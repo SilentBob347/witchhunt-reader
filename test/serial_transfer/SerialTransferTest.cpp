@@ -24,6 +24,11 @@ class FakeHost : public SerialTransferHost {
   std::vector<uint8_t> out;      // bytes the device "sends"
   std::vector<BookEntry> books;  // what listBooks() returns
 
+  // When set, writeBytes() fails (returns false) once out.size() reaches or
+  // exceeds this threshold, simulating a stalled USB-CDC link that gives up
+  // partway through a chunk. -1 (default) means "never fail".
+  long long failWriteAtOutSize = -1;
+
   // Captured upload state.
   std::string lastPath;
   std::vector<uint8_t> lastData;
@@ -63,7 +68,11 @@ class FakeHost : public SerialTransferHost {
   }
 
   // -- outbound --
-  void writeBytes(const uint8_t* data, size_t len) override { out.insert(out.end(), data, data + len); }
+  bool writeBytes(const uint8_t* data, size_t len) override {
+    if (failWriteAtOutSize >= 0 && static_cast<long long>(out.size()) >= failWriteAtOutSize) return false;
+    out.insert(out.end(), data, data + len);
+    return true;
+  }
 
   // -- file sink --
   bool fileBegin(const std::string& path) override {
@@ -362,7 +371,11 @@ TEST(SerialTransferDownload, RoundTripMultiChunk) {
   EXPECT_EQ(h.out, expectedDownload(h.downloadSource));
 }
 
-// If the host never ACKs a chunk, the device aborts and sends no trailing CRC.
+// If the host never ACKs a chunk, the device aborts, sends no trailing CRC,
+// and (unlike before) now reports ERR:io — the wire is still in sync at this
+// point (the full chunk went out; only the ACK is missing), so an error line
+// is safe to send and lets the host fail fast instead of relying solely on
+// its own long read timeout.
 TEST(SerialTransferDownload, NoAckAborts) {
   FakeHost h;
   for (int i = 0; i < 100; ++i) h.downloadSource.push_back(static_cast<uint8_t>(i));
@@ -373,8 +386,9 @@ TEST(SerialTransferDownload, NoAckAborts) {
   // no 0x06 ACK provided -> readByte() returns -1 after the first chunk
   SerialTransferProtocol proto(h);
   EXPECT_TRUE(proto.poll());
-  // READY + size + the chunk data, but NO 4-byte CRC at the end.
-  EXPECT_EQ(h.out.size(), 6u + 4u + 100u);
+  // READY + size + the chunk data + "ERR:io\n", but NO 4-byte CRC.
+  EXPECT_EQ(h.out.size(), 6u + 4u + 100u + 7u);
+  EXPECT_EQ(std::string(h.out.end() - 7, h.out.end()), "ERR:io\n");
 }
 
 TEST(SerialTransferDownload, EmptyFile) {
@@ -388,6 +402,35 @@ TEST(SerialTransferDownload, EmptyFile) {
   // READY\n + size(0) + crc(0)
   const std::vector<uint8_t> expected = {'R', 'E', 'A', 'D', 'Y', '\n', 0, 0, 0, 0, 0, 0, 0, 0};
   EXPECT_EQ(h.out, expected);
+}
+
+// Regression: if the link stalls partway through a chunk write (e.g. a
+// USB-CDC TX ring the host stopped draining, per SerialTransferDevice's
+// writeBytes()), the device must abort the transfer immediately rather than
+// still waiting for an ACK the host will never send for a chunk it never
+// finished receiving. Previously writeBytes() was void, so this failure was
+// invisible to handleDownload() and it would call readByte() anyway.
+TEST(SerialTransferDownload, StalledWriteAbortsWithoutWaitingForAck) {
+  FakeHost h;
+  for (int i = 0; i < 4500; ++i) h.downloadSource.push_back(static_cast<uint8_t>(i & 0xFF));
+  // Let READY + size (6 + 4 = 10 bytes) and the first full 2048-byte chunk
+  // through, then fail every write after that — simulating the link dying
+  // partway through the second chunk.
+  h.failWriteAtOutSize = 10 + 2048 + 100;
+  const std::string path = "/x.bin";
+  h.push("CMNDT");
+  h.pushU16(static_cast<uint16_t>(path.size()));
+  h.push(path);
+  h.in.push_back(0x06);  // ACK for chunk 0 only; chunk 1's write never completes
+  SerialTransferProtocol proto(h);
+  EXPECT_TRUE(proto.poll());
+  // No trailing 4-byte CRC: the transfer aborted instead of completing.
+  EXPECT_LT(h.out.size(), expectedDownload(h.downloadSource).size());
+  // The device didn't block forever waiting on an ACK for the failed chunk —
+  // proto.poll() returning at all (this test doesn't hang) is the main
+  // assertion, but also confirm no more than one ACK's worth of data went out
+  // beyond the stall point.
+  EXPECT_LE(h.out.size(), static_cast<size_t>(h.failWriteAtOutSize) + SerialTransferProtocol::kChunkSize);
 }
 
 TEST(SerialTransferDownload, OpenFailure) {

@@ -15,6 +15,9 @@ constexpr char kMagicEpub[4] = {'E', 'P', 'U', 'B'};
 }  // namespace
 
 void SerialTransferHost::writeLine(const char* s) {
+  // Best-effort: status/error lines have no reader-side ack to fail against, so
+  // there's nothing useful to do with a short write here beyond what the
+  // underlying link already does (retry/give up on its own timeout).
   writeBytes(reinterpret_cast<const uint8_t*>(s), std::strlen(s));
   const uint8_t nl = '\n';
   writeBytes(&nl, 1);
@@ -171,7 +174,10 @@ bool SerialTransferProtocol::receiveFile(const std::string& dest) {
     // ACK immediately; the firmware's fileWrite buffers/overlaps the SD write so
     // line time hides SD latency. One ACK per chunk, as the protocol requires.
     const uint8_t ack = kAck;
-    host_.writeBytes(&ack, 1);
+    if (!host_.writeBytes(&ack, 1)) {
+      ok = false;
+      break;
+    }
     remaining -= static_cast<uint32_t>(want);
   }
 
@@ -267,20 +273,37 @@ bool SerialTransferProtocol::handleDownload() {
   host_.writeLine("READY");
   const uint8_t szb[4] = {static_cast<uint8_t>(size), static_cast<uint8_t>(size >> 8), static_cast<uint8_t>(size >> 16),
                           static_cast<uint8_t>(size >> 24)};
-  host_.writeBytes(szb, 4);
+  bool ok = host_.writeBytes(szb, 4);
+  // Once the size write has gone out, the host is committed to reading exactly
+  // `size` bytes of binary chunk data off the wire (see cp_serial.c's
+  // read_exact()). If a later writeBytes() gives up partway through a chunk,
+  // there is no way to signal an error to the host anymore short of sending
+  // exactly the remaining bytes it's still blocked waiting for — an "ERR:..."
+  // text line at that point would just be consumed as (corrupt) chunk data.
+  // So mid-chunk failures below can only abort cleanly on our side; the host
+  // discovers the failure via its own read timeout.
+  bool wireDesynced = false;
 
   uint32_t crc = 0;
-  uint32_t remaining = size;
+  uint32_t remaining = ok ? size : 0;
   uint8_t buf[kChunkSize];
-  bool ok = true;
   while (remaining > 0) {
     const size_t want = remaining < kChunkSize ? remaining : kChunkSize;
     const size_t n = host_.fileRead(buf, want);
     if (n == 0) {
       ok = false;
-      break;  // unexpected short read
+      break;  // unexpected short read; no chunk data sent yet this iteration
     }
-    host_.writeBytes(buf, n);
+    // A short/failed write here (e.g. the USB-CDC TX ring stayed full past the
+    // link's stall-abort and writeBytes() gave up) must abort immediately: the
+    // host is still waiting for the rest of this chunk and will never send the
+    // ACK we're about to wait for below, so continuing would just silently hang
+    // both sides until the host's own long read timeout finally fires.
+    if (!host_.writeBytes(buf, n)) {
+      ok = false;
+      wireDesynced = true;
+      break;
+    }
     crc = crc32Update(crc, buf, n);
     // Wait for the host to ACK this chunk before sending the next. Flow control:
     // keeps the device from outrunning the host and overflowing the USB-CDC TX
@@ -297,8 +320,9 @@ bool SerialTransferProtocol::handleDownload() {
   if (ok) {
     const uint8_t crcb[4] = {static_cast<uint8_t>(crc), static_cast<uint8_t>(crc >> 8), static_cast<uint8_t>(crc >> 16),
                              static_cast<uint8_t>(crc >> 24)};
-    host_.writeBytes(crcb, 4);
+    ok = host_.writeBytes(crcb, 4);
   }
+  if (!ok && !wireDesynced) host_.writeLine("ERR:io");
   return true;
 }
 

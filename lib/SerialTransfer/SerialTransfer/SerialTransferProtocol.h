@@ -68,7 +68,9 @@ class SerialTransferHost {
   virtual int peek(size_t i) = 0;
 
   // --- Outbound (to the serial line) ---
-  virtual void writeBytes(const uint8_t* data, size_t len) = 0;
+  // Write `len` bytes. Returns false if the link gave up before all of them
+  // went out (e.g. a stalled USB-CDC TX ring the host stopped draining).
+  virtual bool writeBytes(const uint8_t* data, size_t len) = 0;
   // Convenience: write an ASCII line followed by '\n'.
   void writeLine(const char* s);
 

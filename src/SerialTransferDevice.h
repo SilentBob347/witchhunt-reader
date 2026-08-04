@@ -48,7 +48,7 @@ class SerialTransferDevice : public serialtransfer::SerialTransferHost {
   size_t available() override;
   int readByte() override;
   int peek(size_t i) override;
-  void writeBytes(const uint8_t* data, size_t len) override;
+  bool writeBytes(const uint8_t* data, size_t len) override;
   bool fileBegin(const std::string& path) override;
   bool fileWrite(const uint8_t* data, size_t len) override;
   void fileEnd(bool keep) override;

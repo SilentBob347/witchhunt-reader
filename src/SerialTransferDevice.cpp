@@ -134,12 +134,20 @@ int SerialTransferDevice::readByte() {
   return logSerial.read();
 }
 
-void SerialTransferDevice::writeBytes(const uint8_t* data, size_t len) {
+bool SerialTransferDevice::writeBytes(const uint8_t* data, size_t len) {
   // logSerial.write() returns a SHORT count when the USB-CDC TX ring stays full
   // past HWCDC's ~100ms tx timeout (host slow to drain — e.g. a download client
   // that reads in small chunks with work between reads). The old code ignored
   // the return value and silently dropped the rest, corrupting downloads. Loop
   // over the remainder so we never drop; bail only if the host appears gone.
+  //
+  // On Windows specifically, the host's USB-CDC driver (usbser.sys) drains the
+  // TX ring less eagerly/more burstily than Linux's cdc_acm, so the "host slow
+  // to drain" case that kWriteStallAbortMs guards against is far more likely to
+  // actually happen there — this is why downloads that never stalled on Linux
+  // could still hit the 15s abort here on Windows. Report the short write
+  // (instead of returning void) so the protocol layer can abort the transfer
+  // cleanly instead of proceeding as if every byte went out.
   size_t sent = 0;
   unsigned long lastProgressMs = millis();
   while (sent < len) {
@@ -153,6 +161,7 @@ void SerialTransferDevice::writeBytes(const uint8_t* data, size_t len) {
       vTaskDelay(1);
     }
   }
+  return sent == len;
 }
 
 bool SerialTransferDevice::fileBegin(const std::string& path) {
