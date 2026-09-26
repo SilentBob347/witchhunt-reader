@@ -195,6 +195,14 @@ constexpr uint32_t LARGEST_FREE_BLOCK_SLACK = 16;
 #ifndef BG_BUILD_BORROW_QUIET_MS
 #define BG_BUILD_BORROW_QUIET_MS 1500UL
 #endif
+
+// The image lane's settle after a page turn, a draw or a preempted decode (see
+// stepImageWarmLocked). Short on purpose: the lane also waits for any gesture in flight and for
+// the deferred AA pass, which are the real hazards; this only keeps a fast flipper from being
+// handed a decode to abort on every page.
+#ifndef IMAGE_LANE_SETTLE_MS
+#define IMAGE_LANE_SETTLE_MS 300UL
+#endif
 // See backgroundPreemptCount_: give up on a target after this many preempted attempts. Two is
 // deliberate — attempt 1 banks the inflated XHTML in the book-keyed HTML cache (kept on abort,
 // see Section::abortSectionBuild), so attempt 2 skips inflation and is the one that gets a fair
@@ -1700,13 +1708,23 @@ bool EpubReaderActivity::stepImageWarmLocked() {
   if (secondaryBorrowed_ || backgroundBorrowActive_ || !renderer.hasSecondaryBuffer()) return false;
   const int cur = section->currentPage;
   if (imageWarmCleanSpine_ == currentSpineIndex && imageWarmCleanPage_ == cur) return false;
-  // Same settle rule as B's borrow: not within 1.5 s of a turn or a draw, and no button queued --
-  // a decode holds the lock for seconds and only yields to input by aborting. Run 17 showed the
-  // settle is not what limits the lane: at 3.3 s per page it still caught every image five pages
-  // ahead.
+  // When to start. A decode holds the loop for seconds and yields to input only by aborting, so:
+  //  - no gesture in flight: the abort hook fires on NEW edges, and a tap whose edges were
+  //    already drained (released, waiting out the 300 ms double-click window) would be held for
+  //    the whole decode -- runs 17/18 caught three page turns firing 18 ms after a lane decode;
+  //  - a short settle after a turn, a draw or a preemption, so a reader flipping pages is not
+  //    handed a decode to abort on every page. The deferred AA pass needs no allowance of its
+  //    own: the scheduler runs nothing while it is owed, and it ends ~0.35 s after the draw.
+  // It used to wait B's 1.5 s borrow settle. Run 18, at 6-7 s per page: a 570 KB progressive
+  // (~4.5 s) lost to the page turn four times, once within ~100 ms of finishing; the second
+  // that settle sat on was the difference. An abort costs the turn a few ms (the decoders poll
+  // per band and every few KB of the index pass), so starting early is cheap.
   const unsigned long now = millis();
   const unsigned long lastActivityMs = std::max({lastPageTurnTime, lastPageOnScreenMs_, imageWarmPreemptedMs_});
-  if (CooperativeAbort::shouldAbortLongTask() || now - lastActivityMs < BG_BUILD_BORROW_QUIET_MS) return false;
+  if (CooperativeAbort::shouldAbortLongTask() || buttonEvents.isGestureInFlight() ||
+      now - lastActivityMs < IMAGE_LANE_SETTLE_MS) {
+    return false;
+  }
 
   // Large images are warmed too (forceLoad), whatever the placeholder setting says: that setting
   // exists because a decode on a page turn is slow, and this is the decode nobody waits for.

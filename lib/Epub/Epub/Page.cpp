@@ -172,9 +172,11 @@ void PageTableFragment::warmCellImages(GfxRenderer& renderer, const bool forceLo
       // discarded by the caller's clearScreen().
       if (!cached) {
         cell.image->render(renderer, 0, 0, forceLoad, monochromeOutput);
+        if (CooperativeAbort::wasAborted()) return;  // see Page::warmImageCaches
       }
       if (alsoWarmGrayscale && monochromeOutput && !cell.image->hasGrayscaleCache()) {
         cell.image->render(renderer, 0, 0, forceLoad, /*monochromeOutput=*/false);
+        if (CooperativeAbort::wasAborted()) return;
       }
     }
   }
@@ -317,7 +319,15 @@ void Page::warmImageCaches(GfxRenderer& renderer, const int xOffset, const int y
   // actually require a PNG/JPG decoder allocation. Cached and placeholder paths
   // do not need the contiguous heap headroom, so skipping the iteration entirely
   // saves the no-op overhead on text-only pages (the common case).
+  //
+  // A decode that bails for pending input (CooperativeAbort) ends the whole warm: every later
+  // decode here would bail the same way, one after the other, while the input waits -- the
+  // grayscale companion of an aborted image added ~130 ms to the page turn on the X3. The latch
+  // is cleared first so a stale abort from an earlier task cannot end this one, and left set on
+  // the way out for the caller to read.
+  CooperativeAbort::clearAborted();
   for (auto& element : elements) {
+    if (CooperativeAbort::wasAborted()) return;
     if (element->getTag() == TAG_PageTable) {
       static_cast<const PageTableFragment&>(*element).warmCellImages(renderer, forceLoadLargeImages, monochromeOutput,
                                                                      alsoWarmGrayscale);
@@ -340,6 +350,7 @@ void Page::warmImageCaches(GfxRenderer& renderer, const int xOffset, const int y
     if (!alreadyCached) {
       static_cast<PageImage&>(*element).renderWithForceLoad(renderer, xOffset, yOffset, forceLoadLargeImages,
                                                             monochromeOutput, mergeVariants);
+      if (CooperativeAbort::wasAborted()) return;
     }
     // Second decode for the other variant when AA needs the grayscale planes on top of
     // the BW frame. Skipped when monochromeOutput is already false — that pass wrote the
