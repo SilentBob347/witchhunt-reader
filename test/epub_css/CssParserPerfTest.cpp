@@ -475,22 +475,28 @@ TEST(CssParserArena, ResidentAndIndexMatchHeapResolution) {
     parser.clear();  // drop the arena view before the arena is destroyed
   }
 
-  // 3) RESIDENT under moderate heap pressure: 30 KB is below the normal 40 KB CSS floor but
-  //    the resident path touches no SD, so it must still resolve (no low-heap bypass).
+  // 3) RESIDENT in low-heap mode: 16 KB is below even the 24 KB lean floor, so resolveStyle
+  //    runs with disk lookups disallowed. The resident path touches no SD and must still
+  //    resolve every probe. (This used 30 KB, which clears the lean floor, so low-heap mode
+  //    never engaged; lowHeapSkips pins that it does now.)
   {
     FreeHeapGuard heapGuard;
-    ESP.setFreeHeap(30 * 1024);
+    ESP.setFreeHeap(16 * 1024);
     BuildArena arena(kFixtureRuleCount * 128 + 8192);
     ASSERT_TRUE(arena.valid());
     parser.clear();
     parser.setIndexArena(&arena);
     parser.setLeanResolve(true);
     ASSERT_TRUE(parser.loadFromCache());
+    ASSERT_TRUE(parser.isArenaResident());
     const std::vector<CssStyle> residentStyles = resolveAll(parser);
     for (size_t i = 0; i < probes.size(); ++i) {
       EXPECT_TRUE(stylesEqual(heapStyles[i], residentStyles[i])) << "resident-under-pressure mismatch at " << i;
     }
-    EXPECT_EQ(parser.getResolveStats().lowHeapDiskBypasses, 0u);
+    const auto stats = parser.getResolveStats();
+    EXPECT_EQ(stats.lowHeapSkips, probes.size()) << "low-heap mode did not engage for every resolve";
+    EXPECT_GT(stats.lowHeapRescuedHits, 0u) << "resident lookups should still hit in low-heap mode";
+    EXPECT_EQ(stats.lowHeapDiskBypasses, 0u);
     parser.clear();
   }
 
