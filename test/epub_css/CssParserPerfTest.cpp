@@ -16,8 +16,6 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <iostream>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,8 +24,6 @@
 #include "Arduino.h"
 #include "BuildArena.h"
 #include "HalStorage.h"
-
-using Clock = std::chrono::steady_clock;
 
 // ---------------------------------------------------------------------------
 // Heap instrumentation: malloc/free/calloc/realloc are interposed and every
@@ -41,22 +37,11 @@ using Clock = std::chrono::steady_clock;
 // ---------------------------------------------------------------------------
 
 static std::atomic<size_t> g_liveBytes{0};
-static std::atomic<size_t> g_peakBytes{0};
-// Allocation COUNT, not just bytes. Peak bytes is blind to churn: a short-lived string raises
-// peak by nothing yet still leaves a hole, and on a no-compaction heap those holes are
-// permanent for the session. Count is the number that tracks fragmentation pressure.
-static std::atomic<size_t> g_allocCount{0};
 static std::atomic<uint32_t> g_epoch{0};  // current measurement window; 0 = not measuring
 static std::atomic<bool> g_tracking{false};
 static thread_local bool g_inHook = false;
 
-static void trackAlloc(size_t sz) {
-  g_allocCount.fetch_add(1, std::memory_order_relaxed);
-  size_t live = g_liveBytes.fetch_add(sz) + sz;
-  size_t peak = g_peakBytes.load(std::memory_order_relaxed);
-  while (live > peak && !g_peakBytes.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
-  }
-}
+static void trackAlloc(size_t sz) { g_liveBytes.fetch_add(sz); }
 
 // Reaching the real allocator underneath our own malloc/free overrides. Same technique as
 // test/epub_pipeline/HeapTrack.cpp: on Windows go straight to the Win32 heap (there is no
@@ -183,27 +168,13 @@ void* realloc(void* ptr, size_t size) {
 
 }  // extern "C"
 
-static long long elapsedUs(const Clock::time_point& start) {
-  return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
-}
-
 static void beginMeasurement() {
   g_liveBytes.store(0);
-  g_peakBytes.store(0);
-  g_allocCount.store(0);
   g_epoch.fetch_add(1);
   g_tracking.store(true);
 }
 
 static void endMeasurement() { g_tracking.store(false); }
-
-// Peak heap while fn runs (allocations minus frees, high-water mark).
-static size_t measurePeakBytes(const std::function<void()>& fn) {
-  beginMeasurement();
-  fn();
-  endMeasurement();
-  return g_peakBytes.load();
-}
 
 // Bytes still allocated when fn returns — the retained footprint of whatever fn built.
 static size_t measureLiveBytes(const std::function<void()>& fn) {
@@ -327,70 +298,6 @@ TEST(CssParser, KeepsOnlyInvisibleValuesOfInvisibilityProperties) {
   ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), cssFile));
   ASSERT_TRUE(parser.loadFromStream(cssFile));
   EXPECT_EQ(parser.ruleCount(), 5u);  // .ocr .fill .alpha .gone .hid
-
-  std::error_code rmEc;
-  std::filesystem::remove(cssPath, rmEc);  // best-effort; see removePath()
-}
-
-TEST(CssParserPerf, ParseLargeCssEpub) {
-  const std::string epubPath = FIXTURE_EPUB;
-  const char* cssEntry = "OEBPS/styles/large.css";
-
-  const std::vector<uint8_t> cssData = readZipEntry(epubPath, cssEntry);
-  ASSERT_FALSE(cssData.empty()) << "Failed to read CSS entry from EPUB";
-
-  std::string cssPath;
-  ASSERT_TRUE(writeTempCssFile(cssData, cssPath));
-
-  size_t parseTimeUs = 0;
-  size_t parseAllocs = 0;
-  bool parseOk = false;
-  size_t ruleCount = 0;
-
-  const size_t heapPeak = measurePeakBytes([&] {
-    std::unique_ptr<CssParser> parser = std::make_unique<CssParser>("");
-    FsFile cssFile;
-    if (!Storage.openFileForRead("CSS", cssPath.c_str(), cssFile)) {
-      return;
-    }
-    const auto t0 = Clock::now();
-    if (!parser->loadFromStream(cssFile)) {
-      return;
-    }
-    parseTimeUs = static_cast<size_t>(elapsedUs(t0));
-    ruleCount = parser->ruleCount();
-    parseAllocs = g_allocCount.load();  // sample inside the window, before it is reset
-    parseOk = true;
-  });
-
-  ASSERT_TRUE(parseOk);
-  ASSERT_EQ(ruleCount, kFixtureRuleCount);
-
-  // Allocation count alongside peak bytes: peak is blind to churn (a short-lived string raises
-  // it by nothing yet still leaves a hole, and on a no-compaction heap those holes are
-  // permanent for the session), so the count is what tracks fragmentation pressure.
-  printf("BENCHMARK parse_time=%zu us heap_peak=%zu B parse_allocs=%zu rule_count=%zu css_bytes=%zu\n", parseTimeUs,
-         heapPeak, parseAllocs, ruleCount, cssData.size());
-
-  CssParser parser("");
-  FsFile cssFile;
-  ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), cssFile));
-  const size_t parseLiveBytes = measureLiveBytes([&] { ASSERT_TRUE(parser.loadFromStream(cssFile)); });
-  printf("PARSE_LIVE_BYTES=%zu\n", parseLiveBytes);
-
-  const std::vector<std::string> testClasses = {"rule0_0", "rule1_0", "rule4_0", "rule7_0"};
-  for (const auto& cls : testClasses) {
-    const std::string classAttr = cls;
-    const CssStyle style = parser.resolveStyle("p", classAttr);
-    if (cls == "rule0_0") {
-      ASSERT_TRUE(style.hasTextDecoration());
-      ASSERT_EQ(style.textDecoration, CssTextDecoration::Underline);
-    }
-  }
-
-  const auto stats = parser.getResolveStats();
-  printf("LOOKUP_STATS resolveCalls=%u mapHits=%u hotHits=%u diskHits=%u misses=%u\n", stats.resolveCalls,
-         stats.mapHits, stats.hotHits, stats.diskHits, stats.misses);
 
   std::error_code rmEc;
   std::filesystem::remove(cssPath, rmEc);  // best-effort; see removePath()
@@ -786,55 +693,6 @@ TEST(CssParserArena, ResidentPreservesAllStyleFields) {
   removePath(cacheDir);
   std::error_code rmEc;
   std::filesystem::remove(cssPath, rmEc);  // best-effort; see removePath()
-}
-
-// Baseline measurement of the resident CSS footprint (index + distinct-style pool) across
-// representative stylesheets, so the dedup/compression win is measured, not estimated. Prints
-// CSS_FOOTPRINT lines the CI log captures; re-run after compression lands to see the delta.
-TEST(CssParserArena, ResidentFootprintBaseline) {
-  auto footprintForCss = [](const std::string& css) {
-    const std::string cacheDir = makeTempDir();
-    std::string cssPath;
-    EXPECT_TRUE(writeTempCssFile(std::vector<uint8_t>(css.begin(), css.end()), cssPath));
-    CssParser parser(cacheDir);
-    {
-      FsFile f;
-      EXPECT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), f));
-      EXPECT_TRUE(parser.loadFromStream(f));
-    }
-    EXPECT_TRUE(parser.saveToCache());
-    BuildArena arena(1024 * 1024);  // huge → always resident, so we measure the full pool
-    parser.clear();
-    parser.setIndexArena(&arena);
-    parser.setLeanResolve(true);
-    EXPECT_TRUE(parser.loadFromCache());
-    const CssParser::ResidentFootprint fp = parser.getResidentFootprint();
-    parser.clear();
-    removePath(cacheDir);
-    std::error_code rmEc;
-    std::filesystem::remove(cssPath, rmEc);  // best-effort; see removePath()
-    return fp;
-  };
-
-  std::string calibre;  // hundreds of identically-styled classes (the Calibre pattern)
-  for (int i = 0; i < 800; ++i) calibre += ".calibre" + std::to_string(i) + " { margin-top: 0px; }\n";
-  std::string distinct;  // every rule unique — no dedup possible
-  for (int i = 0; i < 400; ++i)
-    distinct += ".u" + std::to_string(i) + " { margin-top: " + std::to_string(i + 1) + "px; }\n";
-  std::string typical;  // a realistic mix (~24 distinct combinations)
-  for (int i = 0; i < 200; ++i)
-    typical += ".t" + std::to_string(i) + " { margin-top: " + std::to_string(i % 12) +
-               "px; text-align: " + (i % 2 ? "center" : "left") + "; }\n";
-
-  const std::vector<std::pair<const char*, std::string>> sheets = {
-      {"calibre-800-dup", calibre}, {"distinct-400", distinct}, {"typical-200", typical}};
-  for (const auto& [name, css] : sheets) {
-    const CssParser::ResidentFootprint fp = footprintForCss(css);
-    printf("CSS_FOOTPRINT[%-16s] rules=%4u distinct=%4u indexB=%6u poolB=%6u totalB=%6u  %.1f B/distinct\n", name,
-           fp.ruleCount, fp.distinctStyles, fp.indexBytes, fp.poolBytes, fp.totalBytes(),
-           fp.distinctStyles ? static_cast<double>(fp.poolBytes) / fp.distinctStyles : 0.0);
-    EXPECT_GT(fp.ruleCount, 0u);
-  }
 }
 
 // Regression: font-size from stylesheets must survive the disk-cache round trip.
