@@ -13,6 +13,7 @@
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
 
+#include <array>
 #include <atomic>
 
 #include "BookmarkStore.h"
@@ -414,12 +415,28 @@ class EpubReaderActivity final : public Activity {
   // Last WaitHeap gate evaluation; the heap-walk checks re-run at most ~1×/s.
   unsigned long backgroundBuildGateCheckMs_ = 0;
   // Image lane (memory audit 2026-09, R7): between page turns, decode the pixel caches of the
-  // images on the next few pages so the turn that reaches them replays a cache instead of
-  // running a 1-4 s decode. Ranked above Background-B's look-ahead build. The pair below marks a
-  // window already found clean, so an idle reader does not re-read those pages every tick.
+  // images in a window of pages so the turn that reaches them replays a cache instead of running
+  // a 1-4 s decode. Ranked above Background-B's look-ahead build. The window is the page on
+  // screen (a large-image placeholder, or a decode the render could not afford, is loaded
+  // lazily and the page redrawn) and the next kImageWarmLookahead pages, continuing into the
+  // next section's first pages when its cache exists. The pair below marks a window already
+  // found clean, so an idle reader does not re-read those pages every tick.
   static constexpr int kImageWarmLookahead = 5;
   int imageWarmCleanSpine_ = -1;
   int imageWarmCleanPage_ = -1;
+  // Pages whose warm came back incomplete although no input preempted it (an unsupported or
+  // corrupt image, a decode refused for heap). Each gets kImageWarmMaxTries attempts, then the
+  // lane skips it for the session -- a failed decode writes no cache, so without this the lane
+  // retried the same page on every loop tick. Eight slots hold every page of one window (the
+  // page on screen plus five), so a window of broken images cannot evict its own entries.
+  struct ImageWarmMiss {
+    int16_t spine = -1;
+    int16_t page = -1;
+    uint8_t tries = 0;
+  };
+  static constexpr uint8_t kImageWarmMaxTries = 2;
+  std::array<ImageWarmMiss, 8> imageWarmMisses_{};
+  uint8_t imageWarmMissNext_ = 0;
   // Times a build of backgroundBuildSpineIndex_ was preempted (reader needed the borrowed
   // buffer back) before reaching Done. Bounds the retry loop: a spine whose parse cannot fit
   // between two page turns would otherwise re-inflate and re-parse forever, burning CPU, SD
@@ -726,6 +743,12 @@ class EpubReaderActivity final : public Activity {
   // The image lane's step; called from stepBackgroundSectionBuild with the RenderLock held.
   // True when it did a page's worth of work this tick (the caller then yields to the loop).
   bool stepImageWarmLocked();
+  // Decode one page's missing image caches into the borrowed secondary buffer, writing no
+  // framebuffer byte. `onScreen`: the page is the one displayed; once the images it showed as
+  // placeholders are cached it is redrawn. Always returns true (the tick was spent).
+  bool warmPageForImageLane(const Page& page, int spine, int pageIndex, bool onScreen, bool warmGrayscale);
+  bool imageWarmGaveUp(int spine, int page) const;
+  void noteImageWarmMiss(int spine, int page);
   // Lend the secondary framebuffer to Background-B's build arena. Mirrors the Background-C
   // borrow site in buildSection(): the lent block never enters the heap, so the return cannot
   // fail on a fragmented hole, and the build's scratch — parse working set, inflate ring, CSS
