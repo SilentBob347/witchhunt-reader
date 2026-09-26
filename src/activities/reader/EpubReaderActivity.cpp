@@ -3183,6 +3183,31 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
   requestUpdate();
 }
 
+void EpubReaderActivity::jumpPages(const bool isForwardTurn, const int count) {
+  // One lock for the whole jump, like pageTurn(): the render task publishes the deferred-AA page
+  // and the pre-render flags, and a jump that lands in a render's unlocked waveform window must
+  // not interleave with that.
+  RenderLock lock(*this);
+  // The same hand-off pageTurn() makes on its non-pre-rendered path. Without it the jump's render
+  // request reached render() with the old page's deferred AA still owed and that page's
+  // pre-render still armed, was classified as a PreRender and shelved ("PreRender deferred: AA
+  // owed"); the AA then ran on the page being left and the new page was never drawn. X3,
+  // 2026-09-26: a double-click during a slow image-page render saved page 144 as the position
+  // while the screen stayed on 134 until something else repainted it.
+  pendingGrayscale_ = {};
+  int stepped = 0;
+  while (stepped < count && stepPageStateLocked(isForwardTurn)) {
+    ++stepped;
+  }
+  if (stepped == 0) {
+    return;
+  }
+  preRenderedPage.ready = false;
+  preRenderedPlanesStaged_ = false;
+  pendingPreRender = false;
+  requestUpdate();
+}
+
 bool EpubReaderActivity::reallocSecondaryEvictingCaches() {
   // The FDC page slots are per-page state (every prewarmed render batch-clears and refills
   // them via endScanAndPrewarm), but a render done mid-released-build leaves the last page's
@@ -6210,16 +6235,10 @@ void EpubReaderActivity::onButtonAction(const CrossPointSettings::BUTTON_ACTION 
       pageTurn(false);
       break;
     case BA::BTN_PAGE_FORWARD_10:
-      for (int i = 0; i < 10; i++) {
-        if (!stepPageState(true)) break;
-      }
-      requestUpdate();
+      jumpPages(true, 10);
       break;
     case BA::BTN_PAGE_BACK_10:
-      for (int i = 0; i < 10; i++) {
-        if (!stepPageState(false)) break;
-      }
-      requestUpdate();
+      jumpPages(false, 10);
       break;
     case BA::BTN_STAR_PAGE: {
       RenderLock lock(*this);

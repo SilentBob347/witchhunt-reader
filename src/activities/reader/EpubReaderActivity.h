@@ -951,6 +951,10 @@ class EpubReaderActivity final : public Activity {
   bool stepPageState(bool isForwardTurn);
   bool stepPageStateLocked(bool isForwardTurn);
   void pageTurn(bool isForwardTurn);
+  // Jump `count` pages (the 10-page double-click action): steps the page state under one lock
+  // and makes pageTurn()'s hand-off -- drops the old page's deferred AA and pre-render -- before
+  // requesting the render. Stops early at a chapter boundary.
+  void jumpPages(bool isForwardTurn, int count);
 #if ENABLE_BENCHMARKS
   void runRenderBenchmark();
   std::string buildRenderBenchmarkReport(const LastRenderStats& startSnapshot, const BenchmarkAggregate& aggregate,
