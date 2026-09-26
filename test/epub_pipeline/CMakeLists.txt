@@ -153,6 +153,28 @@ add_test(NAME HeapPeakRegression
 )
 set_tests_properties(HeapPeakRegression PROPERTIES TIMEOUT 600)
 
+# Exact allocation inventory of section builds (memory audit 2026-09): the heap profiler's
+# per-build window plus BuildArena's host-only trace hooks, with debug info and frame pointers so
+# every site symbolizes to file:line (inline chains included). See InventoryMain.cpp and
+# inventory_report.py. Not a test; run it by hand.
+add_executable(epub_build_inventory
+  InventoryMain.cpp
+  HeapTrack.cpp
+  ${PIPELINE_SOURCES}
+)
+target_include_directories(epub_build_inventory PRIVATE ${PIPELINE_INCLUDES})
+target_compile_definitions(epub_build_inventory PRIVATE
+  ENABLE_SERIAL_LOG=1
+  LOG_LEVEL=1
+  BUILD_ARENA_TRACE=1
+)
+target_compile_options(epub_build_inventory PRIVATE -O2 -g -fno-omit-frame-pointer -fno-ipa-icf)
+target_link_libraries(epub_build_inventory PRIVATE
+  crosspoint_test_common
+  SaxParser
+  ${CMAKE_DL_LIBS}
+)
+
 # Same dump tool without the process-wide malloc/free override, which deadlocks
 # under the MinGW runtime. --bench heap numbers read 0 here; everything else is
 # identical, so this is the variant to use when diagnosing layout on Windows.

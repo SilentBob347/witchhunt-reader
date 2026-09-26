@@ -11,6 +11,8 @@
 #include <ostream>
 #include <string>
 
+class BuildArena;
+
 namespace pipeline_harness {
 
 // A named render-settings profile — the section-cache variant under test.
@@ -36,6 +38,12 @@ struct Profile {
 };
 
 using ArenaStatFn = std::function<void(int spineIndex, size_t highWater, size_t capacity)>;
+
+// Called around each spine's section build (createSectionFile only, not the harness read-back):
+// begin=true right before it, false right after. `lentArena` is the region lent to the build, or
+// nullptr in heap-only mode. The epub_build_inventory tool opens its measurement window here.
+using BuildBracketFn = std::function<void(int spineIndex, bool begin, ::BuildArena* lentArena)>;
+void setBuildBracket(BuildBracketFn fn);
 
 // Called after each spine item's build+dump with its wall-clock cost.
 // pages/elapsedUs cover the section build AND the page-by-page dump read-back.

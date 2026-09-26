@@ -102,6 +102,12 @@ void dumpPage(std::ostream& out, const Page& page, const uint16_t pageIndex, con
 
 }  // namespace
 
+namespace {
+BuildBracketFn g_buildBracket;
+}  // namespace
+
+void setBuildBracket(BuildBracketFn fn) { g_buildBracket = std::move(fn); }
+
 bool runAndDump(const std::string& epubPath, const std::string& cacheDir, const Profile& profile, std::ostream& out,
                 const SpineStatFn& spineStat, const ArenaStatFn& arenaStat) {
   GfxRenderer renderer;
@@ -146,7 +152,10 @@ bool runAndDump(const std::string& epubPath, const std::string& cacheDir, const 
     p.bionicReadingEnabled = profile.bionicReadingEnabled;
     p.inlineFootnotePreviews = profile.inlineFootnotePreviews;
     p.imageRendering = profile.imageRendering;
-    if (!section.createSectionFile(p, {}, /*skipEviction=*/true)) {
+    if (g_buildBracket) g_buildBracket(i, true, lentArena.get());
+    const bool built = section.createSectionFile(p, {}, /*skipEviction=*/true);
+    if (g_buildBracket) g_buildBracket(i, false, lentArena.get());
+    if (!built) {
       out << "SPINE " << i << " ERROR build failed\n";
       return false;
     }
