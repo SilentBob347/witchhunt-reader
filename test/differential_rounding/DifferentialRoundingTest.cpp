@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
-#include <cstdlib>
 
 #include "lib/EpdFont/EpdFont.h"
 #include "lib/EpdFont/EpdFontData.h"
@@ -129,17 +128,14 @@ TEST(Fp4Math, RoundingBoundaries) {
   EXPECT_EQ(fp4::toPixel(137 + (-9)), 8);  // 128 = 8.0 exact
   EXPECT_EQ(fp4::toPixel(137 + (-5)), 8);  // 132 = 8.25
   EXPECT_EQ(fp4::toPixel(137 + (-1)), 9);  // 136 = 8.5 (half rounds up)
-}
 
-TEST(Fp4Math, ExhaustiveKernRange) {
-  const int32_t baseAdvance = 128;
-
-  for (int advFrac = 0; advFrac < 16; advFrac++) {
-    int32_t advance = baseAdvance + advFrac;
-    for (int kern = -128; kern <= 127; kern++) {
-      int step = fp4::toPixel(advance + static_cast<int32_t>(kern));
-      float idealPx = fp4::toFloat(advance + kern);
-      EXPECT_LT(std::abs(step - idealPx), 1.0f) << "advance=" << advance << " kern=" << kern;
+  // Every 4.4 kern (-128..127) on every 8.x px advance (128..143): the step is always the
+  // nearest pixel, halves rounding up.
+  for (int32_t advance = 128; advance < 144; advance++) {
+    for (int32_t kern = -128; kern <= 127; kern++) {
+      const int32_t fp = advance + kern;
+      EXPECT_EQ(fp4::toPixel(fp), static_cast<int>(std::floor(fp4::toFloat(fp) + 0.5f)))
+          << "advance=" << advance << " kern=" << kern;
     }
   }
 }
