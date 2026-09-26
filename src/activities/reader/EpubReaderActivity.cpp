@@ -145,8 +145,22 @@ constexpr uint32_t PRE_RENDER_MIN_FREE_HEAP_BYTES = 44 * 1024;
 // heap is the small fixed setup (parser object, file handles, std::string paths) plus whatever
 // the CSS resolver needs above the LEAN floor it drops to in arena mode. These floors cover that
 // remainder with reserve, and are reachable from the ~57 KB reading steady state.
+//
+// Re-derived 2026-09-26 from device measurements (memory audit 2026-09, section 8; X3 runs 18-20):
+//  - the reading state is no longer ~57 KB: the free heap B sees after a page's deferred AA pass
+//    has a median of ~37 KB, a 25th percentile of 34-36 KB and a floor of ~32.5 KB. 40 KB was out
+//    of reach on the X3, so B never ran at all (run 18: waited in WaitHeap for a whole chapter);
+//  - a borrowed build's heap cost, from its start to its lowest per-page reading, is 22.6 KB on
+//    the heaviest chapter measured (Chapter 3 of Strange Pictures, 27 images) and 16.2 KB on a
+//    text chapter. Since the image-header probe went into the arena (5ce8564ee) nothing larger
+//    than that happens between two readings;
+//  - the parser aborts below MIN_FREE_HEAP_FOR_TEXT_LAYOUT_HARD (9 KB), and B discards an aborted
+//    build (three in a row switch B off for the book).
+// 35 KB keeps the worst chapter's low at ~12.4 KB, 3 KB clear of the abort, and is met in most
+// quiet moments. A render never overlaps B's heap: it takes the buffer back and the live build
+// is discarded first (recoverSecondaryBufferIfNeeded).
 #ifndef BG_BUILD_BORROW_MIN_FREE_HEAP_BYTES
-#define BG_BUILD_BORROW_MIN_FREE_HEAP_BYTES (40 * 1024)
+#define BG_BUILD_BORROW_MIN_FREE_HEAP_BYTES (35 * 1024)
 #endif
 #ifndef BG_BUILD_BORROW_MIN_CONTIG_HEAP_BYTES
 #define BG_BUILD_BORROW_MIN_CONTIG_HEAP_BYTES (12 * 1024)
@@ -166,8 +180,13 @@ constexpr uint32_t LARGEST_FREE_BLOCK_SLACK = 16;
 // would push the gate out of reach and re-lose the look-ahead it exists to protect. A resolve
 // that still cannot fit fails cleanly — the build is discarded and the foreground rebuilds the
 // spine released, where it has ~52 KB more to work with.
+//
+// Zero since 5ce8564ee (memory audit 2026-09, section 8): the pass's SAX state (9 832 B) now comes
+// from the build's arena, which holds ~4 KB while the pass runs, and what stays on the heap (a
+// 1 KB chunk, the archive reader, the target list) is taken while the build holds only its setup
+// heap -- well under the layout peak the free floor above is derived from. Kept as a knob.
 #ifndef BG_BUILD_RESOLVE_EXTRA_HEAP_BYTES
-#define BG_BUILD_RESOLVE_EXTRA_HEAP_BYTES (8 * 1024)
+#define BG_BUILD_RESOLVE_EXTRA_HEAP_BYTES 0
 #endif
 
 // Quiet period after the last page reached the screen before B may take the buffer. B's borrow
