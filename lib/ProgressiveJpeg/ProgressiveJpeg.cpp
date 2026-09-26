@@ -32,6 +32,7 @@ bool isStartOfFrame(const uint8_t marker) {
 // one 512-byte buffer instead of one per scan.
 struct Source {
   FsFile* file = nullptr;
+  uint32_t base = 0;  // file offset of the JPEG's first byte; `pos` below is relative to it
   uint8_t buffer[INPUT_BUFFER] = {};
   uint32_t start = 0;
   uint16_t length = 0;
@@ -43,7 +44,7 @@ struct Source {
   // fails on SdFat: that is end of data too, which the bit reader pads with zeros like libjpeg.
   int at(const uint32_t pos) {
     if (pos - start >= length) {
-      if (!file->seek(pos)) return -1;
+      if (!file->seek(base + pos)) return -1;
       const int count = file->read(buffer, sizeof(buffer));
       ++reads;
       if (count > 0) bytesRead += static_cast<uint32_t>(count);
@@ -848,11 +849,11 @@ Result decodeBands(State& st, const Geometry& g, uint8_t* workspace, const Layou
 
 }  // namespace
 
-Result probe(FsFile& file, ImageInfo& info) {
+Result probe(FsFile& file, ImageInfo& info, const uint32_t base) {
   info = {};
-  if (!file || !file.seek(0)) return Result::InvalidData;
+  if (!file || !file.seek(base)) return Result::InvalidData;
   auto finish = [&](const Result result) {
-    file.seek(0);
+    file.seek(base);
     return result;
   };
   auto readByte = [&]() -> int {
@@ -922,7 +923,7 @@ size_t workspaceBytes(const ImageInfo& info, const uint8_t scaleShift) {
 Result decode(FsFile& file, const DecodeOptions& options, const BandCallback callback, void* user) {
   if (!file || callback == nullptr || options.scaleShift > 3) return Result::InvalidData;
   ImageInfo info;
-  const Result probed = probe(file, info);
+  const Result probed = probe(file, info, options.base);
   if (probed != Result::Ok) return probed;
 
   const Geometry g = geometryFor(info.width, info.height, info.componentCount, info.maxHorizontal, info.maxVertical,
@@ -945,6 +946,7 @@ Result decode(FsFile& file, const DecodeOptions& options, const BandCallback cal
 
   auto* st = new (workspace) State();
   st->source.file = &file;
+  st->source.base = options.base;
   buildBasis(*st, g.n);
   const uint32_t t0 = options.clock ? options.clock() : 0;
   Result result = indexFile(*st, options);
@@ -965,7 +967,7 @@ Result decode(FsFile& file, const DecodeOptions& options, const BandCallback cal
     options.stats->bytesRead = st->source.bytesRead;
   }
   st->~State();
-  file.seek(0);
+  file.seek(options.base);
   return result;
 }
 

@@ -44,7 +44,9 @@ struct ImageInfo {
 
 // Reads marker segments through SOF and rewinds the file. Unsupported for anything
 // decode() would refuse on geometry alone (non-SOF2, precision, luma not at full sampling).
-Result probe(FsFile& file, ImageInfo& info);
+// `base`: where the JPEG starts in the file -- 0 for a file of its own, the entry's data offset for
+// an image stored uncompressed in a ZIP and read in place. Every offset is relative to it.
+Result probe(FsFile& file, ImageInfo& info, uint32_t base = 0);
 
 // Working memory decode() needs at output scale 1/2^scaleShift, including alignment slack.
 size_t workspaceBytes(const ImageInfo& info, uint8_t scaleShift);
@@ -66,6 +68,8 @@ struct DecodeStats {
 };
 
 struct DecodeOptions {
+  // Where the JPEG starts in the file (see probe()).
+  uint32_t base = 0;
   uint8_t scaleShift = 0;  // 0..3: output is floor(width >> s) x floor(height >> s)
   // Polled before every band and every 32 KB while indexing the file (the whole file is read
   // before the first band): a watchdog feed belongs here. True aborts with Result::Aborted.
