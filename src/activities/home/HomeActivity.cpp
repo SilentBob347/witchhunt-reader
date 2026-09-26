@@ -220,13 +220,23 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
   // releases that buffer before decoding for the same reason; do the same here for the
   // duration of loading and reallocate it once every cover is resolved (see end of this
   // function) or on exit. Release under the render lock so we never free it mid-render.
-  if (!secondaryBufferLent && renderer.hasSecondaryBuffer()) {
+  if (secondaryBufferLent && frameCacheInRegion_) {
+    // A later pass on the same visit: the carousel's frame cache has the region; the decoders
+    // need it back. (The cache would be rebuilt anyway -- new covers are about to land.)
+    RenderLock lock;
+    UITheme::getInstance().getMutableTheme().setFrameCacheRegion(nullptr, 0);
+    frameCacheInRegion_ = false;
+    coverScratch_ = makeUniqueNoThrow<BuildArena>(lentRegion_, lentRegionBytes_);
+    if (!coverScratch_ || !coverScratch_->valid()) coverScratch_.reset();
+  } else if (!secondaryBufferLent && renderer.hasSecondaryBuffer()) {
     RenderLock lock;
     size_t lentSize = 0;
     if (uint8_t* lent = renderer.borrowSecondaryBuffer(&lentSize)) {
       coverScratch_ = makeUniqueNoThrow<BuildArena>(lent, lentSize);
       if (coverScratch_ && coverScratch_->valid()) {
         secondaryBufferLent = true;
+        lentRegion_ = lent;
+        lentRegionBytes_ = lentSize;
         // Keep X4 fast-differential refresh alive while the secondary buffer is lent: the
         // controller still holds the last home frame in RED RAM and displayBuffer() re-seeds it
         // after every refresh (syncRedRamFromFrameBuffer), so carousel/menu navigation diffs
@@ -687,7 +697,35 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
 
   recentsLoaded = true;
   recentsLoading = false;
-  restoreSecondaryBuffer();
+  if (!keepRegionAsFrameCache()) restoreSecondaryBuffer();
+}
+
+bool HomeActivity::keepRegionAsFrameCache() {
+  // Every cover is resolved, so the region would go back to the display now -- where, on the
+  // carousel, it leaves Home without a frame cache: the cache wants one ~49 KB block (X3; 45 KB
+  // X4), which Home's heap never has with the buffer resident (run 16: "cover region 0 (49104
+  // bytes, 36108 free)" on every render, then "OOM: cover buffer (20592 bytes)" for the fallback),
+  // so every render redrew the three covers from SD: ~360 ms against ~40 ms restored from a cache.
+  // The region is idle for the rest of the visit, so the cache lives there instead. The display
+  // keeps working as it does during the cover pass (single-buffer fast diff).
+  if (!secondaryBufferLent || lentRegion_ == nullptr || frameCacheInRegion_) return false;
+  if (thumbSession || extractSession || pngSession) return false;  // nothing may still hold a block
+  auto& theme = UITheme::getInstance().getMutableTheme();
+  const size_t wanted = theme.frameCacheRegionBytes(renderer);
+  if (wanted == 0 || wanted > lentRegionBytes_) return false;
+  RenderLock lock;
+  coverScratch_.reset();
+  theme.setFrameCacheRegion(lentRegion_, lentRegionBytes_);
+  frameCacheInRegion_ = true;
+  LOG_DBG("HOME", "Kept the lent framebuffer as the carousel frame cache (%u of %u bytes, free=%lu)",
+          static_cast<unsigned>(wanted), static_cast<unsigned>(lentRegionBytes_),
+          static_cast<unsigned long>(esp_get_free_heap_size()));
+  return true;
+}
+
+void HomeActivity::startActivityForResult(std::unique_ptr<Activity>&& activity, ActivityResultHandler resultHandler) {
+  restoreSecondaryBuffer(/*callerHoldsRenderLock=*/false);
+  Activity::startActivityForResult(std::move(activity), std::move(resultHandler));
 }
 
 void HomeActivity::restoreSecondaryBuffer(bool callerHoldsRenderLock) {
@@ -707,8 +745,14 @@ void HomeActivity::restoreSecondaryBuffer(bool callerHoldsRenderLock) {
     extractSession.reset();
     pngSession.reset();
     coverScratch_.reset();
+    if (frameCacheInRegion_) {
+      UITheme::getInstance().getMutableTheme().setFrameCacheRegion(nullptr, 0);
+      frameCacheInRegion_ = false;
+    }
     renderer.returnSecondaryBuffer();  // cannot fail: the region never entered the heap
     secondaryBufferLent = false;
+    lentRegion_ = nullptr;
+    lentRegionBytes_ = 0;
     // Two-buffer differential is available again — turn off the single-buffer RED-RAM-baseline
     // mode so normal fast refresh resumes against the secondary. No syncRedRamFromFrameBuffer()
     // here: the return re-seeds the baseline exactly as a realloc does, and RED already holds the
@@ -769,6 +813,9 @@ void HomeActivity::onEnter() {
   coverTransientAttempts.clear();
   coverRendered = false;
   secondaryBufferLent = false;
+  lentRegion_ = nullptr;
+  lentRegionBytes_ = 0;
+  frameCacheInRegion_ = false;
   freeCoverBuffer();
 
   const auto& metrics = UITheme::getInstance().getMetrics();

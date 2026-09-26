@@ -41,6 +41,12 @@ class HomeActivity final : public Activity {
   // The lent block never enters the heap, and the return cannot fail. Returned once all covers
   // are loaded, and on exit. See loadRecentCovers() / restoreSecondaryBuffer().
   bool secondaryBufferLent = false;
+  // The lent region itself. During the cover pass it backs coverScratch_; once every cover is
+  // resolved the carousel keeps it as its frame cache (frameCacheInRegion_) instead of handing
+  // it back, and it returns to the display on exit or before a child activity opens.
+  uint8_t* lentRegion_ = nullptr;
+  size_t lentRegionBytes_ = 0;
+  bool frameCacheInRegion_ = false;
   std::unique_ptr<BuildArena> coverScratch_;
   size_t nextRecentCoverIndex = 0;
   size_t nextThumbSizeIndex = 0;  // which thumb size within the current book is next
@@ -94,6 +100,7 @@ class HomeActivity final : public Activity {
   void dispatchMenuAction(HomeMenuAction action);
 
   void rebuildMenuEntries();
+  bool keepRegionAsFrameCache();
   bool storeCoverBuffer();
   bool restoreCoverBuffer();
   void freeCoverBuffer();
@@ -134,6 +141,9 @@ class HomeActivity final : public Activity {
  public:
   void loop() override;
   void render(RenderLock&&) override;
+  // A child drawn over Home (the touch boards' light drawer) recovers the displayed frame from the
+  // secondary buffer, which does nothing while Home has it lent: hand it back first.
+  void startActivityForResult(std::unique_ptr<Activity>&& activity, ActivityResultHandler resultHandler) override;
   // Covers still resolving (not just mid-pass): loadRecentCovers() clears recentsLoading at
   // every yield point so loop() re-enters it, which briefly makes the activity look idle. If
   // skipLoopDelay went false in that window, the main loop's inactivity governor could drop
