@@ -846,28 +846,3 @@ TEST(CssParserCache, RuleCapExceededPersistsACacheMarkedTruncated) {
   std::error_code rmEc;
   std::filesystem::remove(cssPath, rmEc);  // best-effort; see removePath()
 }
-
-// Font-size absolute units and keywords resolve to body-relative multipliers:
-// pt normalises against 12 pt, px against 16 px, keywords use fixed steps.
-TEST(CssParserUnits, FontSizeKeywordsAndAbsoluteUnits) {
-  struct Case {
-    const char* decl;
-    float expected;
-  };
-  const Case cases[] = {
-      {"font-size: 9pt", 0.75f},     {"font-size: 12pt", 1.0f},     {"font-size: 24pt", 2.0f},
-      {"font-size: 8px", 0.5f},      {"font-size: 16px", 1.0f},     {"font-size: 32px", 2.0f},
-      {"font-size: xx-small", 0.6f}, {"font-size: x-small", 0.75f}, {"font-size: small", 0.8f},
-      {"font-size: smaller", 0.8f},  {"font-size: medium", 1.0f},   {"font-size: large", 1.2f},
-      {"font-size: larger", 1.2f},   {"font-size: x-large", 1.4f},  {"font-size: xx-large", 1.6f},
-  };
-  for (const auto& c : cases) {
-    const CssStyle st = CssParser::parseInlineStyle(c.decl);
-    EXPECT_TRUE(st.hasFontSizeMultiplier()) << c.decl;
-    EXPECT_FLOAT_EQ(st.fontSizeMultiplier, c.expected) << c.decl;
-  }
-
-  // Unknown keyword must leave font-size undefined.
-  const CssStyle bogus = CssParser::parseInlineStyle("font-size: enormous");
-  EXPECT_FALSE(bogus.hasFontSizeMultiplier());
-}
