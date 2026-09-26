@@ -164,6 +164,11 @@ struct JpegContext {
   bool areaAverage{false};
   std::unique_ptr<AreaCarry> areaCarry;
 
+  // Output rows no later block will touch: set when a block completes its row of blocks (its
+  // unclamped bottom edge). Between two rows of blocks everything above it is final, which is
+  // where a checkpointed decode parks (see park::).
+  int finalDstRows{0};
+
   // See PngContext for the rationale: monochromeOutput requests a 1-bit Atkinson dither
   // emitting only 0/3 so the BW DirectPixelWriter (`pixelValue < 3` rule) maps cleanly.
   int oneBitDitherRow{-1};
@@ -744,6 +749,9 @@ int emitGrayBlock(JpegContext& ctxRef, const uint8_t* pixels, int blockX, int bl
   int dstYEnd = (srcYEnd >= ctx->scaledSrcHeight) ? ctx->dstHeight : (int)((int64_t)srcYEnd * fineScaleFPY >> FP_SHIFT);
   int dstXStart = (int)((int64_t)blockX * fineScaleFPX >> FP_SHIFT);
   int dstXEnd = (srcXEnd >= ctx->scaledSrcWidth) ? ctx->dstWidth : (int)((int64_t)srcXEnd * fineScaleFPX >> FP_SHIFT);
+  // The decoder only pauses between rows of blocks, and this block finishes its row before
+  // control returns to it: the rows above its bottom edge are then final.
+  if (srcXEnd >= ctx->scaledSrcWidth) ctx->finalDstRows = std::min(dstYEnd, ctx->dstHeight);
 
   // Area-average bookkeeping works on the unclipped ranges: a pixel off screen still has to
   // pass its share on, or the visible pixel next to it would inherit a stale carry.
@@ -1092,6 +1100,222 @@ void configureResample(JpegContext& ctx, const bool allowAreaAverage) {
     }
   }
 }
+
+// ---- Parked decodes (RenderConfig::checkpointPath) ---------------------------------------------
+// A decode stopped for input between two rows of blocks is parked instead of thrown away: its pixel
+// caches keep the rows already done in their .part files, and one checkpoint file holds the rest --
+// the decoder's state and the pipeline's carried state (area carry, ditherer error rows). The next
+// decode of the same image with the same configuration resumes it. The reader's image lane hands
+// its region back on every page turn, and in runs 18-21 (X3) it threw away 73 s of preempted
+// decodes against 54 s it completed; one image restarted five times.
+namespace park {
+constexpr uint32_t MAGIC = 0x314B504A;  // "JPK1"
+enum Kind : uint8_t { KIND_PROGRESSIVE = 1, KIND_BASELINE = 2 };
+enum Flag : uint16_t {
+  F_MONOCHROME = 1 << 0,
+  F_DITHERING = 1 << 1,
+  F_ATKINSON = 1 << 2,
+  F_AREA_CARRY = 1 << 3,
+  F_COMPANION = 1 << 4,
+  F_COMPANION_ATKINSON = 1 << 5,
+  F_COARSE = 1 << 6,
+  F_DITHER_BAND = 1 << 7,
+};
+
+// Everything that shapes the rows a decode writes, plus where it stopped.
+struct Header {
+  uint32_t magic;
+  uint32_t imageBytes;
+  uint16_t srcWidth, srcHeight, dstWidth, dstHeight;
+  int16_t x, y;  // the ordered dither depends on screen position
+  uint8_t kind, scale;
+  uint16_t flags;
+  uint8_t ditherMode;
+  uint8_t reserved[3];
+  int32_t finalRows;   // rows already in the parked caches
+  uint32_t sinkBytes;  // pipeline state after the header; the decoder's own follows it
+};
+
+bool sameDecode(const Header& a, const Header& b) {
+  return a.magic == b.magic && a.imageBytes == b.imageBytes && a.srcWidth == b.srcWidth && a.srcHeight == b.srcHeight &&
+         a.dstWidth == b.dstWidth && a.dstHeight == b.dstHeight && a.x == b.x && a.y == b.y && a.kind == b.kind &&
+         a.scale == b.scale && a.flags == b.flags && a.ditherMode == b.ditherMode;
+}
+
+// TJpgDec between two MCU rows: what jd_prepare() cannot rebuild from the headers.
+struct BaselineState {
+  JDCURSOR cursor;
+  uint32_t wreg;
+  uint32_t nextByte;  // file offset of the first entropy byte not yet taken into the bit register
+  int16_t dcv[3];
+  uint8_t dbit;
+  uint8_t marker;
+};
+
+template <typename T>
+bool writeAll(FsFile& f, const T* p, const size_t count) {
+  const size_t n = sizeof(T) * count;
+  return n == 0 || f.write(reinterpret_cast<const uint8_t*>(p), n) == n;
+}
+template <typename T>
+bool readAll(FsFile& f, T* p, const size_t count) {
+  const size_t n = sizeof(T) * count;
+  return n == 0 || f.read(p, n) == static_cast<int>(n);
+}
+
+Header describe(const JpegContext& ctx, const RenderConfig& config, const uint32_t imageBytes, const int srcWidth,
+                const int srcHeight, const Kind kind, const uint8_t scale, const bool coarse) {
+  Header h{};
+  h.magic = MAGIC;
+  h.imageBytes = imageBytes;
+  h.srcWidth = static_cast<uint16_t>(srcWidth);
+  h.srcHeight = static_cast<uint16_t>(srcHeight);
+  h.dstWidth = static_cast<uint16_t>(ctx.dstWidth);
+  h.dstHeight = static_cast<uint16_t>(ctx.dstHeight);
+  h.x = static_cast<int16_t>(config.x);
+  h.y = static_cast<int16_t>(config.y);
+  h.kind = kind;
+  h.scale = scale;
+  h.flags = static_cast<uint16_t>(
+      (config.monochromeOutput ? F_MONOCHROME : 0) | (config.useDithering ? F_DITHERING : 0) |
+      (ctx.atkinson1BitDitherer ? F_ATKINSON : 0) | (ctx.areaCarry ? F_AREA_CARRY : 0) |
+      (ctx.companion ? F_COMPANION : 0) | (ctx.companion && ctx.companion->atkinson1Bit ? F_COMPANION_ATKINSON : 0) |
+      (coarse ? F_COARSE : 0) | (ctx.ditherBand ? F_DITHER_BAND : 0));
+  h.ditherMode = static_cast<uint8_t>(ctx.effectiveDitherMode);
+  return h;
+}
+
+size_t ditherBytes(const Atkinson1BitDitherer& d) { return 3 * d.stateRowLength() * sizeof(int16_t); }
+
+size_t sinkBytes(const JpegContext& ctx) {
+  size_t n = 0;
+  if (ctx.areaCarry) n += 2 * (sizeof(int32_t) + static_cast<size_t>(ctx.areaCarry->width) * 3);
+  if (ctx.atkinson1BitDitherer) n += sizeof(int32_t) + ditherBytes(*ctx.atkinson1BitDitherer);
+  if (ctx.companion) {
+    n += sizeof(int32_t);
+    if (ctx.companion->atkinson1Bit) n += ditherBytes(*ctx.companion->atkinson1Bit);
+  }
+  return n;
+}
+
+bool writeDither(FsFile& f, const Atkinson1BitDitherer& d) {
+  for (int i = 0; i < 3; ++i) {
+    if (!writeAll(f, d.stateRow(i), d.stateRowLength())) return false;
+  }
+  return true;
+}
+bool readDither(FsFile& f, Atkinson1BitDitherer& d) {
+  for (int i = 0; i < 3; ++i) {
+    if (!readAll(f, d.stateRow(i), d.stateRowLength())) return false;
+  }
+  return true;
+}
+
+// Between two rows of blocks the dither band is empty and the area carry's column carry is dead
+// (the next row starts at column 0), so this is the pipeline's whole state.
+bool writeSink(FsFile& f, const JpegContext& ctx) {
+  if (ctx.areaCarry) {
+    const AreaCarry& carry = *ctx.areaCarry;
+    for (const AreaCarry::PendingRow& slot : carry.pending) {
+      const int32_t row = slot.row;
+      if (!writeAll(f, &row, 1) || !writeAll(f, slot.weight.get(), static_cast<size_t>(carry.width)) ||
+          !writeAll(f, slot.mean.get(), static_cast<size_t>(carry.width))) {
+        return false;
+      }
+    }
+  }
+  if (ctx.atkinson1BitDitherer) {
+    const int32_t row = ctx.oneBitDitherRow;
+    if (!writeAll(f, &row, 1) || !writeDither(f, *ctx.atkinson1BitDitherer)) return false;
+  }
+  if (ctx.companion) {
+    const int32_t row = ctx.companion->row;
+    if (!writeAll(f, &row, 1)) return false;
+    if (ctx.companion->atkinson1Bit && !writeDither(f, *ctx.companion->atkinson1Bit)) return false;
+  }
+  return true;
+}
+
+bool readSink(FsFile& f, JpegContext& ctx) {
+  if (ctx.areaCarry) {
+    AreaCarry& carry = *ctx.areaCarry;
+    for (AreaCarry::PendingRow& slot : carry.pending) {
+      int32_t row = -1;
+      if (!readAll(f, &row, 1) || !readAll(f, slot.weight.get(), static_cast<size_t>(carry.width)) ||
+          !readAll(f, slot.mean.get(), static_cast<size_t>(carry.width))) {
+        return false;
+      }
+      slot.row = row;
+    }
+  }
+  if (ctx.atkinson1BitDitherer) {
+    int32_t row = -1;
+    if (!readAll(f, &row, 1) || !readDither(f, *ctx.atkinson1BitDitherer)) return false;
+    ctx.oneBitDitherRow = row;
+  }
+  if (ctx.companion) {
+    int32_t row = -1;
+    if (!readAll(f, &row, 1)) return false;
+    ctx.companion->row = row;
+    if (ctx.companion->atkinson1Bit && !readDither(f, *ctx.companion->atkinson1Bit)) return false;
+  }
+  return true;
+}
+
+// What a half-read checkpoint may have left in the pipeline: back to a fresh decode's state.
+void resetSink(JpegContext& ctx) {
+  if (ctx.areaCarry) {
+    for (AreaCarry::PendingRow& slot : ctx.areaCarry->pending) slot.row = -1;
+    ctx.areaCarry->rowCol = -1;
+  }
+  ctx.oneBitDitherRow = -1;
+  if (ctx.atkinson1BitDitherer) ctx.atkinson1BitDitherer->reset();
+  if (ctx.companion) {
+    ctx.companion->row = -1;
+    if (ctx.companion->atkinson1Bit) ctx.companion->atkinson1Bit->reset();
+  }
+  ctx.finalDstRows = 0;
+}
+
+// A checkpoint and the partial caches it belongs to.
+void discard(const RenderConfig& config) {
+  Storage.remove(config.checkpointPath.c_str());
+  if (!config.cachePath.empty()) Storage.remove(PixelCache::partPathFor(config.cachePath).c_str());
+  if (!config.companionCachePath.empty()) Storage.remove(PixelCache::partPathFor(config.companionCachePath).c_str());
+}
+
+// Park a decode stopped between two rows of blocks: flush the caches through the last final row and
+// keep their partial files, then write the checkpoint. `writeDecoder` appends the decoder's state.
+// False (everything dropped) when the pipeline is not in a state a resume could rebuild, or a write
+// fails.
+template <typename WriteDecoder>
+bool parkDecode(JpegContext& ctx, const RenderConfig& config, Header header, WriteDecoder&& writeDecoder) {
+  // A cache dropped mid-decode (a failed write) changes what a resume would build.
+  if (!ctx.caching || ((header.flags & F_COMPANION) != 0) != (ctx.companion != nullptr)) {
+    if (ctx.caching) ctx.cache.abort();
+    if (ctx.companion) ctx.companion->cache.abort();
+    discard(config);
+    return false;
+  }
+  const int rows = ctx.finalDstRows;
+  bool ok = ctx.cache.park(rows);
+  if (ok && ctx.companion) ok = ctx.companion->cache.park(rows);
+  FsFile out;
+  if (ok) ok = Storage.openFileForWrite("JPG", config.checkpointPath, out);
+  if (ok) {
+    header.finalRows = rows;
+    header.sinkBytes = static_cast<uint32_t>(sinkBytes(ctx));
+    ok = writeAll(out, &header, 1) && writeSink(out, ctx) && writeDecoder(out);
+    out.close();
+  }
+  if (!ok) {
+    if (ctx.cache.file.isOpen()) ctx.cache.abort();
+    if (ctx.companion && ctx.companion->cache.file.isOpen()) ctx.companion->cache.abort();
+    discard(config);
+  }
+  return ok;
+}
+}  // namespace park
 
 // Draw a simple bordered placeholder where an undecodable (non-baseline) JPEG would
 // have gone, so the layout shows a framed gap rather than a silent blank.
@@ -1448,14 +1672,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   // dedicated run, never in normal builds.
   ctx.caching = false;
 #endif
-  if (ctx.caching) {
-    if (!ctx.cache.begin(config.cachePath, destWidth, destHeight, config.x, config.y, maxBlockDstRows)) {
-      LOG_ERR("JPG", "Failed to start cache stream, continuing without caching");
-      ctx.caching = false;
-    } else if (coarseDecode) {
-      ctx.cache.markCoarse();
-    }
-  }
+  // The cache files are opened further down, once it is known whether a parked decode resumes.
 
   if (shouldForceBayerDither(config)) {
     LOG_DBG("JPG", "Low-memory mode: forcing Bayer dithering (%u free)", static_cast<unsigned>(ESP.getFreeHeap()));
@@ -1562,12 +1779,124 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
       ctx.companion->atkinson1Bit = makeUniqueNoThrow<Atkinson1BitDitherer>(destWidth);
       if (!ctx.companion->atkinson1Bit) ctx.companion.reset();
     }
-    if (ctx.companion && !ctx.companion->cache.begin(config.companionCachePath, destWidth, destHeight, config.x,
-                                                     config.y, maxBlockDstRows)) {
-      LOG_ERR("JPG", "Failed to start companion cache stream, continuing with one variant");
-      ctx.companion.reset();
-    } else if (ctx.companion && coarseDecode) {
-      ctx.companion->cache.markCoarse();
+  }
+
+  // A parked decode of this image (see park::) resumes when everything that shapes its rows is
+  // what it was: same image, box, scale, ditherers, carry and companion. Anything else starts over.
+  bool checkpointable = !config.checkpointPath.empty() && ctx.caching && !dcPreview && !config.adaptiveTone.active &&
+                        (fullProgressive || mode == JpegMode::Baseline);
+#ifdef ENABLE_IMAGE_DITHERING_EXTENSION
+  if (ctx.atkinsonDitherer || ctx.diffusedBayerDitherer) checkpointable = false;
+#endif
+  const park::Header parkKey =
+      checkpointable
+          ? park::describe(ctx, config, static_cast<uint32_t>(file.size()), srcWidth, srcHeight,
+                           fullProgressive ? park::KIND_PROGRESSIVE : park::KIND_BASELINE, tjpgScale, coarseDecode)
+          : park::Header{};
+  park::Header parked{};
+  FsFile checkpoint;
+  bool resuming = false;
+  if (!config.checkpointPath.empty() && Storage.exists(config.checkpointPath.c_str())) {
+    if (checkpointable && Storage.openFileForRead("JPG", config.checkpointPath, checkpoint) &&
+        park::readAll(checkpoint, &parked, 1) && park::sameDecode(parked, parkKey) &&
+        parked.sinkBytes == park::sinkBytes(ctx) && parked.finalRows >= 0 && parked.finalRows <= destHeight) {
+      resuming = true;
+    } else if (!ctx.caching) {
+      // This pass writes no cache -- the heap gate refused one -- so it cannot disturb the parked
+      // partial files. Leave the parked decode for a pass that can resume it: throwing it away here
+      // made a page render on a tight heap discard what the image lane had already decoded. (A pass
+      // that does cache, even a coarse one, supersedes the checkpoint below: keeping it past a pass
+      // that could cache risks an image that is never cached at all.)
+      LOG_INF("JPG", "Leaving a parked decode for a pass with room to cache: %s", imagePath.c_str());
+      if (checkpoint) checkpoint.close();
+    } else {
+      LOG_INF("JPG", "Discarding a parked decode that no longer matches: %s", imagePath.c_str());
+      if (checkpoint) checkpoint.close();
+      park::discard(config);
+    }
+  }
+
+  // Full progressive: set up before the caches, since a resume restores the decoder first.
+  ProgressiveJpeg::Decoder progressive;
+  ProgressiveJpeg::DecodeOptions progressiveOptions;
+  ProgressiveJpeg::DecodeStats progressiveStats;
+  FullProgressiveSink progressiveSink{&ctx, false};
+  if (fullProgressive) {
+    progressiveOptions.scaleShift = tjpgScale;
+    progressiveOptions.shouldAbort = fullProgressiveShouldAbort;
+    progressiveOptions.workspace = progressiveWorkspace->get();
+    progressiveOptions.workspaceSize = progressiveWorkspaceBytes;
+    progressiveOptions.stats = &progressiveStats;
+    progressiveOptions.clock = []() -> uint32_t { return millis(); };
+  }
+  park::BaselineState baseline{};
+
+  const unsigned long resumeStart = millis();
+  if (resuming) {
+    // Decoder, then caches, then the pipeline's carried state; any refusal drops the lot and this
+    // decode fails (the next one starts over, with no checkpoint in the way).
+    const uint32_t decoderAt = static_cast<uint32_t>(sizeof(park::Header)) + parked.sinkBytes;
+    bool ok = checkpoint.seekSet(decoderAt);
+    if (ok && fullProgressive) {
+      ok = progressive.resume(file, progressiveOptions, fullProgressiveOutput, &progressiveSink, checkpoint) ==
+           ProgressiveJpeg::Result::Ok;
+      progressiveSink.emitted = true;  // rows exist: a failure from here on is no case for the preview
+    } else if (ok) {
+      ok = park::readAll(checkpoint, &baseline, 1);
+    }
+    ok = ok && checkpoint.seekSet(sizeof(park::Header)) &&
+         ctx.cache.resume(config.cachePath, destWidth, destHeight, config.x, config.y, maxBlockDstRows,
+                          parked.finalRows, coarseDecode);
+    if (ok && ctx.companion) {
+      ok = ctx.companion->cache.resume(config.companionCachePath, destWidth, destHeight, config.x, config.y,
+                                       maxBlockDstRows, parked.finalRows, coarseDecode);
+    }
+    ok = ok && park::readSink(checkpoint, ctx);
+    if (ok && mode == JpegMode::Baseline) {
+      // jd_prepare() rebuilt the tables; put the bit reader back where the parked decode left it.
+      ok = file.seekSet(baseline.nextByte);
+      if (ok) {
+        jdec.dctr = 0;
+        jdec.dptr = jdec.inbuf;
+        jdec.wreg = baseline.wreg;
+        jdec.dbit = baseline.dbit;
+        jdec.marker = baseline.marker;
+        memcpy(jdec.dcv, baseline.dcv, sizeof(jdec.dcv));
+        jdec.scale = tjpgScale;
+      }
+    }
+    checkpoint.close();
+    if (!ok) {
+      LOG_ERR("JPG", "Parked decode could not be resumed; starting over next time: %s", imagePath.c_str());
+      progressive.end();
+      ctx.cache.abort();
+      if (ctx.companion) ctx.companion->cache.abort();
+      park::resetSink(ctx);
+      park::discard(config);
+      file.close();
+      return false;
+    }
+    ctx.finalDstRows = parked.finalRows;
+    LOG_INF("JPG", "Resumed a parked decode at row %d/%d in %lu ms: %s", parked.finalRows, destHeight,
+            millis() - resumeStart, imagePath.c_str());
+  } else {
+    if (ctx.caching) {
+      if (!ctx.cache.begin(config.cachePath, destWidth, destHeight, config.x, config.y, maxBlockDstRows)) {
+        LOG_ERR("JPG", "Failed to start cache stream, continuing without caching");
+        ctx.caching = false;
+      } else if (coarseDecode) {
+        ctx.cache.markCoarse();
+      }
+    }
+    if (ctx.companion && !ctx.caching) ctx.companion.reset();  // a companion only rides along the primary
+    if (ctx.companion) {
+      if (!ctx.companion->cache.begin(config.companionCachePath, destWidth, destHeight, config.x, config.y,
+                                      maxBlockDstRows)) {
+        LOG_ERR("JPG", "Failed to start companion cache stream, continuing with one variant");
+        ctx.companion.reset();
+      } else if (coarseDecode) {
+        ctx.companion->cache.markCoarse();
+      }
     }
   }
 
@@ -1575,27 +1904,45 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   unsigned long decodeStart = millis();
   ProgressiveJpegDc::Result progressiveResult = ProgressiveJpegDc::Result::Ok;
   bool runDcPreview = dcPreview;
+  bool aborted = false;  // stopped for input between two rows of blocks
+  bool isParked = false;
+  unsigned long parkMs = 0;
   if (fullProgressive) {
-    ProgressiveJpeg::DecodeOptions options;
-    options.scaleShift = tjpgScale;
-    options.shouldAbort = fullProgressiveShouldAbort;
-    options.workspace = progressiveWorkspace->get();
-    options.workspaceSize = progressiveWorkspaceBytes;
-    ProgressiveJpeg::DecodeStats stats;
-    options.stats = &stats;
-    options.clock = []() -> uint32_t { return millis(); };
-    FullProgressiveSink sink{&ctx, false};
-    const auto result = ProgressiveJpeg::decode(file, options, fullProgressiveOutput, &sink);
-    progressiveWorkspace.reset();
+    ProgressiveJpeg::Result result =
+        resuming ? ProgressiveJpeg::Result::Ok
+                 : progressive.begin(file, progressiveOptions, fullProgressiveOutput, &progressiveSink);
+    if (result == ProgressiveJpeg::Result::Ok) {
+      do {
+        result = progressive.step(UINT16_MAX);  // the abort hook still polls per band / 32 KB of index
+      } while (result == ProgressiveJpeg::Result::Pending);
+    }
     LOG_DBG("JPG", "Progressive %dx%d at 1/%d: index %lu ms, bands %lu ms, %lu reads / %lu bytes", srcWidth, srcHeight,
-            1 << tjpgScale, static_cast<unsigned long>(stats.indexMs), static_cast<unsigned long>(stats.bandsMs),
-            static_cast<unsigned long>(stats.reads), static_cast<unsigned long>(stats.bytesRead));
+            1 << tjpgScale, static_cast<unsigned long>(progressiveStats.indexMs),
+            static_cast<unsigned long>(progressiveStats.bandsMs), static_cast<unsigned long>(progressiveStats.reads),
+            static_cast<unsigned long>(progressiveStats.bytesRead));
     if (result == ProgressiveJpeg::Result::Aborted) {
+      aborted = true;
       progressiveResult = ProgressiveJpegDc::Result::Aborted;
-    } else if (result != ProgressiveJpeg::Result::Ok) {
+      if (checkpointable) {
+        const unsigned long parkStart = millis();
+        isParked =
+            park::parkDecode(ctx, config, parkKey, [&](FsFile& out) { return progressive.writeCheckpoint(out); });
+        parkMs = millis() - parkStart;
+      }
+    }
+    const uint16_t bandsDone = progressive.bandsDone();
+    const uint16_t bandCount = progressive.bandCount();
+    progressive.end();
+    progressiveWorkspace.reset();
+    if (isParked) {
+      LOG_INF("JPG", "Parked at band %u/%u, row %d/%d in %lu ms (%u B of state): %s", bandsDone, bandCount,
+              ctx.finalDstRows, destHeight, parkMs,
+              static_cast<unsigned>(sizeof(park::Header) + park::sinkBytes(ctx) + progressive.checkpointSize()),
+              imagePath.c_str());
+    } else if (!aborted && result != ProgressiveJpeg::Result::Ok) {
       LOG_ERR("JPG", "Progressive JPEG full decode failed (%s)%s: %s", ProgressiveJpeg::resultName(result),
-              sink.emitted ? "" : ", trying the DC preview", imagePath.c_str());
-      if (sink.emitted) {
+              progressiveSink.emitted ? "" : ", trying the DC preview", imagePath.c_str());
+      if (progressiveSink.emitted) {
         progressiveResult = ProgressiveJpegDc::Result::InvalidData;
       } else {
         // Nothing was drawn or cached yet, so the preview can start over on the same context.
@@ -1615,7 +1962,32 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     options.shouldAbort = progressiveShouldAbort;
     progressiveResult = ProgressiveJpegDc::decode(file, options, progressiveOutput, &ctx);
   } else if (mode == JpegMode::Baseline) {
-    jr = jd_decomp(&jdec, tjpgOutput, tjpgScale);
+    // One MCU row at a time. A checkpointable decode stops between rows for input and parks; any
+    // other runs to the end, as TJpgDec always did.
+    JDCURSOR& cursor = baseline.cursor;
+    for (;;) {
+      jr = jd_decomp_rows(&jdec, tjpgOutput, tjpgScale, &cursor, 1);
+      if (jr != JDR_OK || cursor.done) break;
+      if (checkpointable && CooperativeAbort::shouldAbortLongTask()) {
+        CooperativeAbort::markAborted();
+        aborted = true;
+        break;
+      }
+    }
+    if (aborted) {
+      baseline.wreg = jdec.wreg;
+      baseline.dbit = jdec.dbit;
+      baseline.marker = jdec.marker;
+      memcpy(baseline.dcv, jdec.dcv, sizeof(baseline.dcv));
+      baseline.nextByte = static_cast<uint32_t>(file.position() - jdec.dctr);
+      const unsigned long parkStart = millis();
+      isParked = park::parkDecode(ctx, config, parkKey, [&](FsFile& out) { return park::writeAll(out, &baseline, 1); });
+      parkMs = millis() - parkStart;
+      if (isParked) {
+        LOG_INF("JPG", "Parked at MCU row y=%u, row %d/%d in %lu ms: %s", static_cast<unsigned>(cursor.y),
+                ctx.finalDstRows, destHeight, parkMs, imagePath.c_str());
+      }
+    }
   }
   unsigned long decodeTime = millis() - decodeStart;
   // Check before abort() so a corrupt reading is attributed to the decode itself
@@ -1623,22 +1995,38 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   jpgCheckHeap("jpg_after_decode");
   file.close();
 
+  if (aborted) {
+    // Preempted by input: the caller retries later (CooperativeAbort::markAborted is set). A parked
+    // decode picks up from its checkpoint then; any other starts over.
+    if (!isParked) {
+      LOG_DBG("JPG", "JPEG decode stopped for input after %lu ms: %s", decodeTime, imagePath.c_str());
+      if (ctx.caching) ctx.cache.abort();
+      if (ctx.companion) ctx.companion->cache.abort();
+      if (resuming) park::discard(config);
+    }
+    drawUnsupportedPlaceholder(renderer, config);
+    return true;
+  }
+  const auto dropAll = [&]() {
+    if (ctx.caching) ctx.cache.abort();
+    if (ctx.companion) ctx.companion->cache.abort();
+    if (resuming) park::discard(config);
+  };
   if (mode == JpegMode::Progressive && progressiveResult != ProgressiveJpegDc::Result::Ok) {
     LOG_ERR("JPG", "Progressive JPEG decode failed (%s): %s", ProgressiveJpegDc::resultName(progressiveResult),
             imagePath.c_str());
-    if (ctx.caching) ctx.cache.abort();
-    if (ctx.companion) ctx.companion->cache.abort();
+    dropAll();
     drawUnsupportedPlaceholder(renderer, config);
     return true;
   }
   if (mode == JpegMode::Baseline && jr != JDR_OK) {
     LOG_ERR("JPG", "TJpgDec decode failed (jr=%d): %s", jr, imagePath.c_str());
-    if (ctx.caching) ctx.cache.abort();
-    if (ctx.companion) ctx.companion->cache.abort();
+    dropAll();
     return false;
   }
 
-  LOG_DBG("JPG", "JPEG decoding complete - render time: %lu ms%s", decodeTime, ctx.companion ? " (both variants)" : "");
+  LOG_DBG("JPG", "JPEG decoding complete - render time: %lu ms%s%s", decodeTime,
+          ctx.companion ? " (both variants)" : "", resuming ? " (resumed)" : "");
 
   // Finalize the streamed cache file. Note: a flush failure mid-decode clears
   // ctx.caching (the partial file is dropped), so re-read the flag here.
@@ -1653,6 +2041,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
       ctx.companion->cache.abort();
     }
   }
+  if (resuming) Storage.remove(config.checkpointPath.c_str());
 
   return true;
 }

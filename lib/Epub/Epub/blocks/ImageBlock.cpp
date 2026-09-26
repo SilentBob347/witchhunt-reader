@@ -424,6 +424,11 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
   if (alsoCacheOtherVariant) {
     config.companionCachePath = monochromeOutput ? getGrayscaleCachePath(imagePath) : getBwCachePath(imagePath);
   }
+  // A JPEG decode stopped for input parks here and the next decode of it resumes (see
+  // RenderConfig::checkpointPath): the reader's image lane gives its region back on every page
+  // turn, and used to throw the decode away with it.
+  const bool jpeg = FsHelpers::hasJpgExtension(imagePath);
+  if (jpeg) config.checkpointPath = imagePath + ".ckpt";
 
   // Deliberately no adaptive tone on either variant: both .pxc files are dithered straight
   // from the raw luminance. The curve has to be derived from a completed histogram, and a
@@ -490,9 +495,15 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
 
   LOG_TRC("IMG", "Using %s decoder", decoder->getFormatName());
 
+  // A resumed decode draws only the rows after its park; the finished cache has them all.
+  const bool resuming = jpeg && Storage.exists(config.checkpointPath.c_str());
   bool success = decoder->decodeToFramebuffer(imagePath, renderer, config);
   if (!success) {
     LOG_ERR("IMG", "Failed to decode image: %s", imagePath.c_str());
+    return;
+  }
+  if (resuming && !Storage.exists(config.checkpointPath.c_str())) {
+    renderFromCache(renderer, cachePath, x, y, width, renderedHeight, srcYOffset_, srcHeight_);
   }
 }
 
