@@ -1255,6 +1255,28 @@ bool coverBmpComplete(const std::string& path) {
   f.close();
   return ok;
 }
+
+// A thumbnail worth keeping: every pixel row present, and no larger than its slot (the themes draw
+// thumbs 1:1; an oversized one from an older crop mode would be rescaled, aliasing its dither).
+// The generators' own "already done" short-circuit. It used coverBmpComplete() until that learned
+// to demand 8 bpp for the sleep-screen cover (ee71b96c8, 2026-08-05), which no 1-bit thumbnail
+// passes: every generator call re-decoded a thumbnail that was already there. Mirrors
+// ReaderActivity::isCoverThumbComplete, which the callers check first.
+bool thumbBmpComplete(const std::string& path, const int slotWidth, const int slotHeight) {
+  FsFile f;
+  if (!Storage.openFileForRead("EBP", path, f)) return false;
+  if (f.size() == 0) {
+    f.close();
+    return false;
+  }
+  Bitmap bmp(f);
+  bool ok = bmp.parseHeaders() == BmpReaderError::Ok && bmp.isComplete();
+  if (ok && slotWidth > 0 && slotHeight > 0 && (bmp.getWidth() > slotWidth || bmp.getHeight() > slotHeight)) {
+    ok = false;
+  }
+  f.close();
+  return ok;
+}
 }  // namespace
 
 bool Epub::coverBmpReady(bool cropped) const { return coverBmpComplete(getCoverBmpPath(cropped)); }
@@ -1365,7 +1387,7 @@ ThumbResult Epub::generateThumbBmp(int height, bool allowExtract, BuildArena* sc
       // size>0 is not "done": a thumb truncated by an interrupted write must be regenerated, not
       // returned as valid (the caller's completeness check would otherwise reject it forever and
       // loop). Reuse only a complete BMP; else fall through (openFileForWrite below truncates it).
-      if (coverBmpComplete(getThumbBmpPath(height))) return ThumbResult::Ok;
+      if (thumbBmpComplete(getThumbBmpPath(height), height * 6 / 10, height)) return ThumbResult::Ok;
       LOG_DBG("EBP", "Existing h=%d thumb is truncated — regenerating", height);
     }
   }
@@ -1455,7 +1477,7 @@ ThumbResult Epub::generateThumbBmp(int width, int height, bool allowExtract, Bui
       // size>0 is not "done": a thumb truncated by an interrupted write must be regenerated, not
       // returned as valid (the caller's completeness check would otherwise reject it forever and
       // loop). Reuse only a complete BMP; else fall through (openFileForWrite below truncates it).
-      if (coverBmpComplete(getThumbBmpPath(width, height))) return ThumbResult::Ok;
+      if (thumbBmpComplete(getThumbBmpPath(width, height), width, height)) return ThumbResult::Ok;
       LOG_DBG("EBP", "Existing %dx%d thumb is truncated — regenerating", width, height);
     }
   }
@@ -1549,7 +1571,7 @@ ThumbResult Epub::generateThumbBmps(const std::pair<int, int>* sizes, const int 
         LOG_DBG("EBP", "Sentinel found for %dx%d thumb, skipping retry", sizes[i].first, sizes[i].second);
         return ThumbResult::StructurallyAbsent;
       }
-      if (coverBmpComplete(path)) continue;
+      if (thumbBmpComplete(path, sizes[i].first, sizes[i].second)) continue;
       LOG_DBG("EBP", "Existing %dx%d thumb is truncated — regenerating", sizes[i].first, sizes[i].second);
     }
     needed[i] = true;

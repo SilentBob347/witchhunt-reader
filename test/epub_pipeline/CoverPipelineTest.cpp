@@ -239,8 +239,13 @@ TEST_F(CoverPipelineFixture, BothCarouselThumbsFromOneJpegDecode) {
     ASSERT_GE(small.size(), 62u);
     // 40x28 1-bit, top-down: 62-byte header + 28 rows of 8 bytes.
     EXPECT_EQ(small.size(), 62u + 28u * 8u);
-    // A second call finds both complete and decodes nothing.
+    // A second call finds both complete and decodes nothing: with the cached cover replaced by
+    // bytes no decoder takes, a decode would fail.
+    if (!inPlace) {
+      std::ofstream(epub.getCoverImageCachePath(), std::ios::binary | std::ios::trunc) << "\xFF\xD8\xFF\xE0garbage";
+    }
     EXPECT_EQ(epub.generateThumbBmps(sizes, 2, /*allowExtract=*/false), ThumbResult::Ok);
+    EXPECT_EQ(readFileString(epub.getThumbBmpPath(90, 60)), reference);
   }
 }
 
