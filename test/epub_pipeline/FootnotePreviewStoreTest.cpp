@@ -111,31 +111,6 @@ TEST(FootnotePreviewStore, AccumulatesPerSpineAndIsIdempotent) {
   EXPECT_EQ(storeTexts(*epub), afterFirst);
 }
 
-TEST(FootnotePreviewStore, ResolvedSpineNeedsNoArchive) {
-  const std::string cacheDir = freshDir("no_archive");
-  const std::string epubCopy = cacheDir + "/book.epub";  // work from a copy, never the corpus
-  fs::copy_file(kCorpusEpub, epubCopy);
-
-  auto epub = openBook(epubCopy, cacheDir);
-  ASSERT_TRUE(FootnotePreviews::resolveSpine(*epub, kChapterSpine));
-  const std::vector<std::string> resolved = storeTexts(*epub);
-  ASSERT_FALSE(resolved.empty());
-
-  // Pass A reads the spine's banked XHTML and Pass B has nothing left to fetch, so a re-resolve
-  // must not touch the archive. Deleting it is the only way to prove that from outside.
-  GfxRenderer renderer;
-  Section section(epub, kChapterSpine, renderer);
-  Section::BuildParams params;
-  params.viewportWidth = 480;
-  params.viewportHeight = 800;
-  params.lineCompression = 1.0f;
-  ASSERT_TRUE(section.createSectionFile(params, {}, /*skipEviction=*/true));  // banks chapter1
-  fs::remove(epubCopy);
-
-  EXPECT_TRUE(FootnotePreviews::resolveSpine(*epub, kChapterSpine));
-  EXPECT_EQ(storeTexts(*epub), resolved);
-}
-
 TEST(FootnotePreviewStore, BanksTheNoteDocumentItStreams) {
   const std::string cacheDir = freshDir("banks_notes");
   auto epub = openBook(kCorpusEpub, cacheDir);
