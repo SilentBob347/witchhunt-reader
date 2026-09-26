@@ -1192,7 +1192,118 @@ the hole (the `0x3fcbc778` pin) but does not split it. Since R1b Home lends
 rather than releases, and the post-sync silent restart re-lays the heap
 anyway, this stack is no longer on any failure path. Left as is.
 
-## 8. Appendix — where the numbers come from
+## 8. Build allocation inventory — X3 and X4 (2026-09-26)
+
+*Asked for before any more heap moves into the arena: the arena is not unlimited, so every
+candidate has to be checked against the room the arena actually has while the candidate is alive.*
+The X3 and X4 are the benchmark: ESP32-C3, no PSRAM. (The X4 Pro and the T5 S3 are ESP32-S3
+boards with 8 MB PSRAM and `CONFIG_SPIRAM_USE_MALLOC`: anything over 4 KB lands in PSRAM and the
+free-heap figure includes it, so Background-B's heap gate is always met there.)
+
+**Method.** A new host tool, `epub_build_inventory` (`test/epub_pipeline/InventoryMain.cpp`), runs
+the real section build of *Strange Pictures* with a lent region of the board's secondary
+framebuffer (X3 52 272 B, X4 48 000 B) and records, per chapter build:
+
+- *heap*: every allocation site the build touched, keyed by its code location and two caller frames
+  (a shared helper such as `SaxParser::init` would otherwise carry whichever caller claimed it
+  first), with its live bytes at the build's start, at the build's own heap peak (snapshotted to
+  within 128 B) and at its end; the first frame above the allocator is chosen by symbol, and the
+  build uses `-fno-ipa-icf` so folded functions keep their names;
+- *arena*: a shadow stack of every live allocation in the lent region, fed by host-only trace hooks
+  in `BuildArena` (`BUILD_ARENA_TRACE`; compiled out of firmware), snapshotted at the arena's peak
+  and at the heap's peak, plus every arena allocation of 4 KB or more;
+- *phases*: heap and arena at the start and peak of setup, extraction (with the resident setup that
+  follows it) and layout.
+
+`inventory_report.py` symbolizes the records to file:line. The host renderer's metrics are
+synthetic, so the viewport was calibrated to the device's pagination: 400 × 430 gives 183 / 145
+pages for Chapters 3 / 4 against the X3's 180 / 147; the X4 run uses 362 × 435 (scaled by the
+panel difference). The host is 64-bit: pointers, `std::string` (32 vs 24 B) and vectors are larger
+than on the C3, so heap sites holding objects read ~1.3–1.6× high; byte buffers are exact. No
+32-bit multilib is installed on this machine (`g++ -m32` lacks its headers); the device trace
+below gives the 32-bit totals. The heap figures are the build's own growth above the heap it
+started from.
+
+**The arena, by moment** (identical layout on both boards apart from capacity):
+
+| moment | in use | free on X3 | free on X4 | what fills it |
+|---|---:|---:|---:|---|
+| setup | 3 888 | 48 384 | 44 112 | CSS ruleset 2 861, feed chunk 1 024 |
+| extraction | 45 872 | 6 400 | 2 128 | inflate ring 32 768, grow block 8 192, read buffer 1 024 |
+| layout, between image walks | ~14 900 | ~37 300 | ~33 100 | + SAX state 9 832, page block ~1–2 KB |
+| layout, 16 KB walk stage | ~31 800 | ~20 400 | ~16 200 | + ring 16 384 + read 512 |
+| layout, 32 KB walk stage | 47 900–48 016 | ~4 300 | **64** | + ring 32 768 + read 512 |
+
+Every image in this book has its dimensions beyond the 4 KB probe window, so every image is walked:
+one 16 KB stage per image (27 in Chapter 3), and a 32 KB stage for the images whose metadata runs
+past 16 KB (0–5 per chapter: Chapter 1 one, Chapter 2 five, Chapter 3 three, Chapter 4 none). The
+heap's peak never coincides with a walk: at the heap's peak the arena holds ~14.9 KB on both boards.
+
+**The heap, by phase** (host bytes above the build's start, Chapter 3 / Chapter 4):
+
+| phase | held at start | peak |
+|---|---:|---:|
+| setup | 0 | +20 282 / +14 610 |
+| extraction + resident setup | +12 405 / +10 829 | +25 885 / +24 309 |
+| layout + finalize | +16 461 / +14 645 | **+38 246 / +34 959** |
+
+Text-only chapters peak at ~+17.5 KB; the image chapters are the ones that set B's need.
+
+**What the heap holds at the build's peak** (Chapter 3, X3 profile; X4 within 1 %):
+
+| host bytes | what | lifetime | device size |
+|---:|---|---|---|
+| 4 096 + 4 096 + 512 | image-header resolve: probe buffer, its inflate ring, read chunk (`EpubImageManifest::resolve`, `ZipFile::readBytesFromStat`) | one resolve; freed before any walk | same (byte buffers) |
+| 4 608 + 2 920 | page-list anchors and labels, reserved at setup (`setExternalPageBreakAnchors`) | whole build | ~3.5 + ~2 KB |
+| 4 096 + 3 × 128 | `ParsedText` word vectors (128 entries once grown) | whole build | ~3.4 KB |
+| ~2 800 | line-break scratch and DP tables (`computeLineBreaks`, `calculateWordWidths`) | whole build | ~2 KB |
+| 1 896 | the `ChapterHtmlSlimParser` object | whole build | smaller |
+| 1 784 / 892 | paragraph LUT / section LUT reserves | build / **outlives it** (the reader's LUT) | half |
+| 1 448 + 633 | CSS style memos (8 entries) | whole build | smaller |
+| ~1 500 + ~340 | one page's `TextBlock` objects and `PageLine`s | one page | smaller |
+| 256 | the page's element vector | one page | 128 |
+| 640 + 656 + 3 × 472 | `BuildState`, `ParsedText`, three file handles | whole build | smaller |
+| ~1 100 | path strings, anchor spill, section writer buffer | whole build | similar |
+
+Not at the peak but worth naming: the inline footnote-preview resolve holds a 9 832 B SAX state and
+a 1 KB chunk on the heap between extraction and layout (`FootnotePreviews::Resolver`); the setup
+reads the page list through an 8 KB buffer seven times; the manifest keeps its resolve ZIP handle
+(472 B) after the build.
+
+**Decision, by lifetime against the room the arena has at that time:**
+
+1. *Image-header resolve (8.7 KB, at the heap's peak in every image chapter): move.* It lives only
+   inside one resolve, which the walk never overlaps; the arena then has ≥ 32 KB free on both boards.
+   A scoped block released before the walk costs the arena nothing at any of its peaks and takes up
+   to 8.7 KB off the build's heap peak — on the device too, since these are byte buffers.
+2. *Footnote-preview resolve (9.8 KB SAX state + 1 KB): move.* It runs between extraction and layout,
+   when the arena holds 3.9 KB. Not at the layout peak, but it is the setup phase's largest transient.
+3. *Whole-build heap state (~14 KB on the device): do not move wholesale.* Anything held across
+   layout coexists with the 32 KB walk stage, which leaves 64 B on the X4 and ~4.3 KB on the X3:
+   moving it would push the 32 KB walks out of the arena, defer those images and bring back the
+   second pass for their chapters. Shrink instead where it is cheap — the page-list anchors are
+   `std::pair<std::string,std::string>` per entry (~3.5 KB on the device) and fit a packed array
+   of a few hundred bytes; the word vectors and line-break scratch are bounded (128 words) and
+   could share one fixed buffer. On the X3 only, up to ~3 KB of it could live in the arena after
+   extraction; not worth a board-specific path.
+4. *Per-page objects: leave for now.* They are allocated in page order around the walks (a walk
+   scopes above the page block), so the lines of the page an image sits on would sit under its
+   ring: harmless on the X3, but they would cost the X4 its 32 KB walks for images late on a page.
+   Tables (11–15 KB of objects per page) are the case that would justify it, with a walk-aware
+   budget.
+5. *The LUT reserve outlives the build* (it becomes the reader's LUT) and stays on the heap.
+
+Expected effect of 1 + 2: the image chapters' layout peak falls by up to 8.7 KB on the device,
+which is most of the gap between a borrowed build's cost (≤ 19–24 KB measured, run 18) and the
+33–40 KB the X3 reads at. Background-B's 40 KB floor would then be re-derived from the device
+trace below, not from this table.
+
+**Device confirmation (pending).** `SCT_HEAP_TRACE=1` (set in the local `platformio.local.ini`)
+now prints the arena beside the heap on every page — `arena=` cursor, `hw=` peak, `cap=`, and
+`arenaAtLow=` at the page's heap low point. One X3 run (and one X4 run) of Chapters 3 and 4 from a
+wiped cache gives the 32-bit totals to set against this table.
+
+## 9. Appendix — where the numbers come from
 
 - Device runs (X3, firmware at PR #310's tip): run 3 = `device_run3.log` (14:19, wiped cache, blocking build), run 4 = `device_run4.log` (15:13), run 5 = `device.log` (15:19, after the SAX-in-arena fix).
 - Host census: `epub_pipeline_dump <book> <cacheDir> --bench [--arena=52272]`, stderr `BENCHMARK` lines; `WH_HOST_STDIO_UNBUFFERED=1`; symbolised with `addr2line -e test/build_test/epub_pipeline/epub_pipeline_dump -f -C -i <off>` and, for inlined sites, the `test/build_gprof` binary.
