@@ -1289,6 +1289,23 @@ void EpubReaderActivity::startActivityForResult(std::unique_ptr<Activity>&& acti
     const uint8_t preemptionsBeforeOverlay = backgroundPreemptCount_;
     endBackgroundBorrow();
     backgroundPreemptCount_ = preemptionsBeforeOverlay;
+    // The child draws over the page, so nothing staged for this screen survives it: the owed
+    // deferred AA of the page on it, and a queued or finished pre-render of the next page (it lives
+    // in the write framebuffer, which the child draws into). Left armed, the render that follows
+    // the child's return was classified as that pre-render and drew nothing -- the menu stayed on
+    // screen until the next page turn (X3 run 23: a lane redraw finished 11 ms before the menu
+    // press, arming the pre-render, which the heap floor then skipped). Dropped, that render is a
+    // Normal pass that redraws the page and stages its AA afresh.
+    if (pendingGrayscale_.active || pendingPreRender || usePreRenderedBuffer || preRenderedPage.ready) {
+      LOG_DBG("ERS", "Overlay '%s' opening; dropping the%s%s%s staged for the page under it",
+              activity ? activity->getName().c_str() : "<null>", pendingGrayscale_.active ? " deferred AA" : "",
+              pendingPreRender ? " pre-render request" : "", preRenderedPage.ready ? " pre-rendered page" : "");
+    }
+    pendingGrayscale_ = {};
+    pendingPreRender = false;
+    usePreRenderedBuffer = false;
+    preRenderedPage = {};
+    preRenderedPlanesStaged_ = false;
   }
   Activity::startActivityForResult(std::move(activity), std::move(resultHandler));
 }
