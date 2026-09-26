@@ -88,7 +88,9 @@ TEST(SaxParser, ParseChunked) {
   }
   EXPECT_EQ(starts, 3);  // root, a, b
   EXPECT_EQ(ends, 3);
-  EXPECT_GE(chars, 2);  // at least one Char event per text node; expat may split across chunk boundaries
+  // Text is buffered across feed() calls and only split when the 256-byte char buffer fills, so
+  // the 3-byte chunks still deliver each text node in one piece.
+  EXPECT_EQ(chars, 2);
 }
 
 TEST(SaxParser, EarlyStop) {
@@ -265,7 +267,7 @@ TEST(SaxParser, TruncationFlagsClearForWellSizedDoc) {
 
 TEST(SaxParser, TruncationFlagsReportMaxAttrs) {
   // 13 attributes — one more than kMaxAttrs (12). The 13th is dropped and the
-  // overflow is recorded so callers can log it (the yxml backend only).
+  // overflow is recorded so callers can log it.
   const char* xml =
       "<e a1='1' a2='2' a3='3' a4='4' a5='5' a6='6' a7='7' a8='8' a9='9' "
       "a10='10' a11='11' a12='12' a13='13'/>";
@@ -278,9 +280,6 @@ TEST(SaxParser, TruncationFlagsReportMaxAttrs) {
   ASSERT_TRUE(p.feed(bytes, strlen(xml)));
   ASSERT_TRUE(p.finalize());
 
-  // The active backend (yxml) has fixed caps and records the overflow. expat,
-  // if ever re-enabled, has no fixed caps and returns 0 — so only assert the
-  // flag when the parser actually reports truncation support.
   EXPECT_TRUE(p.truncationFlags() & SaxParser::kTruncMaxAttrs);
 }
 
