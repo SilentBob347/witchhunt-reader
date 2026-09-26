@@ -165,25 +165,6 @@ TEST(SaxParser, ByteOffsetAdvances) {
   EXPECT_GT(state.offsetAtChild, 0u);
 }
 
-TEST(SaxParser, DefaultHandler) {
-  // Verify the defaultCb fires for entity references
-  const char* xml = "<root>&amp;</root>";
-
-  Collector c;
-  SaxParser p;
-  ASSERT_TRUE(p.init(&c, Collector::onStart, Collector::onEnd, nullptr, Collector::onDefault));
-
-  const auto* bytes = reinterpret_cast<const uint8_t*>(xml);
-  ASSERT_TRUE(p.feed(bytes, strlen(xml)));
-  ASSERT_TRUE(p.finalize());
-
-  // With SetDefaultHandlerExpand, standard entities like &amp; are expanded
-  // by expat into char data before reaching the default handler — so no
-  // Default event is expected here. Instead we may get a Char event.
-  // What matters is that the document parsed successfully and no crash occurred.
-  SUCCEED();
-}
-
 TEST(SaxParser, HtmlEntityRoutedToDefaultCb) {
   // &nbsp; is not an XML built-in, so the yxml backend must intercept it and
   // route it to defaultCb (mirroring expat's DefaultHandlerExpand).  Without
@@ -253,6 +234,16 @@ TEST(SaxParser, XmlBuiltinEntitiesPassThrough) {
   for (const auto& e : c.events) {
     EXPECT_NE(e.type, Event::Type::Default) << "built-in entity reached defaultCb: " << e.text;
   }
+
+  // Without a charCb the expansions are dropped, and still none of them reaches defaultCb.
+  Collector noChars;
+  SaxParser q;
+  ASSERT_TRUE(q.init(&noChars, Collector::onStart, Collector::onEnd, nullptr, Collector::onDefault));
+  ASSERT_TRUE(q.feed(bytes, strlen(xml)));
+  ASSERT_TRUE(q.finalize());
+  ASSERT_EQ(noChars.events.size(), 2u);
+  EXPECT_EQ(noChars.events[0].type, Event::Type::Start);
+  EXPECT_EQ(noChars.events[1].type, Event::Type::End);
 }
 
 TEST(SaxParser, TruncationFlagsClearForWellSizedDoc) {
