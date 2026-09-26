@@ -48,7 +48,10 @@ class EpubImageManifest {
   // Look up an image's dimensions, resolving + caching them on a miss. On a miss reads just
   // the image header (by central-directory offset) from epubPath. epubEntryPath must be the
   // normalised path (matches find()'s key).
-  Resolve resolve(const std::string& epubPath, const std::string& epubEntryPath, ImageDimensions& out);
+  // `scratch`: the section build's lent arena. When given, the 4 KB probe window and the probe's
+  // inflate ring come from a block in it, released before returning, instead of the heap.
+  Resolve resolve(const std::string& epubPath, const std::string& epubEntryPath, ImageDimensions& out,
+                  BuildArena* scratch = nullptr);
   // resolve() == Resolved.
   bool ensureResolved(const std::string& epubPath, const std::string& epubEntryPath, ImageDimensions& out);
 

@@ -1873,7 +1873,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
             }
             if (!dimsOk && self->imageManifest) {
               // Resolve + cache on a miss: each image's header is read at most once ever.
-              switch (self->imageManifest->resolve(self->epub->getPath(), resolvedPath, dims)) {
+              switch (self->imageManifest->resolve(self->epub->getPath(), resolvedPath, dims, self->buildArena_)) {
                 case EpubImageManifest::Resolve::Resolved:
                   dimsOk = true;
                   manifestAnswered = true;
