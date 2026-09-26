@@ -253,6 +253,19 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     }
   }
 
+  // A frame being drawn shares the core (on the C3 the render task has the loop task's priority)
+  // and the SD card with this pass. Bursting beside it stretched the redraw a press asked for
+  // from ~360 ms to 0.6-1.1 s (X3, 2026-09-27): the sliced sessions resume after a press instead
+  // of restarting, so -- unlike the one-shot decode they replaced -- they were still running when
+  // the redraw began. Step aside until the frame is handed to the panel; the ~430 ms refresh
+  // after that needs neither, and the pass keeps that window.
+  const auto frameInProgress = [this]() { return renderer.isComposingFrame(); };
+  if (frameInProgress()) {
+    recentsLoading = false;
+    delay(2);  // block rather than spin: a spinning loop task still takes its share of the core
+    return;
+  }
+
   const auto thumbSizes = GUI.getCoverThumbSizes(coverHeight);
 
   // Build the placeholder slots for a book on give-up. Multi-size themes placeholder every
@@ -317,7 +330,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     while (status == CoverThumbSession::Status::Running) {
       status = thumbSession->continueSteps(1);
       if (status == CoverThumbSession::Status::Running &&
-          (mappedInput.hasPendingInput() || static_cast<int32_t>(millis() - deadline) >= 0)) {
+          (mappedInput.hasPendingInput() || frameInProgress() || static_cast<int32_t>(millis() - deadline) >= 0)) {
         recentsLoading = false;  // pause between units; resume on the next call
         return;
       }
@@ -361,7 +374,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
       // Stop the burst (but keep the session alive) when input is waiting or the budget
       // is spent — resume from where we left off on the next loadRecentCovers() call.
       if (status == ReaderActivity::CoverExtractSession::Status::Running &&
-          (mappedInput.hasPendingInput() || static_cast<int32_t>(millis() - deadline) >= 0)) {
+          (mappedInput.hasPendingInput() || frameInProgress() || static_cast<int32_t>(millis() - deadline) >= 0)) {
         recentsLoading = false;
         return;
       }
@@ -388,7 +401,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     while (status == PngDecodeSession::Status::Running) {
       status = pngSession->continueRows(ROWS_PER_BATCH);
       if (status == PngDecodeSession::Status::Running &&
-          (mappedInput.hasPendingInput() || static_cast<int32_t>(millis() - deadline) >= 0)) {
+          (mappedInput.hasPendingInput() || frameInProgress() || static_cast<int32_t>(millis() - deadline) >= 0)) {
         recentsLoading = false;  // pause between batches; resume on the next call
         return;
       }
@@ -460,8 +473,9 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
 
         if (!validThumb) {
           // Button input has priority: never start a fresh decode while a press is
-          // queued. Yield with this size still pending so the next pass retries it.
-          if (mappedInput.hasPendingInput()) {
+          // queued, or while the frame it asked for is being drawn. Yield with this size
+          // still pending so the next pass retries it.
+          if (mappedInput.hasPendingInput() || frameInProgress()) {
             nextThumbSizeIndex = i;
             recentsLoading = false;
             return;
@@ -607,9 +621,10 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               book.coverBmpPath.c_str(), placeholder.c_str(), validThumb ? 0 : 1);
 
       if (!validThumb) {
-        // Button input has priority: don't start a decode while a press is queued.
-        // Yield without advancing so this book's cover is retried on a later pass.
-        if (mappedInput.hasPendingInput()) {
+        // Button input has priority: don't start a decode while a press is queued, or while
+        // the frame it asked for is being drawn. Yield without advancing so this book's cover
+        // is retried on a later pass.
+        if (mappedInput.hasPendingInput() || frameInProgress()) {
           recentsLoading = false;
           return;
         }

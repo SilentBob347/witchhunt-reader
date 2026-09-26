@@ -489,6 +489,12 @@ class GfxRenderer {
   void displayWindow(int x, int y, int width, int height, bool turnOffScreen = false) const;
   void invertScreen() const;
   void clearScreen(uint8_t color = 0xFF) const;
+  // True from clearScreen() until the displayBuffer() that hands the frame to the panel: the part
+  // of a render that draws (CPU, SD reads for bitmaps), not the refresh wait after it. Background
+  // work on another task that shares the core and the card with rendering (Home's cover pass)
+  // steps aside while this holds. A marker older than `maxAgeMs` counts as abandoned -- a
+  // clearScreen() whose frame was never displayed -- so a caller can never wait on it forever.
+  bool isComposingFrame(uint32_t maxAgeMs = 2000) const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
 
   // Extra bezel inset the reader has asked for, on top of whatever the board profile declares.
