@@ -421,6 +421,9 @@ TEST(JpegToBmpConverter, ProgressiveThumbnailMatchesItsBaselineTwin) {
   EXPECT_LT(meanDiff, 0.20);
 }
 
+// progressive_420.jpg is a left-half gradient beside a black upper-right and a white lower-right
+// quadrant (fixtures/generate_fixtures.py), so every row down to the last one has to carry the
+// picture, not just the header announce it.
 TEST(JpegToBmpConverter, ProgressiveThumbnailDecodesAllRows) {
   FsFile file;
   ASSERT_TRUE(file.openForRead(fixture("progressive_420.jpg")));
@@ -433,6 +436,21 @@ TEST(JpegToBmpConverter, ProgressiveThumbnailDecodesAllRows) {
   ASSERT_GE(out.buf.size(), 70u);
   EXPECT_EQ(le32(out.buf, 18), 40);
   EXPECT_EQ(le32(out.buf, 22), -26);
+  const int bytesPerRow = (40 * 2 + 31) / 32 * 4;
+  ASSERT_EQ(out.buf.size(), static_cast<size_t>(le32(out.buf, 10)) + 26u * bytesPerRow) << "every row written";
+
+  int w = 0, h = 0;
+  const auto px = unpack2BitBmp(out.buf, w, h);
+  const auto at = [&](const int x, const int y) { return px[static_cast<size_t>(y) * w + x]; };
+  // Right half, clear of the quadrant edge (row 13) and the gradient's end (column ~20).
+  for (int x = 24; x < w; ++x) {
+    for (int y = 0; y < 12; ++y) EXPECT_EQ(at(x, y), 0) << "black quadrant at " << x << "," << y;
+    for (int y = 14; y < h; ++y) EXPECT_EQ(at(x, y), 3) << "white quadrant at " << x << "," << y;
+  }
+  // Left half: dark to light, on the first row and the last.
+  for (const int y : {0, h - 1}) {
+    EXPECT_LT(at(1, y) + at(2, y), at(17, y) + at(18, y)) << "gradient on row " << y;
+  }
 }
 
 // ---------------------------------------------------------------------------
