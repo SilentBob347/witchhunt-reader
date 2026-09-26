@@ -1811,6 +1811,14 @@ bool EpubReaderActivity::warmPageForImageLane(const Page& page, const int spine,
   // workspace), exactly as the page-turn warm borrows it; the framebuffer is not written at
   // all (ScopedCacheOnlyImageWrites), so the page on screen -- or a pre-rendered next page --
   // is untouched and no clearScreen follows. One page per tick.
+  // At the offsets the page render draws the images at, not (0, 0): the ordered dither baked into a
+  // .pxc follows screen position, so a lane-warmed cache used to differ in phase from the one a
+  // page render writes -- and a decode the lane parks (see RenderConfig::checkpointPath) resumes
+  // only for the very same configuration, so a page turn onto the image could never pick it up.
+  const RenderLayout layout = computeRenderLayout();
+  const int viewportHeight = std::max(0, renderer.getScreenHeight() - layout.marginTop - layout.marginBottom);
+  const int contentTop = layout.marginTop + getImageOnlyPageYOffset(page, viewportHeight);
+
   size_t borrowedSize = 0;
   uint8_t* borrowed = renderer.borrowSecondaryBuffer(&borrowedSize);
   if (!borrowed) return false;
@@ -1821,7 +1829,8 @@ bool EpubReaderActivity::warmPageForImageLane(const Page& page, const int spine,
   {
     image_scratch::ScopedArena scratchScope(scratch && scratch->valid() ? scratch.get() : nullptr);
     GfxRenderer::ScopedCacheOnlyImageWrites cacheOnly(renderer);
-    page.warmImageCaches(renderer, 0, 0, /*forceLoad=*/true, /*monochromeOutput=*/true, warmGrayscale);
+    page.warmImageCaches(renderer, layout.marginLeft, contentTop, /*forceLoad=*/true, /*monochromeOutput=*/true,
+                         warmGrayscale);
   }
   // Preempted by input: not a failure, the next quiet moment retries.
   const bool preempted = CooperativeAbort::consumeAborted();
