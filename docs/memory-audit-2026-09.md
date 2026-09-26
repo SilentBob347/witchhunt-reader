@@ -1298,10 +1298,31 @@ which is most of the gap between a borrowed build's cost (≤ 19–24 KB measure
 33–40 KB the X3 reads at. Background-B's 40 KB floor would then be re-derived from the device
 trace below, not from this table.
 
-**Device confirmation (pending).** `SCT_HEAP_TRACE=1` (set in the local `platformio.local.ini`)
-now prints the arena beside the heap on every page — `arena=` cursor, `hw=` peak, `cap=`, and
-`arenaAtLow=` at the page's heap low point. One X3 run (and one X4 run) of Chapters 3 and 4 from a
-wiped cache gives the 32-bit totals to set against this table.
+**Device confirmation — run 19 (X3, 2026-09-26 22:21, `SCT_HEAP_TRACE=1`, cache wiped).** The
+per-page trace prints the arena beside the heap (`arena=`, `hw=`, `cap=`, and `arenaAtLow=` at the
+page's heap low point). The host model of the arena holds to a fraction of a percent:
+
+| | Chapter 3 host / device | Chapter 4 host / device |
+|---|---:|---:|
+| arena peak | 48 016 / 47 868 | 45 872 / 45 876 |
+| parse lane | — / 34 264 (a 32 KB walk) | — / 18 040 (no 32 KB walk) |
+| arena at the heap's low points | ~14 900 / 14 070–14 960 | ~14 400 / 14 070–14 760 |
+
+The heap, device bytes:
+
+| | Chapter 3 (from Home) | Chapter 4 (from the reading state) |
+|---|---:|---:|
+| free at build start | 44 972 | 39 836 |
+| lowest page boundary | 22 036 | 23 688 |
+| lowest 1 KB-chunk sample | 22 740 | 24 660 |
+| true low (allocator minimum) | **12 864** | ≥ 12 532 (session minimum held) |
+
+The gap between the chunk-level samples and the allocator's true minimum in Chapter 3 is 9.2 KB:
+a spike inside one chunk that the page and chunk sampling cannot see, the size of the image-header
+resolve (8 704 B of buffers plus allocator headers) that the host placed at the heap's peak. So on
+the device a borrowed Chapter 3 build costs 32.1 KB of heap to its trough, 9.2 KB of it that one
+spike; without it the trough would sit near 22 KB, with 37 KB of the arena idle at the same moment.
+Device versus host overall: 32.1 vs 38.2 KB (0.84) — byte buffers exact, objects smaller.
 
 ## 9. Appendix — where the numbers come from
 
