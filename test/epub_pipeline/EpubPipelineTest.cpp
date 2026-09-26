@@ -1,4 +1,4 @@
-// Phase-0 equivalence harness tests (docs/compiled-book-pipeline-plan.md):
+// Full-pipeline equivalence tests over the synthetic corpus:
 //  1. Determinism — two cold runs over the same book produce byte-identical dumps.
 //  2. Warm-path equivalence — a run served from the section cache dumps
 //     identically to the cold run that built it.

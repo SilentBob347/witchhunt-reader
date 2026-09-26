@@ -1,4 +1,4 @@
-# Full-pipeline equivalence harness (docs/compiled-book-pipeline-plan.md Phase 0):
+# Full-pipeline equivalence harness:
 # builds the REAL Epub/Section/ParsedText/CssParser pipeline for the host against
 # deterministic stubs (GfxRenderer metrics, ESP heap/wdt, I18n) and the real-I/O
 # HalStorage shim from test/zip_entry_reader.
