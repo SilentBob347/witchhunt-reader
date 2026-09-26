@@ -428,17 +428,15 @@ TEST(GifDimensions, LargeValidDimensions) {
 // supportsFormat tests
 // ---------------------------------------------------------------------------
 
-TEST(GifSupportsFormat, GifLowercase) { EXPECT_TRUE(GifToFramebufferConverter::supportsFormat(".gif")); }
-
-TEST(GifSupportsFormat, GifUppercase) { EXPECT_TRUE(GifToFramebufferConverter::supportsFormat(".GIF")); }
-
-TEST(GifSupportsFormat, GifMixedCase) { EXPECT_TRUE(GifToFramebufferConverter::supportsFormat(".Gif")); }
-
-TEST(GifSupportsFormat, NotPng) { EXPECT_FALSE(GifToFramebufferConverter::supportsFormat(".png")); }
-
-TEST(GifSupportsFormat, NotJpeg) { EXPECT_FALSE(GifToFramebufferConverter::supportsFormat(".jpg")); }
-
-TEST(GifSupportsFormat, Empty) { EXPECT_FALSE(GifToFramebufferConverter::supportsFormat("")); }
+// supportsFormat() hands off to FsHelpers::hasGifExtension; one case pins the hand-off.
+TEST(GifSupportsFormat, AcceptsGifInAnyCaseOnly) {
+  for (const char* ext : {".gif", ".GIF", ".Gif"}) {
+    EXPECT_TRUE(GifToFramebufferConverter::supportsFormat(ext)) << ext;
+  }
+  for (const char* ext : {".png", ".jpg", ""}) {
+    EXPECT_FALSE(GifToFramebufferConverter::supportsFormat(ext)) << '"' << ext << '"';
+  }
+}
 
 // ---------------------------------------------------------------------------
 // decodeFirstFrameToGrayscale tests
