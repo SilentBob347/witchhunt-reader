@@ -1,6 +1,6 @@
 // Full-pipeline equivalence tests over the synthetic corpus:
-//  1. Warm-path equivalence — a run served from the section cache dumps
-//     identically to the cold run that built it.
+//  1. Warm-cache equivalence — rebuilding over the book-level caches a cold
+//     run left behind dumps identically to that run.
 //  2. Golden equivalence — two cold builds of every synthetic corpus book dump
 //     identically to each other and to the committed golden. Regenerate
 //     intentionally changed goldens with: UPDATE_GOLDENS=1 ctest -R EpubPipeline
@@ -69,12 +69,16 @@ std::string caseCacheDir(const Case& c, const std::string& tag) {
 
 class EpubPipelineTest : public testing::TestWithParam<Case> {};
 
-TEST_P(EpubPipelineTest, WarmRunMatchesColdRun) {
+// runAndDump always rebuilds every section, so the second run is not a page cache served without a
+// build. What it does read back instead of the archive is the book-level state the first run left:
+// book.bin, the compiled CSS index, the image manifest, the banked chapter XHTML and the footnote
+// store with its resolved-spine bits.
+TEST_P(EpubPipelineTest, RebuildOverWarmBookCacheMatchesColdRun) {
   const Case c = GetParam();
   const std::string cacheDir = caseCacheDir(c, "warm");
   const std::string cold = runOnce(c, cacheDir);
-  const std::string warm = runOnce(c, cacheDir);  // same cacheDir: cache-hit path
-  EXPECT_EQ(cold, warm) << "cache-served layout of " << c.epub << " differs from the build that wrote it";
+  const std::string warm = runOnce(c, cacheDir);
+  EXPECT_EQ(cold, warm) << "rebuilding " << c.epub << " over its warm book cache changed the layout";
 }
 
 // Built twice, into separate cache dirs: a nondeterministic build (an uninitialised field, a

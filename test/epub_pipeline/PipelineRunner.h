@@ -50,8 +50,9 @@ using SpineStatFn = std::function<void(int spineIndex, uint16_t pages, int64_t e
 
 // Compile `epubPath` into `cacheDir` under `profile` and stream the canonical
 // dump to `out`. Returns false on any pipeline failure (already-logged).
-// `cacheDir` should be empty/fresh for a cold run; a second call over the same
-// cacheDir exercises the warm (cache-hit) path and must dump identically.
+// `cacheDir` should be empty/fresh for a cold run. A second call over the same
+// cacheDir still rebuilds every section, but from the book-level caches the first
+// left behind (book.bin, CSS index, image manifest, banked XHTML, footnote store).
 bool runAndDump(const std::string& epubPath, const std::string& cacheDir, const Profile& profile, std::ostream& out,
                 const SpineStatFn& spineStat = {}, const ArenaStatFn& arenaStat = {});
 
