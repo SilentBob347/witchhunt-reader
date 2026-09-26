@@ -1087,7 +1087,43 @@ writes no cache, so a page with a broken or unsupported image stayed
 gets two attempts per session (an attempt preempted by input does not
 count) and is then skipped. What still cannot be reached: the target
 page of a chapter jump while its section builds, because the lane has no
-scratch until the build returns the buffer. The background lanes today parse the next section (B) or the
+scratch until the build returns the buffer.
+
+*Run 18 (2026-09-26 21:34, X3, Chapter 3 from a wiped cache into
+Chapter 7):* fourteen lane warms — two complete ahead of the reader, five
+lazy loads of the page on screen (each redrawn with its image 4–6 s after
+landing, the chapter openers of Chapter 3 and Chapter 7 among them), seven
+preempted by a page turn, none given up. The preemption backoff held (no
+immediate retry), and no jump needed the new stale-work drop (none landed
+while an AA was owed), so that path is still unexercised. Memory steady:
+reading at 30–41 KB free / 17–23.5 KB contiguous, the only lows the
+Chapter 3 build (12 760) and the Home visit before it (below). Three open
+findings:
+
+1. *The lane loses the race on large images at a normal reading pace.* At
+   6–7 s per page, a 570 KB progressive (693 × 970, ~4.5 s decode) was
+   aborted by the page turn four times, once within ~100 ms of finishing,
+   and its page showed the placeholder throughout. The 1.5 s settle is now
+   binding: the AA pass ends ~0.35 s after the draw and the lane cannot run
+   before it anyway, so the rest is waited through. Also, after an aborted
+   decode the warm still starts the grayscale companion, which aborts at
+   once (~130 ms added to the turn). Candidates: settle ≈ 0.3 s after the
+   AA, stop a page's warm on the first abort; the full answer is a
+   resumable progressive decode (R9 3).
+2. *Background-B never runs on the X3 reading heap.* It waited in WaitHeap
+   for Chapter 7 the whole time the reader was within its 50-page runway:
+   its borrow gate wants 40 960 free and the reader sits at 33–40 KB. So no
+   next chapter is ever prepared, the lane's cross-section window has
+   nothing to warm, and each chapter opens with a C build (first page at
+   ~1 s, fine) and a lazily loaded opening illustration (~8 s). Whether the
+   40 KB gate still reflects a borrowed build's heap cost after R2 needs a
+   measurement before it is lowered: a B build holds its heap state across
+   the page renders it yields to.
+3. *Home before the reopen sat at 16 KB free / 6.9 KB contiguous* (first
+   Home: 30 KB / 17 KB), probably the cover regeneration after the cache
+   wipe; the capture lost that window (27 s of device output dropped before
+   the host attached), so it is unattributed. Pre-render (A) never ran
+   (45 KB floor), as in every X3 run. The background lanes today parse the next section (B) or the
 current one (C) and leave image decode to the page turn that reaches the
 image. A reader five pages from an undecoded image should not be spending
 its idle time laying out a section fifty pages away. Add a background lane
