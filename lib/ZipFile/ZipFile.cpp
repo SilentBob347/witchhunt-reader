@@ -746,7 +746,8 @@ size_t ZipFile::readBytesFromEntry(const char* filename, uint8_t* outBuf, const 
   return readBytesFromStat(fileStat, outBuf, maxBytes);
 }
 
-size_t ZipFile::readBytesFromStat(const FileStatSlim& fileStat, uint8_t* outBuf, const size_t maxBytes) {
+size_t ZipFile::readBytesFromStat(const FileStatSlim& fileStat, uint8_t* outBuf, const size_t maxBytes,
+                                  BuildArena* scratch) {
   if (!outBuf || maxBytes == 0) return 0;
 
   const ScopedOpenClose zip{*this};
@@ -770,8 +771,33 @@ size_t ZipFile::readBytesFromStat(const FileStatSlim& fileStat, uint8_t* outBuf,
     // one-shot inflate: read a bounded compressed chunk and decompress it all at
     // once without a ring buffer.
     constexpr size_t READ_BUF = 512;
-    auto* readBuf = static_cast<uint8_t*>(malloc(READ_BUF));
+    // The ring and read buffer from the caller's arena when it has room (the section build's lent
+    // region: memory audit 2026-09, build inventory -- this probe and its caller's header buffer
+    // were the build's heap peak, 8.7 KB inside one SAX chunk). A block of its own, released below
+    // on every path, so the arena is left exactly as found.
+    const size_t ringSize = InflateReader::ringSizeFor(wantBytes);
+    BuildArena::Block scratchBlock;
+    uint8_t* readBuf = nullptr;
+    uint8_t* arenaRing = nullptr;
+    if (scratch != nullptr && scratch->valid()) {
+      scratchBlock = scratch->reserveBlock();
+      readBuf = static_cast<uint8_t*>(scratch->alloc(READ_BUF));
+      arenaRing = readBuf ? static_cast<uint8_t*>(scratch->alloc(ringSize)) : nullptr;
+      if (arenaRing == nullptr) {
+        scratch->release(scratchBlock);
+        readBuf = nullptr;
+      }
+    }
+    const bool inArena = arenaRing != nullptr;
+    if (!inArena) readBuf = static_cast<uint8_t*>(malloc(READ_BUF));
     if (!readBuf) return 0;
+    const auto releaseScratch = [&] {
+      if (inArena) {
+        scratch->release(scratchBlock);
+      } else {
+        free(readBuf);
+      }
+    };
 
     ZipInflateCtx ctx;
     ctx.file = &file;
@@ -791,7 +817,7 @@ size_t ZipFile::readBytesFromStat(const FileStatSlim& fileStat, uint8_t* outBuf,
     // and contig 42996 -> 4084 between two page emissions, recovering pages later. That is this
     // ring, taken and released per image resolve, mid-parse — the single worst contiguous dip
     // in a section build, and it lands exactly where a PNG decode would want its own 32 KB.
-    if (ctx.reader.init(true, wantBytes)) {
+    if (inArena ? ctx.reader.initWithExternalRing(arenaRing, ringSize) : ctx.reader.init(true, wantBytes)) {
       ctx.reader.setReadCallback(zipReadCallback);
 
       size_t totalOut = 0;
@@ -803,14 +829,16 @@ size_t ZipFile::readBytesFromStat(const FileStatSlim& fileStat, uint8_t* outBuf,
         if (status == InflateStatus::Done || status == InflateStatus::Error) break;
       }
 
-      free(readBuf);
+      ctx.reader.deinit();  // drops the ring pointer before its arena block goes back
+      releaseScratch();
       return totalOut;
     }
 
     // Streaming ring buffer unavailable — fall back to one-shot inflate.
     // Read a bounded compressed chunk (4× the desired output as a rough overhead
     // estimate, capped at the actual compressed size) and decompress in one shot.
-    free(readBuf);
+    ctx.reader.deinit();
+    releaseScratch();
     const size_t compChunkSize = std::min(static_cast<size_t>(fileStat.compressedSize), wantBytes * 4);
     auto* compBuf = static_cast<uint8_t*>(malloc(compChunkSize));
     if (!compBuf) return 0;

@@ -48,7 +48,10 @@ class EpubImageManifest {
   // Look up an image's dimensions, resolving + caching them on a miss. On a miss reads just
   // the image header (by central-directory offset) from epubPath. epubEntryPath must be the
   // normalised path (matches find()'s key).
-  Resolve resolve(const std::string& epubPath, const std::string& epubEntryPath, ImageDimensions& out);
+  // `scratch`: the section build's lent arena. When given, the 4 KB probe window and the probe's
+  // inflate ring come from a block in it, released before returning, instead of the heap.
+  Resolve resolve(const std::string& epubPath, const std::string& epubEntryPath, ImageDimensions& out,
+                  BuildArena* scratch = nullptr);
   // resolve() == Resolved.
   bool ensureResolved(const std::string& epubPath, const std::string& epubEntryPath, ImageDimensions& out);
 
@@ -71,11 +74,14 @@ class EpubImageManifest {
     NeedsHeap,   // a stage's ring did not fit `heapBudget` (or its allocation failed): retry later
     Unreadable,  // the entry ends with no SOF: no walk can do better
   };
-  // Walk one deferred image now, mid-parse, from the heap: every stage the walk takes must fit
+  // Walk one deferred image now, mid-parse. Ring storage comes from `arena` when it has room for
+  // the stage (a borrowed build's lent region, idle by ~25 KB during the layout -- memory audit
+  // 2026-09, run 12: with the heap alone, every image of a chapter was deferred to the build's end
+  // and the whole chapter laid out twice), else from the heap, where every stage must fit
   // `heapBudget` (contiguous bytes the caller can spare). On Resolved the entry is recorded and
   // no longer pending.
   Walk resolveDeferredNow(const std::string& epubPath, const std::string& epubEntryPath, ImageDimensions& out,
-                          size_t heapBudget);
+                          size_t heapBudget, BuildArena* arena = nullptr);
   // Walk every queued image through the streaming header reader and record what it finds.
   // Returns how many were resolved. Meant for a build's end, with the build's now-idle arena
   // (the borrowed secondary framebuffer) as ring storage when the caller has one — on the C3 the

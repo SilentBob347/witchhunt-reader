@@ -13,6 +13,7 @@
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
 
+#include <array>
 #include <atomic>
 
 #include "BookmarkStore.h"
@@ -287,6 +288,9 @@ class EpubReaderActivity final : public Activity {
   // Spine whose image-degraded cache was already discarded for a rebuild this session (see the
   // cache probe in buildSection): one retry, not one per entry.
   int imageHeaderRebuildSpine_ = -1;
+  // Same one-shot for a cache whose build demoted a table row or skipped CSS lookups on the
+  // heap (Section::isTableRowDegraded / isCssLowHeapDegraded, persisted in the status byte).
+  int degradedLayoutRebuildSpine_ = -1;
   struct RenderPhaseStats {
     unsigned long prewarmMs = 0UL;
     unsigned long bwRenderMs = 0UL;
@@ -403,9 +407,6 @@ class EpubReaderActivity final : public Activity {
   // until buildSection() adopts it on a consecutive boundary cross or discards it on any
   // other navigation. Its destructor aborts a partial build and deletes the partial file.
   std::unique_ptr<Section> backgroundSection_;
-  // Uncompressed size of the target spine's XHTML (fetched once in the Probe step).
-  // Sizes the inflate ring share of the extraction heap gate.
-  size_t backgroundBuildInflatedSize_ = 0;
   // True when the target spine's footnote links have never been scanned, so its build will run
   // the inline-preview resolve before laying out a line. Decided once in the Probe step; the pass
   // is sliced like the rest of the build, so all this buys is the BG_BUILD_RESOLVE_EXTRA_HEAP_BYTES
@@ -413,6 +414,37 @@ class EpubReaderActivity final : public Activity {
   bool backgroundBuildNeedsResolve_ = false;
   // Last WaitHeap gate evaluation; the heap-walk checks re-run at most ~1×/s.
   unsigned long backgroundBuildGateCheckMs_ = 0;
+  // A clock-minute / battery status refresh held back while Background-B holds the secondary
+  // buffer (shouldSkipPeriodicUpdate); endBackgroundBorrow requests it when the buffer returns.
+  mutable bool statusRefreshDeferred_ = false;
+  // Image lane (memory audit 2026-09, R7): between page turns, decode the pixel caches of the
+  // images in a window of pages so the turn that reaches them replays a cache instead of running
+  // a 1-4 s decode. Ranked above Background-B's look-ahead build. The window is the page on
+  // screen (a large-image placeholder, or a decode the render could not afford, is loaded
+  // lazily and the page redrawn) and the next kImageWarmLookahead pages, continuing into the
+  // next section's first pages when its cache exists. The pair below marks a window already
+  // found clean, so an idle reader does not re-read those pages every tick.
+  static constexpr int kImageWarmLookahead = 5;
+  int imageWarmCleanSpine_ = -1;
+  int imageWarmCleanPage_ = -1;
+  // Pages whose warm came back incomplete although no input preempted it (an unsupported or
+  // corrupt image, a decode refused for heap). Each gets kImageWarmMaxTries attempts, then the
+  // lane skips it for the session -- a failed decode writes no cache, so without this the lane
+  // retried the same page on every loop tick. Eight slots hold every page of one window (the
+  // page on screen plus five), so a window of broken images cannot evict its own entries.
+  struct ImageWarmMiss {
+    int16_t spine = -1;
+    int16_t page = -1;
+    uint8_t tries = 0;
+  };
+  static constexpr uint8_t kImageWarmMaxTries = 2;
+  std::array<ImageWarmMiss, 8> imageWarmMisses_{};
+  uint8_t imageWarmMissNext_ = 0;
+  // When input last preempted a lane decode. Counts as activity for the settle rule: the press
+  // that aborted the decode is usually still held (no new edge queued), so without this the lane
+  // restarted on the very next tick and was aborted again by the release, delaying the page turn
+  // the press was for (~260 ms on the X3, 2026-09-26).
+  unsigned long imageWarmPreemptedMs_ = 0;
   // Times a build of backgroundBuildSpineIndex_ was preempted (reader needed the borrowed
   // buffer back) before reaching Done. Bounds the retry loop: a spine whose parse cannot fit
   // between two page turns would otherwise re-inflate and re-parse forever, burning CPU, SD
@@ -528,6 +560,19 @@ class EpubReaderActivity final : public Activity {
     bool fastLut = false;
   };
   PendingGrayscale pendingGrayscale_;
+  // The reading position the owed deferred AA and the armed pre-render belong to: the page on
+  // screen when either was armed (every arming site runs with that page current). render() and
+  // the deferred-AA runner drop both once the position has moved, so a navigation that does not
+  // make pageTurn()'s hand-off (10-page jump, chapter jump, any future one) still gets its page
+  // drawn instead of having its render shelved as a pre-render of the page it left.
+  int stagedForSpine_ = -1;
+  int stagedForPage_ = -1;
+  void markStagedForCurrentPage() {
+    stagedForSpine_ = currentSpineIndex;
+    stagedForPage_ = section ? section->currentPage : -1;
+  }
+  // True (and the staged work dropped) when the position has moved since it was staged.
+  bool dropStagedWorkIfPositionMoved(const char* where);
   // Set by pageTurn() fast path to tell render() the frame buffer already holds the next page
   // content and only the status bar + display flush are needed.
   bool usePreRenderedBuffer = false;
@@ -716,6 +761,15 @@ class EpubReaderActivity final : public Activity {
   // Serialises SD access against the render task via RenderLock; skips the tick instead of
   // blocking when the render task is busy.
   void stepBackgroundSectionBuild();
+  // The image lane's step; called from stepBackgroundSectionBuild with the RenderLock held.
+  // True when it did a page's worth of work this tick (the caller then yields to the loop).
+  bool stepImageWarmLocked();
+  // Decode one page's missing image caches into the borrowed secondary buffer, writing no
+  // framebuffer byte. `onScreen`: the page is the one displayed; once the images it showed as
+  // placeholders are cached it is redrawn. Always returns true (the tick was spent).
+  bool warmPageForImageLane(const Page& page, int spine, int pageIndex, bool onScreen, bool warmGrayscale);
+  bool imageWarmGaveUp(int spine, int page) const;
+  void noteImageWarmMiss(int spine, int page);
   // Lend the secondary framebuffer to Background-B's build arena. Mirrors the Background-C
   // borrow site in buildSection(): the lent block never enters the heap, so the return cannot
   // fail on a fragmented hole, and the build's scratch — parse working set, inflate ring, CSS
@@ -771,7 +825,11 @@ class EpubReaderActivity final : public Activity {
   // Draws a single text-only page from an in-progress Background-C build (no AA, no pre-render
   // arming). Releases the lock before the waveform wait (like renderContents) so a C build
   // slice can run on the loop task during the refresh.
-  void displayBuildPage(RenderLock& lock, const Page& page, const RenderLayout& layout);
+  // `drawBlock`: the arena block the page's TextBlock bytes live in, when the caller loaded the
+  // page from the build's lent region. Released here, before the lock is, so a build slice that
+  // runs during the waveform wait finds the arena cursor where it left it.
+  void displayBuildPage(RenderLock& lock, const Page& page, const RenderLayout& layout,
+                        BuildArena::Block* drawBlock = nullptr);
   // Draws the status bar over the current frame buffer and flushes to the display.
   // Handles the refresh cycle and grayscale AA pass. page must be the same page
   // that was last rendered into the buffer (needed for image AA re-render).
@@ -909,6 +967,10 @@ class EpubReaderActivity final : public Activity {
   bool stepPageState(bool isForwardTurn);
   bool stepPageStateLocked(bool isForwardTurn);
   void pageTurn(bool isForwardTurn);
+  // Jump `count` pages (the 10-page double-click action): steps the page state under one lock
+  // and makes pageTurn()'s hand-off -- drops the old page's deferred AA and pre-render -- before
+  // requesting the render. Stops early at a chapter boundary.
+  void jumpPages(bool isForwardTurn, int count);
 #if ENABLE_BENCHMARKS
   void runRenderBenchmark();
   std::string buildRenderBenchmarkReport(const LastRenderStats& startSnapshot, const BenchmarkAggregate& aggregate,

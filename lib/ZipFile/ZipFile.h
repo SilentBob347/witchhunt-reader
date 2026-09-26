@@ -107,7 +107,11 @@ class ZipFile {
 
   // Same as readBytesFromEntry but for a caller that already holds the entry's central-dir
   // stat (e.g. from a prior loadFileStatSlim), avoiding a second central-directory scan.
-  size_t readBytesFromStat(const FileStatSlim& fileStat, uint8_t* outBuf, size_t maxBytes);
+  // `scratch`: when given, the inflate ring and read buffer come from a block reserved in it and
+  // released before returning (heap when it has no room). The section build passes its lent
+  // arena, so an image-header probe mid-parse costs the heap nothing.
+  size_t readBytesFromStat(const FileStatSlim& fileStat, uint8_t* outBuf, size_t maxBytes,
+                           BuildArena* scratch = nullptr);
 
   // Resumable reader for a single ZIP entry. Holds the file handle and inflate
   // state alive across calls so the caller can feed decompressed bytes in small

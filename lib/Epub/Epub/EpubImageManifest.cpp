@@ -230,7 +230,7 @@ bool EpubImageManifest::openResolveZip(const std::string& epubPath) {
 }
 
 EpubImageManifest::Resolve EpubImageManifest::resolve(const std::string& epubPath, const std::string& epubEntryPath,
-                                                      ImageDimensions& out) {
+                                                      ImageDimensions& out, BuildArena* scratch) {
   const uint64_t key = keyFor(epubEntryPath);
   if (const Record* r = findRecord(key)) {
     out.width = r->width;
@@ -249,20 +249,37 @@ EpubImageManifest::Resolve EpubImageManifest::resolve(const std::string& epubPat
     return Resolve::Unreadable;
   }
 
-  // Probe-window read: kHeaderBufSize on the heap (the ~8 KB task stack cannot hold it) for the
-  // duration of this call only, plus the bounded ring readBytesFromStat sizes to the same amount.
-  auto* headerBuf = static_cast<uint8_t*>(malloc(kHeaderBufSize));
+  // Probe-window read: kHeaderBufSize (the ~8 KB task stack cannot hold it) for the duration of
+  // this call only, plus the bounded ring readBytesFromStat sizes to the same amount. From the
+  // build's arena when one is lent: measured on the X3 (run 19), these 8.7 KB, taken and released
+  // inside one SAX chunk, were the section build's heap trough (12 864 free against 22 036 at the
+  // page boundaries around it), while ~37 KB of the arena sat idle -- a probe never overlaps an
+  // image walk, which is what fills the arena. A block of its own, released before returning.
+  BuildArena::Block probeBlock;
+  uint8_t* headerBuf = nullptr;
+  if (scratch != nullptr && scratch->valid()) {
+    probeBlock = scratch->reserveBlock();
+    headerBuf = static_cast<uint8_t*>(scratch->alloc(kHeaderBufSize));
+    if (headerBuf == nullptr) scratch->release(probeBlock);
+  }
+  const bool headerInArena = headerBuf != nullptr;
+  if (!headerInArena) headerBuf = static_cast<uint8_t*>(malloc(kHeaderBufSize));
   if (!headerBuf) {
     LOG_ERR("IMF", "resolve: header buffer alloc failed (%u bytes)", static_cast<unsigned>(kHeaderBufSize));
     // A moment's heap, not a verdict on the image: same treatment as a header that outruns the
     // window, so the build's end (or a later build) gets to answer it.
     return deferFor(key, stat);
   }
-  const size_t bytesRead = zf.readBytesFromStat(stat, headerBuf, kHeaderBufSize);
+  const size_t bytesRead = zf.readBytesFromStat(stat, headerBuf, kHeaderBufSize, headerInArena ? scratch : nullptr);
   ImageDimensions dims = {0, 0};
   bool needMore = false;
   const bool ok = bytesRead > 0 && parseImageDimensions(headerBuf, bytesRead, dims, &needMore);
-  free(headerBuf);
+  if (headerInArena) {
+    scratch->release(probeBlock);
+  } else {
+    free(headerBuf);
+  }
+  headerBuf = nullptr;
 
   if (ok && dims.width > 0 && dims.height > 0) {
     insertEntry(key, dims);
@@ -382,13 +399,13 @@ EpubImageManifest::Walk EpubImageManifest::walkEntry(const ZipFile::FileStatSlim
 
 EpubImageManifest::Walk EpubImageManifest::resolveDeferredNow(const std::string& epubPath,
                                                               const std::string& epubEntryPath, ImageDimensions& out,
-                                                              const size_t heapBudget) {
+                                                              const size_t heapBudget, BuildArena* arena) {
   const uint64_t key = keyFor(epubEntryPath);
   ZipFile::FileStatSlim stat = {};
   if (!findPending(key, &stat)) return Walk::Unreadable;
   if (!openResolveZip(epubPath)) return Walk::NeedsHeap;
   ImageDimensions dims = {0, 0};
-  const Walk walk = walkEntry(stat, dims, nullptr, heapBudget);
+  const Walk walk = walkEntry(stat, dims, arena, heapBudget);
   if (walk != Walk::Resolved) return walk;
   insertEntry(key, dims);
   LOG_DBG("IMF", "Resolved %s -> %dx%d by walk (%u cached)", epubEntryPath.c_str(), dims.width, dims.height,
