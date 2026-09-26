@@ -1009,6 +1009,7 @@ bool Epub::clearCache(const bool preserveThumbs) const {
   bool anyFailed = false;
   for (FsFile f = dir.openNextFile(); f; f = dir.openNextFile()) {
     f.getName(nameBuf, sizeof(nameBuf));
+    const bool isDir = f.isDirectory();
     f.close();
 
     const std::string name(nameBuf);
@@ -1016,9 +1017,12 @@ bool Epub::clearCache(const bool preserveThumbs) const {
     // expensive to regenerate (require ZIP decompression or format conversion).
     if (FsHelpers::hasBmpExtension(name) || name == "cover.img") continue;
 
+    // A subdirectory (the image manifest's img/) goes as a whole, like sections/ above: a plain
+    // file remove refuses a directory, which logged "Failed to remove cache file" on every clear
+    // and left the directory behind.
     const std::string fullPath = cachePath + "/" + name;
-    if (!Storage.remove(fullPath.c_str())) {
-      LOG_ERR("EPB", "Failed to remove cache file: %s", fullPath.c_str());
+    if (!(isDir ? Storage.removeDir(fullPath.c_str()) : Storage.remove(fullPath.c_str()))) {
+      LOG_ERR("EPB", "Failed to remove cache %s: %s", isDir ? "directory" : "file", fullPath.c_str());
       anyFailed = true;
     }
   }
