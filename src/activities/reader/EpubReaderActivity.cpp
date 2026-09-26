@@ -1701,7 +1701,7 @@ bool EpubReaderActivity::stepImageWarmLocked() {
   // settle is not what limits the lane: at 3.3 s per page it still caught every image five pages
   // ahead.
   const unsigned long now = millis();
-  const unsigned long lastActivityMs = std::max(lastPageTurnTime, lastPageOnScreenMs_);
+  const unsigned long lastActivityMs = std::max({lastPageTurnTime, lastPageOnScreenMs_, imageWarmPreemptedMs_});
   if (CooperativeAbort::shouldAbortLongTask() || now - lastActivityMs < BG_BUILD_BORROW_QUIET_MS) return false;
 
   // Large images are warmed too (forceLoad), whatever the placeholder setting says: that setting
@@ -1783,13 +1783,14 @@ bool EpubReaderActivity::warmPageForImageLane(const Page& page, const int spine,
 
   const bool complete = !page.hasUncachedImages(true, true, warmGrayscale);
   if (!complete && !preempted) noteImageWarmMiss(spine, pageIndex);
+  if (preempted) imageWarmPreemptedMs_ = millis();
   // The lazy load: the page on screen showed these images as placeholders, and their caches now
   // exist, so a plain redraw renders them (from the cache, no decode). Not while input waits --
   // the press it belongs to is about to replace this page anyway.
   const bool shownNowCached = shownWasUncached && !page.hasUncachedImages(true, true, false);
   const bool inputWaiting = CooperativeAbort::shouldAbortLongTask();
   const bool redraw = shownNowCached && !inputWaiting;
-  const char* note = !complete        ? (preempted                           ? " -- preempted by input, will retry"
+  const char* note = !complete        ? (preempted ? " -- preempted by input, retries after the next settle"
                                          : imageWarmGaveUp(spine, pageIndex) ? " -- incomplete, giving up on this page"
                                                                              : " -- incomplete, will retry once")
                      : redraw         ? " -- on screen, redrawing"

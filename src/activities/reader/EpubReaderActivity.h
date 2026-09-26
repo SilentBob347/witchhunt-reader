@@ -437,6 +437,11 @@ class EpubReaderActivity final : public Activity {
   static constexpr uint8_t kImageWarmMaxTries = 2;
   std::array<ImageWarmMiss, 8> imageWarmMisses_{};
   uint8_t imageWarmMissNext_ = 0;
+  // When input last preempted a lane decode. Counts as activity for the settle rule: the press
+  // that aborted the decode is usually still held (no new edge queued), so without this the lane
+  // restarted on the very next tick and was aborted again by the release, delaying the page turn
+  // the press was for (~260 ms on the X3, 2026-09-26).
+  unsigned long imageWarmPreemptedMs_ = 0;
   // Times a build of backgroundBuildSpineIndex_ was preempted (reader needed the borrowed
   // buffer back) before reaching Done. Bounds the retry loop: a spine whose parse cannot fit
   // between two page turns would otherwise re-inflate and re-parse forever, burning CPU, SD
