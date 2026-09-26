@@ -1341,6 +1341,24 @@ Run 19's 12 532 was the same event. That is the next item on the heap's critical
 with the secondary framebuffer resident (the page is being drawn), so the lent region is not
 available to it.
 
+*Follow-ups landed the same evening (host-measured; device validation pending):*
+
+| step | commit | host build heap peak, Chapter 3 (X3 profile) |
+|---|---|---:|
+| inventory baseline | — | +38 246 |
+| image-header probe + footnote resolver SAX state in the arena | `5ce8564ee` | +31 575 |
+| page-list anchors and labels packed | this evening | **+25 475** |
+
+Arena peaks unchanged at every step; layout dumps and section files byte-identical. With the build's
+cost measured, Background-B's heap floor was re-derived: **40 → 35 KB** (`78d58a8b8`). The X3's
+reading state after a page's AA pass has a median of ~37 KB free (25th percentile 34–36 KB, runs
+18–20), and a borrowed build cost 22.6 KB to its lowest per-page reading on the heaviest chapter
+before the packing, so the worst low sits ~3 KB clear of the parser's 9 KB abort; the
+footnote-resolve surcharge on the floor is zero now that its SAX state is in the arena. And a
+clock-minute or battery status refresh no longer takes the buffer back from B: it waits while B
+holds the borrow and is drawn when B hands it back (`77a51bc34`) — every render discards B's live
+build, and a 7–15 s build rarely survived the minute tick.
+
 ## 9. Appendix — where the numbers come from
 
 - Device runs (X3, firmware at PR #310's tip): run 3 = `device_run3.log` (14:19, wiped cache, blocking build), run 4 = `device_run4.log` (15:13), run 5 = `device.log` (15:19, after the SAX-in-arena fix).
