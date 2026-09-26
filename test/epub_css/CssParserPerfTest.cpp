@@ -251,6 +251,34 @@ struct FreeHeapGuard {
   ~FreeHeapGuard() { ESP.setFreeHeap(saved); }
 };
 
+// Persists the stylesheet at cssPath as parser's rules cache the way the device does
+// (Epub::parseCssFiles): beginCacheCompile / appendCompiledFromStream / endCacheCompile, which
+// stages rules through a temp file. saveToCache() writes the same format from the in-RAM rule
+// map instead, and firmware never calls it, so a cache written that way proves nothing about
+// the one the reader actually loads.
+static ::testing::AssertionResult compileCache(CssParser& parser, const std::string& cssPath) {
+  if (!parser.beginCacheCompile()) {
+    return ::testing::AssertionFailure() << "beginCacheCompile failed";
+  }
+  bool appended = false;
+  {
+    FsFile cssFile;
+    if (!Storage.openFileForRead("CSS", cssPath.c_str(), cssFile)) {
+      parser.abortCacheCompile();
+      return ::testing::AssertionFailure() << "cannot open " << cssPath;
+    }
+    appended = parser.appendCompiledFromStream(cssFile);
+  }
+  if (!appended) {
+    parser.abortCacheCompile();
+    return ::testing::AssertionFailure() << "appendCompiledFromStream failed";
+  }
+  if (!parser.endCacheCompile()) {
+    return ::testing::AssertionFailure() << "endCacheCompile failed";
+  }
+  return ::testing::AssertionSuccess();
+}
+
 // Must match the defaults in scripts/generate_large_css_epub.py, which produced
 // test/fixtures/test_large_css.epub.
 constexpr size_t kFixtureRuleCount = 1500;
@@ -316,24 +344,26 @@ TEST(CssParserPerf, CacheSaveLoadAndLowHeapLookup) {
   ASSERT_TRUE(writeTempCssFile(cssData, cssPath));
 
   ASSERT_FALSE(cacheDir.empty());
-  CssParser parser(cacheFileRoot);
   {
-    FsFile cssFile;
-    ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), cssFile));
-    ASSERT_TRUE(parser.loadFromStream(cssFile));
+    CssParser compiler(cacheFileRoot);
+    ASSERT_TRUE(compileCache(compiler, cssPath));
+    EXPECT_EQ(compiler.ruleCount(), kFixtureRuleCount);
   }
-  ASSERT_TRUE(parser.saveToCache());
   const std::filesystem::path cacheFilePath = std::filesystem::path(cacheDir) / "css_rules.cache";
   EXPECT_TRUE(std::filesystem::exists(cacheFilePath));
-  EXPECT_EQ(parser.ruleCount(), kFixtureRuleCount);
 
-  parser.clear();
+  // Load into a fresh parser, as a later open of the book does. endCacheCompile() already
+  // loaded the index into the compiling parser, and clear() keeps that vector's capacity, so
+  // reloading there allocates nothing and the footprint bounds below would pass on 0 bytes.
+  CssParser parser(cacheFileRoot);
   const size_t loadedCacheLiveBytes = measureLiveBytes([&] { ASSERT_TRUE(parser.loadFromCache()); });
   EXPECT_EQ(parser.ruleCount(), kFixtureRuleCount);
   printf("CACHE_LOAD_LIVE_BYTES=%zu\n", loadedCacheLiveBytes);
   // The retained footprint after a cache load is the selector index: one
   // 8-byte (hash, offset) entry per rule. Assert the order of magnitude so a
-  // regression back to in-RAM rule storage (~275 KB for this fixture) fails loudly.
+  // regression back to in-RAM rule storage (~275 KB for this fixture) fails loudly,
+  // and the floor so a load that measured nothing cannot pass.
+  EXPECT_GE(loadedCacheLiveBytes, kFixtureRuleCount * 8);
   EXPECT_LE(loadedCacheLiveBytes, kFixtureRuleCount * 16);
 
   {
@@ -401,12 +431,7 @@ TEST(CssParserArena, ResidentAndIndexMatchHeapResolution) {
   ASSERT_TRUE(writeTempCssFile(cssData, cssPath));
 
   CssParser parser(cacheDir);
-  {
-    FsFile cssFile;
-    ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), cssFile));
-    ASSERT_TRUE(parser.loadFromStream(cssFile));
-  }
-  ASSERT_TRUE(parser.saveToCache());
+  ASSERT_TRUE(compileCache(parser, cssPath));
 
   // Probe a spread of real rules plus a couple of guaranteed misses.
   std::vector<std::pair<std::string, std::string>> probes;
@@ -491,12 +516,7 @@ TEST(CssParserArena, IndexOnlyFallbackMatchesHeapResolution) {
   ASSERT_TRUE(writeTempCssFile(std::vector<uint8_t>(css.begin(), css.end()), cssPath));
 
   CssParser parser(cacheDir);
-  {
-    FsFile cssFile;
-    ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), cssFile));
-    ASSERT_TRUE(parser.loadFromStream(cssFile));
-  }
-  ASSERT_TRUE(parser.saveToCache());
+  ASSERT_TRUE(compileCache(parser, cssPath));
 
   std::vector<std::pair<std::string, std::string>> probes;
   for (int i = 0; i < 30; ++i) probes.emplace_back("p", "u" + std::to_string(i * 13));
@@ -554,12 +574,7 @@ TEST(CssParserArena, ResidentMatchesHeapForRealRichStylesheet) {
   ASSERT_TRUE(writeTempCssFile(std::vector<uint8_t>(css.begin(), css.end()), cssPath));
 
   CssParser parser(cacheDir);
-  {
-    FsFile f;
-    ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), f));
-    ASSERT_TRUE(parser.loadFromStream(f));
-  }
-  ASSERT_TRUE(parser.saveToCache());
+  ASSERT_TRUE(compileCache(parser, cssPath));
 
   const std::vector<std::string> classes = {"apnf", "auteur", "bl", "border", "calibre", "titre"};
   auto resolveAll = [&](CssParser& p) {
@@ -604,12 +619,7 @@ TEST(CssParserArena, ResidentHitsElementClassAndCombinedSelectors) {
   ASSERT_TRUE(writeTempCssFile(std::vector<uint8_t>(css.begin(), css.end()), cssPath));
 
   CssParser parser(cacheDir);
-  {
-    FsFile f;
-    ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), f));
-    ASSERT_TRUE(parser.loadFromStream(f));
-  }
-  ASSERT_TRUE(parser.saveToCache());
+  ASSERT_TRUE(compileCache(parser, cssPath));
 
   BuildArena arena(64 * 1024);
   ASSERT_TRUE(arena.valid());
@@ -659,12 +669,7 @@ TEST(CssParserArena, ResidentPreservesAllStyleFields) {
   ASSERT_TRUE(writeTempCssFile(std::vector<uint8_t>(css.begin(), css.end()), cssPath));
 
   CssParser parser(cacheDir);
-  {
-    FsFile f;
-    ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), f));
-    ASSERT_TRUE(parser.loadFromStream(f));
-  }
-  ASSERT_TRUE(parser.saveToCache());
+  ASSERT_TRUE(compileCache(parser, cssPath));
 
   const std::vector<std::pair<std::string, std::string>> probes = {
       {"p", "a"}, {"p", "b"}, {"div", "c"}, {"span", "a"}, {"p", "none"}};
@@ -712,12 +717,7 @@ TEST(CssParserCache, FontSizeMultiplierSurvivesDiskCache) {
   ASSERT_TRUE(writeTempCssFile(std::vector<uint8_t>(css.begin(), css.end()), cssPath));
 
   CssParser parser(cacheDir);
-  {
-    FsFile cssFile;
-    ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), cssFile));
-    ASSERT_TRUE(parser.loadFromStream(cssFile));
-  }
-  ASSERT_TRUE(parser.saveToCache());
+  ASSERT_TRUE(compileCache(parser, cssPath));
 
   // Fresh state: resolve purely from the cache file, as the device does.
   parser.clear();
@@ -760,12 +760,7 @@ TEST(CssParserCache, ListStyleAndPageBreaksSurviveDiskCache) {
   ASSERT_TRUE(writeTempCssFile(std::vector<uint8_t>(css.begin(), css.end()), cssPath));
 
   CssParser parser(cacheDir);
-  {
-    FsFile cssFile;
-    ASSERT_TRUE(Storage.openFileForRead("CSS", cssPath.c_str(), cssFile));
-    ASSERT_TRUE(parser.loadFromStream(cssFile));
-  }
-  ASSERT_TRUE(parser.saveToCache());
+  ASSERT_TRUE(compileCache(parser, cssPath));
   parser.clear();
   ASSERT_TRUE(parser.loadFromCache());
 
