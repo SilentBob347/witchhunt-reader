@@ -90,6 +90,9 @@ class Section {
   // In-flight incremental build, owned across stepSectionBuild() calls. Null when no build
   // is live. Heap-owned so the visitor's &lut capture stays stable across ticks.
   std::unique_ptr<BuildState> buildState_;
+  // The live build's arena (nullptr when no build is live, or it has none): read by the per-page
+  // heap trace, which sits above BuildState's definition in Section.cpp.
+  const BuildArena* activeBuildArena() const;
   // See setExternalBuildScratch. Not owned; must outlive any active build.
   BuildArena* externalScratch_ = nullptr;
   // Outcome of one phase method. Mostly maps to BuildStep: More means the phase yielded

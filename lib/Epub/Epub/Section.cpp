@@ -235,13 +235,15 @@ struct ParseHeapLowWater {
   uint32_t minFree = UINT32_MAX;
   uint32_t minContig = UINT32_MAX;
   uint32_t atByteOffset = 0;  // bytes fed into the parser when the low point was seen
+  uint32_t arenaAtLow = 0;    // build-arena cursor at that moment: the arena's room when the heap was lowest
 
-  void sample(const size_t bytesFedSoFar) {
+  void sample(const size_t bytesFedSoFar, const size_t arenaUsed) {
     const uint32_t f = static_cast<uint32_t>(esp_get_free_heap_size());
     if (f < minFree) {
       minFree = f;
       minContig = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT));
       atByteOffset = static_cast<uint32_t>(bytesFedSoFar);
+      arenaAtLow = static_cast<uint32_t>(arenaUsed);
     }
   }
   void reset() { *this = ParseHeapLowWater{}; }
@@ -482,25 +484,32 @@ uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
   // section 8.4, unchanged since it was written; these three counters are what answer it.
   multi_heap_info_t pageHeapInfo{};
   heap_caps_get_info(&pageHeapInfo, MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
+  // The build arena beside the heap (memory audit 2026-09, allocation inventory): its cursor now,
+  // its peak so far and its capacity, so one trace shows how much room each allocator had.
+  const BuildArena* traceArena = activeBuildArena();
+  const unsigned long arenaUsedNow = traceArena ? static_cast<unsigned long>(traceArena->used()) : 0;
+  const unsigned long arenaHwNow = traceArena ? static_cast<unsigned long>(traceArena->highWater()) : 0;
+  const unsigned long arenaCap = traceArena ? static_cast<unsigned long>(traceArena->capacity()) : 0;
   if (g_parseLowWater.seen()) {
     LOG_INF("HEAP",
             "spine_page=%d free=%lu contig=%lu allocBlk=%lu freeBlk=%lu allocBytes=%lu | page-low free=%lu "
-            "contig=%lu lowAt=%lu",
+            "contig=%lu lowAt=%lu arenaAtLow=%lu | arena=%lu hw=%lu cap=%lu",
             pageCount, static_cast<unsigned long>(esp_get_free_heap_size()),
             static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)),
             static_cast<unsigned long>(pageHeapInfo.allocated_blocks),
             static_cast<unsigned long>(pageHeapInfo.free_blocks),
             static_cast<unsigned long>(pageHeapInfo.total_allocated_bytes),
             static_cast<unsigned long>(g_parseLowWater.minFree), static_cast<unsigned long>(g_parseLowWater.minContig),
-            static_cast<unsigned long>(g_parseLowWater.atByteOffset));
+            static_cast<unsigned long>(g_parseLowWater.atByteOffset),
+            static_cast<unsigned long>(g_parseLowWater.arenaAtLow), arenaUsedNow, arenaHwNow, arenaCap);
     g_parseLowWater.reset();  // per-page window
   } else {
-    LOG_INF("HEAP", "spine_page=%d free=%lu contig=%lu allocBlk=%lu freeBlk=%lu allocBytes=%lu", pageCount,
-            static_cast<unsigned long>(esp_get_free_heap_size()),
-            static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)),
-            static_cast<unsigned long>(pageHeapInfo.allocated_blocks),
-            static_cast<unsigned long>(pageHeapInfo.free_blocks),
-            static_cast<unsigned long>(pageHeapInfo.total_allocated_bytes));
+    LOG_INF(
+        "HEAP", "spine_page=%d free=%lu contig=%lu allocBlk=%lu freeBlk=%lu allocBytes=%lu | arena=%lu hw=%lu cap=%lu",
+        pageCount, static_cast<unsigned long>(esp_get_free_heap_size()),
+        static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)),
+        static_cast<unsigned long>(pageHeapInfo.allocated_blocks), static_cast<unsigned long>(pageHeapInfo.free_blocks),
+        static_cast<unsigned long>(pageHeapInfo.total_allocated_bytes), arenaUsedNow, arenaHwNow, arenaCap);
   }
 #endif
 
@@ -872,6 +881,8 @@ struct Section::BuildState {
   uint32_t setupMs = 0;
   uint32_t parseMs = 0;
 };
+
+const BuildArena* Section::activeBuildArena() const { return buildState_ ? buildState_->arena : nullptr; }
 
 // Out-of-line (see header): both need the complete BuildState type, and the dtor must
 // not leave a partially written cache file behind when a Section dies with a build in
@@ -1400,7 +1411,7 @@ Section::BuildPhaseResult Section::runBuildParse(BuildState& st, const uint32_t 
         // Sample AFTER the write: the allocation we are hunting happens inside the parser while
         // it consumes this chunk, and by here it is either still held or already released — a
         // dip visible here is a block that outlived the chunk that created it.
-        g_parseLowWater.sample(st.tempBytesFed);
+        g_parseLowWater.sample(st.tempBytesFed, st.arena ? st.arena->used() : 0);
 #endif
 #ifdef BENCH_EXTRACT_PROFILE
         visitorUs += static_cast<uint32_t>(esp_timer_get_time() - tv);
