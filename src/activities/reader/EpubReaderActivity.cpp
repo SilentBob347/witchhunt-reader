@@ -1148,6 +1148,9 @@ void EpubReaderActivity::runDeferredGrayscalePass() {
   if (!pendingGrayscale_.active || !pendingGrayscale_.page || renderer.isRefreshPending()) {
     return;
   }
+  if (dropStagedWorkIfPositionMoved("deferred AA")) {
+    return;  // the page this AA belongs to is no longer the one being read
+  }
   // Full clock for the pass, as for the Background-B/C build slices. Usually redundant — the AA
   // pass is normally owed within IDLE_DOWNCLOCK_MS of the page turn that armed it, so the idle
   // saver has not downclocked yet (device trace 2026-08-07: AA ran ~1.7 s after the button press,
@@ -1435,6 +1438,7 @@ void EpubReaderActivity::stepBackgroundSectionBuild() {
     preRenderRearmSpine_ = currentSpineIndex;
     preRenderRearmPage_ = section->currentPage;
     pendingPreRender = true;
+    markStagedForCurrentPage();
     requestUpdate();
     return;
   }
@@ -3411,6 +3415,23 @@ EpubReaderActivity::RenderLayout EpubReaderActivity::computeRenderLayout() const
   return layout;
 }
 
+bool EpubReaderActivity::dropStagedWorkIfPositionMoved(const char* where) {
+  if (!pendingGrayscale_.active && !pendingPreRender) return false;
+  // pageTurn()'s pre-rendered fast path moves the position on purpose and made the hand-off
+  // itself; the buffer it hands over is the new page.
+  if (usePreRenderedBuffer) return false;
+  const int page = section ? section->currentPage : -1;
+  if (currentSpineIndex == stagedForSpine_ && page == stagedForPage_) return false;
+  LOG_DBG("ERS", "%s: position moved (spine %d page %d -> spine %d page %d); dropping the%s%s of the page left", where,
+          stagedForSpine_, stagedForPage_, currentSpineIndex, page, pendingGrayscale_.active ? " deferred AA" : "",
+          pendingPreRender ? " pre-render" : "");
+  pendingGrayscale_ = {};
+  pendingPreRender = false;
+  preRenderedPage.ready = false;
+  preRenderedPlanesStaged_ = false;
+  return true;
+}
+
 EpubReaderActivity::RenderPass EpubReaderActivity::classifyRenderPass() const {
   if (currentSpineIndex == epub->getSpineItemsCount()) {
     return RenderPass::FinishedBook;
@@ -3492,6 +3513,7 @@ bool EpubReaderActivity::renderBufferDisplayPass(const RenderLayout& layout) {
 
   if (section->currentPage + 1 < section->pageCount) {
     pendingPreRender = true;
+    markStagedForCurrentPage();
     requestUpdate();
   }
   LOG_DBG("ERS", "Page summary: spine=%d page=%d/%d prerendered=1 refresh=%s mode=0x%02X", currentSpineIndex,
@@ -4637,6 +4659,9 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   // without this guard its AA was preempted by the queued pre-render on EVERY page
   // ("Deferred AA ABORTED: planes=35ms gray=0ms"), so the anti-aliasing was computed
   // and thrown away every time. The guard belongs to deferring, not to the X3.
+  // A navigation that skipped pageTurn()'s hand-off leaves the AA and pre-render of the page it
+  // left: drop them first, so the guard below cannot shelve this pass as that page's pre-render.
+  dropStagedWorkIfPositionMoved("render");
   if (usesDeferredAa() && pendingGrayscale_.active && pendingPreRender && !usePreRenderedBuffer &&
       classifyRenderPass() == RenderPass::PreRender) {
     // Logged so the pre-render chain has no silent link left: a deferred pass that is
@@ -5217,6 +5242,7 @@ void EpubReaderActivity::renderContents(RenderLock& lock, std::unique_ptr<Page> 
     // is board-agnostic; only the choice to use it was ever board-specific.
     pendingGrayscale_.active = true;
     pendingGrayscale_.page = std::move(page);
+    markStagedForCurrentPage();
     pendingGrayscale_.fontId = getEffectiveReaderFontId();
     pendingGrayscale_.marginLeft = orientedMarginLeft;
     pendingGrayscale_.contentTop = contentTop;
@@ -5249,6 +5275,7 @@ void EpubReaderActivity::renderContents(RenderLock& lock, std::unique_ptr<Page> 
   // result is discarded — no correctness issue.
   if (!preRenderedPage.ready && section && section->currentPage + 1 < section->pageCount) {
     pendingPreRender = true;
+    markStagedForCurrentPage();
     // Do NOT request the update while a deferred AA is owed: isUpdateSuperseded()
     // is true from the moment requestUpdate() sets its flag, and
     // aaPreemptedByNavigation() reads that as "this page is on its way out", so

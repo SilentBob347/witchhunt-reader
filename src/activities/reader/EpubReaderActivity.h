@@ -557,6 +557,19 @@ class EpubReaderActivity final : public Activity {
     bool fastLut = false;
   };
   PendingGrayscale pendingGrayscale_;
+  // The reading position the owed deferred AA and the armed pre-render belong to: the page on
+  // screen when either was armed (every arming site runs with that page current). render() and
+  // the deferred-AA runner drop both once the position has moved, so a navigation that does not
+  // make pageTurn()'s hand-off (10-page jump, chapter jump, any future one) still gets its page
+  // drawn instead of having its render shelved as a pre-render of the page it left.
+  int stagedForSpine_ = -1;
+  int stagedForPage_ = -1;
+  void markStagedForCurrentPage() {
+    stagedForSpine_ = currentSpineIndex;
+    stagedForPage_ = section ? section->currentPage : -1;
+  }
+  // True (and the staged work dropped) when the position has moved since it was staged.
+  bool dropStagedWorkIfPositionMoved(const char* where);
   // Set by pageTurn() fast path to tell render() the frame buffer already holds the next page
   // content and only the status bar + display flush are needed.
   bool usePreRenderedBuffer = false;
