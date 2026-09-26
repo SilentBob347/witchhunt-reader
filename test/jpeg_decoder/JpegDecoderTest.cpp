@@ -735,16 +735,44 @@ TEST(JpegThumbSession, AbandonedMidDecodeReleasesEverything) {
   }
 }
 
+// Restores the stubbed free heap even when an ASSERT_* returns early, so the pressure cannot leak
+// into the tests that run after this one.
+class FreeHeapScope {
+ public:
+  explicit FreeHeapScope(const uint32_t bytes) : saved_(ESP.getFreeHeap()) { ESP.setFreeHeap(bytes); }
+  ~FreeHeapScope() { ESP.setFreeHeap(saved_); }
+  FreeHeapScope(const FreeHeapScope&) = delete;
+  FreeHeapScope& operator=(const FreeHeapScope&) = delete;
+
+ private:
+  const uint32_t saved_;
+};
+
 // A progressive image only the DC preview takes is not sliced; the caller converts it one-shot.
+// The host heap stub fits every scale's workspace, so the refusal only happens with the heap one
+// byte short of the smallest (1/8) workspace plus the 16 KB the row pipeline is owed.
 TEST(JpegThumbSession, RefusesWhatOnlyTheDcPreviewTakes) {
   FsFile file;
   ASSERT_TRUE(file.openForRead(fixture("progressive_420.jpg")));
+  ProgressiveJpeg::ImageInfo info;
+  ASSERT_EQ(ProgressiveJpeg::probe(file, info), ProgressiveJpeg::Result::Ok) << "the full decoder takes it";
   MemoryPrint out;
   const JpegToBmpConverter::BmpTarget target[1] = {{&out, 40, 28}};
-  ProgressiveJpeg::ImageInfo info;
-  const bool fullDecoderTakesIt = ProgressiveJpeg::probe(file, info) == ProgressiveJpeg::Result::Ok;
-  auto session = JpegThumbSession::begin(file, target, 1);
-  EXPECT_EQ(session != nullptr, fullDecoderTakesIt);
+  {
+    FreeHeapScope squeezed(static_cast<uint32_t>(ProgressiveJpeg::workspaceBytes(info, 3) + 16 * 1024 - 1));
+    EXPECT_EQ(JpegThumbSession::begin(file, target, 1), nullptr);
+    // ...and the one-shot conversion the caller falls back to still makes the thumbnail.
+    ASSERT_TRUE(file.seek(0));
+    ASSERT_TRUE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, target, 1));
+    ASSERT_GE(out.buf.size(), 26u);
+    EXPECT_EQ(le32(out.buf, 18), 40);
+    EXPECT_EQ(le32(out.buf, 22), -28);
+  }
+  // Control: with the heap back, the same image is sliced.
+  ASSERT_TRUE(file.seek(0));
+  MemoryPrint roomy;
+  const JpegToBmpConverter::BmpTarget roomyTarget[1] = {{&roomy, 40, 28}};
+  EXPECT_NE(JpegThumbSession::begin(file, roomyTarget, 1), nullptr);
   file.close();
 }
 
