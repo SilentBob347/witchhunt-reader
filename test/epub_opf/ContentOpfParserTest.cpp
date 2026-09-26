@@ -248,7 +248,7 @@ TEST(ContentOpfParser, ResolvesSpineIdrefsUsingManifestItems) {
   EXPECT_EQ(capturedSpineHrefs[1], "book/OEBPS/text/ch1.xhtml");
 }
 
-TEST(ContentOpfParser, DoesNotHangOnOversizedManifestIdDuringSpineLookup) {
+TEST(ContentOpfParser, OversizedFirstManifestIdNeitherHangsNorBreaksLaterIdrefs) {
   const std::string cacheDir = makeTempDir();
   ASSERT_FALSE(cacheDir.empty());
   TempDirGuard dirGuard(cacheDir);
@@ -256,45 +256,10 @@ TEST(ContentOpfParser, DoesNotHangOnOversizedManifestIdDuringSpineLookup) {
   std::vector<std::string> capturedSpineHrefs;
   ScopedSpineHrefSink sinkGuard(&capturedSpineHrefs);
 
-  // Oversized ID pushes serialization::readString(FsFile, ...) down its
-  // failure path during spine idref lookup in host tests.
-  const std::string oversizedId = repeatedChar('x', 5000);
-  const std::string base = "/book/OEBPS/";
-  const std::string xml =
-      "<?xml version='1.0' encoding='utf-8'?>"
-      "<package xmlns:opf='http://www.idpf.org/2007/opf' xmlns:dc='http://purl.org/dc/elements/1.1/'>"
-      "<metadata><dc:title>T</dc:title></metadata>"
-      "<manifest>"
-      "<item id='" +
-      oversizedId +
-      "' href='text/huge-id.xhtml' media-type='application/xhtml+xml'/>"
-      "<item id='ch1' href='text/ch1.xhtml' media-type='application/xhtml+xml'/>"
-      "</manifest>"
-      "<spine>"
-      "<itemref idref='ch1'/>"
-      "</spine>"
-      "</package>";
-
-  BookMetadataCache cache(cacheDir);
-  ContentOpfParser parser(cacheDir, base, xml.size(), &cache);
-  ASSERT_TRUE(parseOpfXml(parser, xml));
-
-  // The key invariant for this regression is completion without an endless
-  // loop while still resolving valid idrefs.
-  ASSERT_EQ(capturedSpineHrefs.size(), 1u);
-  EXPECT_EQ(capturedSpineHrefs[0], "book/OEBPS/text/ch1.xhtml");
-}
-
-TEST(ContentOpfParser, SkipsMalformedFirstManifestEntryAndResolvesLaterIdrefs) {
-  const std::string cacheDir = makeTempDir();
-  ASSERT_FALSE(cacheDir.empty());
-  TempDirGuard dirGuard(cacheDir);
-
-  std::vector<std::string> capturedSpineHrefs;
-  ScopedSpineHrefSink sinkGuard(&capturedSpineHrefs);
-
-  // First entry is malformed for the temp store read path (oversized id),
-  // while later entries remain valid and should still be resolved.
+  // A 5000-char id on the first manifest item. SaxParserYxml truncates attribute
+  // values to kAttrValueLen (384), so the item store records a 383-char id rather
+  // than one past serialization's MAX_STRING_LENGTH. The spine pass must still
+  // walk past that record: complete without looping, and resolve every later idref.
   const std::string oversizedId = repeatedChar('m', 5000);
   const std::string base = "/book/OEBPS/";
   const std::string xml =
@@ -318,8 +283,6 @@ TEST(ContentOpfParser, SkipsMalformedFirstManifestEntryAndResolvesLaterIdrefs) {
   ContentOpfParser parser(cacheDir, base, xml.size(), &cache);
   ASSERT_TRUE(parseOpfXml(parser, xml));
 
-  // Parser should complete, skip malformed entry safely, and still resolve
-  // later valid idrefs.
   ASSERT_EQ(capturedSpineHrefs.size(), 2u);
   EXPECT_EQ(capturedSpineHrefs[0], "book/OEBPS/text/ok1.xhtml");
   EXPECT_EQ(capturedSpineHrefs[1], "book/OEBPS/text/ok2.xhtml");
