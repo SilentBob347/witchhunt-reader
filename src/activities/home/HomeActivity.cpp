@@ -220,13 +220,23 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
   // releases that buffer before decoding for the same reason; do the same here for the
   // duration of loading and reallocate it once every cover is resolved (see end of this
   // function) or on exit. Release under the render lock so we never free it mid-render.
-  if (!secondaryBufferLent && renderer.hasSecondaryBuffer()) {
+  if (secondaryBufferLent && frameCacheInRegion_) {
+    // A later pass on the same visit: the carousel's frame cache has the region; the decoders
+    // need it back. (The cache would be rebuilt anyway -- new covers are about to land.)
+    RenderLock lock;
+    UITheme::getInstance().getMutableTheme().setFrameCacheRegion(nullptr, 0);
+    frameCacheInRegion_ = false;
+    coverScratch_ = makeUniqueNoThrow<BuildArena>(lentRegion_, lentRegionBytes_);
+    if (!coverScratch_ || !coverScratch_->valid()) coverScratch_.reset();
+  } else if (!secondaryBufferLent && renderer.hasSecondaryBuffer()) {
     RenderLock lock;
     size_t lentSize = 0;
     if (uint8_t* lent = renderer.borrowSecondaryBuffer(&lentSize)) {
       coverScratch_ = makeUniqueNoThrow<BuildArena>(lent, lentSize);
       if (coverScratch_ && coverScratch_->valid()) {
         secondaryBufferLent = true;
+        lentRegion_ = lent;
+        lentRegionBytes_ = lentSize;
         // Keep X4 fast-differential refresh alive while the secondary buffer is lent: the
         // controller still holds the last home frame in RED RAM and displayBuffer() re-seeds it
         // after every refresh (syncRedRamFromFrameBuffer), so carousel/menu navigation diffs
@@ -241,6 +251,19 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
         renderer.returnSecondaryBuffer();
       }
     }
+  }
+
+  // A frame being drawn shares the core (on the C3 the render task has the loop task's priority)
+  // and the SD card with this pass. Bursting beside it stretched the redraw a press asked for
+  // from ~360 ms to 0.6-1.1 s (X3, 2026-09-27): the sliced sessions resume after a press instead
+  // of restarting, so -- unlike the one-shot decode they replaced -- they were still running when
+  // the redraw began. Step aside until the frame is handed to the panel; the ~430 ms refresh
+  // after that needs neither, and the pass keeps that window.
+  const auto frameInProgress = [this]() { return renderer.isComposingFrame(); };
+  if (frameInProgress()) {
+    recentsLoading = false;
+    delay(2);  // block rather than spin: a spinning loop task still takes its share of the core
+    return;
   }
 
   const auto thumbSizes = GUI.getCoverThumbSizes(coverHeight);
@@ -295,6 +318,51 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
   // this size across all continueStep() calls (realloc only if the size changes).
   constexpr size_t COVER_EXTRACT_CHUNK = 16384;
 
+  // ── Sliced JPEG cover drain ──────────────────────────────────────────────────
+  // One decode writes every missing carousel size (R9 item 2); it runs here a unit at a time -- an
+  // MCU row of a baseline cover; 4 KB of the index pass, then a band, of a progressive one -- in
+  // bursts of COVER_SLICE_BUDGET_MS. A queued press pauses it where it stands (R9 item 3): the
+  // one-shot decode it replaces threw the work away and started over, seconds per press on a
+  // large progressive cover.
+  if (thumbSession) {
+    const uint32_t deadline = millis() + COVER_SLICE_BUDGET_MS;
+    auto status = CoverThumbSession::Status::Running;
+    while (status == CoverThumbSession::Status::Running) {
+      status = thumbSession->continueSteps(1);
+      if (status == CoverThumbSession::Status::Running &&
+          (mappedInput.hasPendingInput() || frameInProgress() || static_cast<int32_t>(millis() - deadline) >= 0)) {
+        recentsLoading = false;  // pause between units; resume on the next call
+        return;
+      }
+    }
+    thumbSession.reset();
+    RecentBook& book = recentBooks[nextRecentCoverIndex];
+    if (status == CoverThumbSession::Status::Done) {
+      LOG_DBG("HOME", "Cover session complete for %s (%d size(s))", book.path.c_str(), thumbSessionCovered);
+      // As after a one-shot decode: sizes this decode did not cover keep the book current.
+      nextThumbSizeIndex = thumbSessionSizeIndex + 1;
+      if (nextThumbSizeIndex < thumbSizes.size() &&
+          static_cast<size_t>(thumbSessionCovered) < thumbSizes.size() - thumbSessionSizeIndex) {
+        yieldAfterDecode();
+        return;
+      }
+      const std::string placeholder = ReaderActivity::coverThumbPlaceholder(book.path);
+      if (book.coverBmpPath != placeholder) {
+        RECENT_BOOKS.updateBook(book.path, book.title, book.author, book.series, placeholder);
+        book.coverBmpPath = placeholder;
+      }
+      nextRecentCoverIndex++;
+      nextThumbSizeIndex = 0;
+      yieldAfterDecode();
+      return;
+    }
+    // The session removed its partial thumbnails. Retry this size once with the one-shot decode,
+    // whose own failure then walks the usual ladder and counts toward the book's budget.
+    LOG_ERR("HOME", "Cover session failed for %s — retrying one-shot", book.path.c_str());
+    thumbSessionFailed = true;
+    nextThumbSizeIndex = thumbSessionSizeIndex;
+  }
+
   // ── Cover extract session drain ──────────────────────────────────────────────
   // Sliced ZIP extraction of cover.img for a large embedded PNG cover. Burst-drain
   // chunks within the time budget; when done, fall through to beginPngThumbSession.
@@ -306,7 +374,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
       // Stop the burst (but keep the session alive) when input is waiting or the budget
       // is spent — resume from where we left off on the next loadRecentCovers() call.
       if (status == ReaderActivity::CoverExtractSession::Status::Running &&
-          (mappedInput.hasPendingInput() || static_cast<int32_t>(millis() - deadline) >= 0)) {
+          (mappedInput.hasPendingInput() || frameInProgress() || static_cast<int32_t>(millis() - deadline) >= 0)) {
         recentsLoading = false;
         return;
       }
@@ -333,7 +401,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     while (status == PngDecodeSession::Status::Running) {
       status = pngSession->continueRows(ROWS_PER_BATCH);
       if (status == PngDecodeSession::Status::Running &&
-          (mappedInput.hasPendingInput() || static_cast<int32_t>(millis() - deadline) >= 0)) {
+          (mappedInput.hasPendingInput() || frameInProgress() || static_cast<int32_t>(millis() - deadline) >= 0)) {
         recentsLoading = false;  // pause between batches; resume on the next call
         return;
       }
@@ -405,8 +473,9 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
 
         if (!validThumb) {
           // Button input has priority: never start a fresh decode while a press is
-          // queued. Yield with this size still pending so the next pass retries it.
-          if (mappedInput.hasPendingInput()) {
+          // queued, or while the frame it asked for is being drawn. Yield with this size
+          // still pending so the next pass retries it.
+          if (mappedInput.hasPendingInput() || frameInProgress()) {
             nextThumbSizeIndex = i;
             recentsLoading = false;
             return;
@@ -426,10 +495,39 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
           // Cover decode needs ~42 KB contiguous heap — free the frame cache first.
           invalidateFrameCacheSafely();
 
-          // Try synchronous decode first (handles JPEG and cached covers).
+          // Every size of this book still missing, from ONE decode of the cover (memory audit 2026-09,
+          // R9 item 2): the carousel's 340x540 and 200x390 thumbs used to be two full decodes of the
+          // same JPEG -- ~4.5 s each for a 1.3 MB progressive cover on the X3.
+          std::pair<int, int> pending[JpegToBmpConverter::kMaxTargets];
+          int pendingCount = 0;
+          pending[pendingCount++] = sz;
+          for (size_t j = i + 1; j < thumbSizes.size() && pendingCount < JpegToBmpConverter::kMaxTargets; j++) {
+            const auto& other = thumbSizes[j];
+            if (!ReaderActivity::isCoverThumbComplete(
+                    UITheme::getCoverThumbPath(placeholder, other.first, other.second), other.first, other.second)) {
+              pending[pendingCount++] = other;
+            }
+          }
+
+          // A JPEG cover that is cached or stored in place starts as a sliced session (drained at the
+          // top of this function); everything else decodes here, one-shot.
           CooperativeAbort::clearAborted();
-          const ThumbResult res = ReaderActivity::ensureCoverThumb(book.path, sz.first, sz.second, coverScratch_.get());
-          LOG_DBG("HOME", "ensureCoverThumb(%dx%d) for %s: %s", sz.first, sz.second, book.path.c_str(),
+          std::unique_ptr<CoverThumbSession> started;
+          const ThumbResult res = ReaderActivity::ensureCoverThumbs(
+              book.path, pending, pendingCount, coverScratch_.get(), thumbSessionFailed ? nullptr : &started);
+          thumbSessionFailed = false;  // consumed
+          if (started) {
+            thumbSession = std::move(started);
+            thumbSessionSizeIndex = i;
+            thumbSessionCovered = pendingCount;
+            nextThumbSizeIndex = i;
+            LOG_DBG("HOME", "Started %s cover session for %s (%d size(s))",
+                    thumbSession->progressive() ? "progressive" : "baseline", book.path.c_str(), pendingCount);
+            recentsLoading = false;
+            return;
+          }
+          LOG_DBG("HOME", "ensureCoverThumbs(%dx%d, %d size(s)) for %s: %s", sz.first, sz.second, pendingCount,
+                  book.path.c_str(),
                   res == ThumbResult::Ok                   ? "ok"
                   : res == ThumbResult::StructurallyAbsent ? "absent"
                                                            : "transient");
@@ -479,10 +577,11 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
             break;
           }
           // One decode done — yield back to loop() so input can be serviced.
-          // nextThumbSizeIndex advances past this size; next call continues from i+1.
+          // nextThumbSizeIndex advances past this size; next call continues from i+1 (any size the
+          // decode just wrote alongside it checks valid there and is skipped).
           nextThumbSizeIndex = i + 1;
-          if (nextThumbSizeIndex < thumbSizes.size()) {
-            // More sizes remain for this book — stay on current book next call.
+          if (nextThumbSizeIndex < thumbSizes.size() && pendingCount < static_cast<int>(thumbSizes.size() - i)) {
+            // Sizes remain that this decode did not cover — stay on current book next call.
             yieldAfterDecode();
             return;
           }
@@ -522,9 +621,10 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               book.coverBmpPath.c_str(), placeholder.c_str(), validThumb ? 0 : 1);
 
       if (!validThumb) {
-        // Button input has priority: don't start a decode while a press is queued.
-        // Yield without advancing so this book's cover is retried on a later pass.
-        if (mappedInput.hasPendingInput()) {
+        // Button input has priority: don't start a decode while a press is queued, or while
+        // the frame it asked for is being drawn. Yield without advancing so this book's cover
+        // is retried on a later pass.
+        if (mappedInput.hasPendingInput() || frameInProgress()) {
           recentsLoading = false;
           return;
         }
@@ -612,7 +712,39 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
 
   recentsLoaded = true;
   recentsLoading = false;
-  restoreSecondaryBuffer();
+  if (!keepRegionAsFrameCache()) restoreSecondaryBuffer();
+}
+
+bool HomeActivity::keepRegionAsFrameCache() {
+  // Every cover is resolved, so the region would go back to the display now -- where, on the
+  // carousel, it leaves Home without a frame cache: the cache wants one ~49 KB block (X3; 45 KB
+  // X4), which Home's heap never has with the buffer resident (run 16: "cover region 0 (49104
+  // bytes, 36108 free)" on every render, then "OOM: cover buffer (20592 bytes)" for the fallback),
+  // so every render redrew the three covers from SD: ~360 ms against ~40 ms restored from a cache.
+  // The region is idle for the rest of the visit, so the cache lives there instead. The display
+  // keeps working as it does during the cover pass (single-buffer fast diff).
+  if (!secondaryBufferLent || lentRegion_ == nullptr || frameCacheInRegion_) return false;
+  if (thumbSession || extractSession || pngSession) return false;  // nothing may still hold a block
+  auto& theme = UITheme::getInstance().getMutableTheme();
+  const size_t wanted = theme.frameCacheRegionBytes(renderer);
+  if (wanted == 0 || wanted > lentRegionBytes_) return false;
+  RenderLock lock;
+  coverScratch_.reset();
+  theme.setFrameCacheRegion(lentRegion_, lentRegionBytes_);
+  frameCacheInRegion_ = true;
+  // The fallback cover buffer (20 592 B on the X3) is dead weight from here on: the fast path
+  // serves every render. Left allocated it held Home at ~28 KB free for the rest of the visit
+  // instead of ~49 KB (X3, 2026-09-27). If the region goes back early the fallback re-stores it.
+  freeCoverBuffer();
+  LOG_DBG("HOME", "Kept the lent framebuffer as the carousel frame cache (%u of %u bytes, free=%lu)",
+          static_cast<unsigned>(wanted), static_cast<unsigned>(lentRegionBytes_),
+          static_cast<unsigned long>(esp_get_free_heap_size()));
+  return true;
+}
+
+void HomeActivity::startActivityForResult(std::unique_ptr<Activity>&& activity, ActivityResultHandler resultHandler) {
+  restoreSecondaryBuffer(/*callerHoldsRenderLock=*/false);
+  Activity::startActivityForResult(std::move(activity), std::move(resultHandler));
 }
 
 void HomeActivity::restoreSecondaryBuffer(bool callerHoldsRenderLock) {
@@ -626,13 +758,20 @@ void HomeActivity::restoreSecondaryBuffer(bool callerHoldsRenderLock) {
   // end-of-loading caller runs from loop() with no lock held and passes false.
   if (!secondaryBufferLent) return;
   const auto doRestore = [this]() {
-    // Anything still holding a block in the lent region goes first: an abandoned extract or
-    // PNG session at exit would otherwise release into a region the display owns again.
+    // Anything still holding a block in the lent region goes first: an abandoned extract, PNG or
+    // JPEG session at exit would otherwise release into a region the display owns again.
+    thumbSession.reset();
     extractSession.reset();
     pngSession.reset();
     coverScratch_.reset();
+    if (frameCacheInRegion_) {
+      UITheme::getInstance().getMutableTheme().setFrameCacheRegion(nullptr, 0);
+      frameCacheInRegion_ = false;
+    }
     renderer.returnSecondaryBuffer();  // cannot fail: the region never entered the heap
     secondaryBufferLent = false;
+    lentRegion_ = nullptr;
+    lentRegionBytes_ = 0;
     // Two-buffer differential is available again — turn off the single-buffer RED-RAM-baseline
     // mode so normal fast refresh resumes against the secondary. No syncRedRamFromFrameBuffer()
     // here: the return re-seeds the baseline exactly as a realloc does, and RED already holds the
@@ -684,6 +823,8 @@ void HomeActivity::onEnter() {
   firstRenderDone = false;
   nextRecentCoverIndex = 0;
   nextThumbSizeIndex = 0;
+  thumbSession.reset();
+  thumbSessionFailed = false;
   extractSession.reset();
   pngSession.reset();
   pngSessionFiles.close();
@@ -691,6 +832,9 @@ void HomeActivity::onEnter() {
   coverTransientAttempts.clear();
   coverRendered = false;
   secondaryBufferLent = false;
+  lentRegion_ = nullptr;
+  lentRegionBytes_ = 0;
+  frameCacheInRegion_ = false;
   freeCoverBuffer();
 
   const auto& metrics = UITheme::getInstance().getMetrics();

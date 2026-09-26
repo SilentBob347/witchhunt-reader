@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Epub/BookMetadataCache.h"
@@ -17,7 +18,8 @@
 #include "Epub/css/CssParser.h"
 
 class ZipFile;
-class BuildArena;  // lib/Memory — optional scratch for the extraction inflate ring
+class BuildArena;         // lib/Memory — optional scratch for the extraction inflate ring
+class CoverThumbSession;  // Epub/CoverThumbSession.h
 
 enum class OpfCacheMode { Disabled, Enabled };
 
@@ -214,6 +216,20 @@ class Epub {
   // `scratch`: a lent region for the JPEG decoder's working memory (see JpegToBmpConverter).
   ThumbResult generateThumbBmp(int height, bool allowExtract = true, BuildArena* scratch = nullptr) const;
   ThumbResult generateThumbBmp(int width, int height, bool allowExtract = true, BuildArena* scratch = nullptr) const;
+  // Every size in `sizes` (width, height) that is not already a complete thumbnail, from ONE decode
+  // of a JPEG cover (a PNG cover is converted once per size). Same sentinel / transient contract as
+  // the single-size overload, answered for the cover as a whole: Ok when every size is complete.
+  // At most JpegToBmpConverter::kMaxTargets sizes. See JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes.
+  ThumbResult generateThumbBmps(const std::pair<int, int>* sizes, int count, bool allowExtract = true,
+                                BuildArena* scratch = nullptr) const;
+  // generateThumbBmps in slices (Home's cover pass): starts converting every size that is not yet a
+  // complete thumbnail when the cover is a JPEG that is already cached or stored in place, and the
+  // sliced converter takes it (see JpegThumbSession). Null otherwise -- nothing needed, a sentinel,
+  // no cover, a PNG, not extracted yet, a DC-preview-only progressive, no memory -- with no thumbnail
+  // written: the caller then runs generateThumbBmps, which gives every structural and transient
+  // answer. `scratch` must stay lent, and untouched by anyone else, while the session lives.
+  std::unique_ptr<CoverThumbSession> beginThumbSession(const std::pair<int, int>* sizes, int count,
+                                                       BuildArena* scratch = nullptr) const;
   uint8_t* readItemContentsToBytes(const std::string& itemHref, size_t* size = nullptr,
                                    bool trailingNullByte = false) const;
   bool readItemContentsToStream(const std::string& itemHref, Print& out, size_t chunkSize) const;

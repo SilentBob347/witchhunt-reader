@@ -13,6 +13,7 @@
 
 #include "../Activity.h"
 #include "./FileBrowserActivity.h"
+#include "Epub/CoverThumbSession.h"
 #include "HomeMenu.h"
 #include "ReadingStats.h"
 #include "activities/reader/ReaderActivity.h"
@@ -40,9 +41,24 @@ class HomeActivity final : public Activity {
   // The lent block never enters the heap, and the return cannot fail. Returned once all covers
   // are loaded, and on exit. See loadRecentCovers() / restoreSecondaryBuffer().
   bool secondaryBufferLent = false;
+  // The lent region itself. During the cover pass it backs coverScratch_; once every cover is
+  // resolved the carousel keeps it as its frame cache (frameCacheInRegion_) instead of handing
+  // it back, and it returns to the display on exit or before a child activity opens.
+  uint8_t* lentRegion_ = nullptr;
+  size_t lentRegionBytes_ = 0;
+  bool frameCacheInRegion_ = false;
   std::unique_ptr<BuildArena> coverScratch_;
   size_t nextRecentCoverIndex = 0;
   size_t nextThumbSizeIndex = 0;  // which thumb size within the current book is next
+
+  // Phase 0: a JPEG cover's missing carousel sizes, from one decode run in slices (memory audit
+  // 2026-09, R9 item 3). A press pauses it where it stands; it resumes on the next pass instead of
+  // starting over. Holds its decoder state in coverScratch_ between slices (declared after it, so
+  // it goes first) and removes its partial thumbnails if it goes unfinished.
+  std::unique_ptr<CoverThumbSession> thumbSession;
+  size_t thumbSessionSizeIndex = 0;  // the first size it writes (nextThumbSizeIndex when it began)
+  int thumbSessionCovered = 0;       // how many sizes it writes
+  bool thumbSessionFailed = false;   // set on error: the retry for that book runs one-shot
 
   // Phase 1: sliced ZIP extraction of cover.img (only needed for large embedded PNG covers)
   std::unique_ptr<ReaderActivity::CoverExtractSession> extractSession;
@@ -84,6 +100,7 @@ class HomeActivity final : public Activity {
   void dispatchMenuAction(HomeMenuAction action);
 
   void rebuildMenuEntries();
+  bool keepRegionAsFrameCache();
   bool storeCoverBuffer();
   bool restoreCoverBuffer();
   void freeCoverBuffer();
@@ -124,12 +141,16 @@ class HomeActivity final : public Activity {
  public:
   void loop() override;
   void render(RenderLock&&) override;
+  // A child drawn over Home (the touch boards' light drawer) recovers the displayed frame from the
+  // secondary buffer, which does nothing while Home has it lent: hand it back first.
+  void startActivityForResult(std::unique_ptr<Activity>&& activity, ActivityResultHandler resultHandler) override;
   // Covers still resolving (not just mid-pass): loadRecentCovers() clears recentsLoading at
   // every yield point so loop() re-enters it, which briefly makes the activity look idle. If
   // skipLoopDelay went false in that window, the main loop's inactivity governor could drop
   // the CPU to 10 MHz mid-burst and the next decode tick would crawl (observed: a ~1.5 s
   // cover decode taking ~25 s). Hold full speed until every recent cover is resolved.
   bool skipLoopDelay() override {
-    return (firstRenderDone && !recentsLoaded) || recentsLoading || extractSession != nullptr || pngSession != nullptr;
+    return (firstRenderDone && !recentsLoaded) || recentsLoading || extractSession != nullptr ||
+           pngSession != nullptr || thumbSession != nullptr;
   }
 };

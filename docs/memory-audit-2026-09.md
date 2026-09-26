@@ -1152,7 +1152,9 @@ needs none of them; the call now runs after the teardown, where the KOSync
 hand-off measured 43 556 free / 23 540 contiguous a few milliseconds later.
 
 **R9 — the cold Home's cover pipeline (R1b follow-up).** *Filed
-2026-09-26; item (1a) done the same evening, the rest not started.* (1a)
+2026-09-26; item (1a) done the same evening; (2), (3) and (1b) done
+2026-09-27 on branch `home/lyra-carousel-covers` and device-validated on the
+X3 in runs 22a–c (see the end of this entry); the X4 is pending.* (1a)
 The thumbnail converter's row pipeline (MCU strip, row buffer, scaling
 accumulators) now comes from the lent region in a block of its own, with
 the heap floor at 8 KB when it does — run 15 showed this refusal on every
@@ -1183,6 +1185,75 @@ worth ~45 % of a cold Home. The alternative of decoding once to an 8-bit
 intermediate on SD and dithering both sizes from it respects the invariant
 but saves only ~20 %. (3) A decode that yields to input resumes or is
 deferred, not restarted from the first scan.
+
+*Done 2026-09-27 (branch `home/lyra-carousel-covers`, host tests
+1039/1039, firmware 93.8 % flash; not yet on a device):*
+
+- *(2) One decode per cover.* `jpegFileTo1BitBmpStreamsWithSizes` decodes
+  once at the scale the larger thumb needs and feeds both outputs, each with
+  its own resampler, ditherer and BMP stream. The larger thumb is
+  byte-identical to generating it alone. On the way: a JPEG cover stored
+  uncompressed in the EPUB never decoded in place (the converter rewound to
+  the start of the ZIP), so every such cover paid the extraction.
+- *(3) Resumable decode.* The progressive decoder stops after 4 KB of its
+  index pass or after one band and resumes where it stopped; TJpgDec gained
+  `jd_decomp_rows` (MCU rows per call). A `CoverThumbSession` runs Home's
+  JPEG covers one unit at a time in the existing 150 ms bursts, and a press
+  pauses it instead of restarting it. The paused state stays in the lent
+  framebuffer, which Home holds for the whole pass. Sliced output is
+  byte-identical to the one-shot conversion.
+- *(1b) Frame cache.* Measured from runs 15–17 (X3, clearScreen to
+  displayBuffer): 34–41 ms when a cached cover strip is restored, ~360 ms
+  when the three covers are redrawn from SD, then ~435 ms of e-ink refresh
+  either way. The carousel's one cached frame is 49 104 B (X3) / 45 120 B
+  (X4), never available on the heap with the secondary buffer resident. Once
+  the cover pass is done, Home now keeps the lent framebuffer (52 272 / 48 000
+  B) as that cache until it exits or opens a child activity. Carousel moves
+  still redraw: the centre book changes, so no cache applies to them.
+- *Found on the way:* since the 8-bit sleep-screen covers (ee71b96c8,
+  2026-08-05) the thumbnail generators' "already complete" check demanded
+  8 bpp, so it never matched a 1-bit thumb and every generator call decoded
+  again. Latent, because callers check first; fixed.
+
+*Runs 22a–c (2026-09-27, X3, cache wiped, buttons pressed throughout):* all
+five covers (two progressive, three baseline) went through the sliced
+sessions, both sizes from one decode, with no restart. Menu-row redraws
+served by the frame cache took 5–8 ms from clearScreen to displayBuffer
+against ~354 ms redrawn from SD; a carousel move still refills it. Home kept
+~50 KB free after the handover once the 20 KB fallback buffer was freed
+there (it had held Home at 28 KB). The runs also turned up three fixes, all
+in this branch: the cover extractor freed and reallocated its chunk buffer on
+every step after a shortfall (~50 times per large cover; it now allocates
+once, 16 KB from the lent region on the X3); redraws during loading took
+0.6–1.1 s because the sessions kept running beside them on the shared core
+(the pass now sleeps while `GfxRenderer::isComposingFrame()`: the Deckhand
+window went from 626–1116 ms to 199–336 ms); and the fallback buffer above.
+Still open: one redraw at 832 ms during the Brazilian Wilderness extraction,
+at the same point in two runs and so tied to that extraction rather than to
+the CPU sharing; the synchronous cover-metadata load before an extraction
+blocks the loop 0.8–2.9 s (1.9 s of it the 230 KB OPF of a book never
+opened); and a session heap minimum of ~11.8 KB that falls in the Settings /
+clear-cache window none of the captures contain. The X4 has not run the
+branch.
+
+*Device check:* wipe the book caches, open Home on the carousel, and press
+buttons while covers load. Expect `Started progressive cover session` /
+`Cover session complete` with no `yielded to input — will retry`, and
+after the pass `Kept the lent framebuffer as the carousel frame cache`;
+menu-row presses should then log ~40 ms from clearScreen to displayBuffer.
+
+*Follow-up, the reader's image lane.* It needs the same thing and does not
+have it: a lane decode that a page turn preempts is thrown away and restarted
+(run 21: one page six times). The decoders can now pause, but the reader must
+return the lent region on every page turn, so a paused decode cannot stay
+there, and the X3 reading heap cannot hold it. What would work is a
+checkpoint at a band boundary: between bands the progressive decoder's
+persistent state is its `State`, 11.8 KB of a 24–26 KB workspace (the rest is
+per-band scratch), plus the pixel-cache writer's accumulators, dither rows
+and file offsets. Written to SD on preemption and read back on resume, that
+costs tens of milliseconds against a 1.5–4.5 s re-decode. A baseline
+checkpoint is ~50 bytes plus a file offset (the tables come back from the
+header).
 
 *R3 residual, the `KOSyncWorker` stack (F6):* re-examined 2026-09-26. The
 worker task is created by `post()` before its job releases the framebuffer

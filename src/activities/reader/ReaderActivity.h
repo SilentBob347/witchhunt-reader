@@ -1,6 +1,7 @@
 #pragma once
 class BuildArena;  // lib/Memory
 
+#include <BuildArena.h>
 #include <PngToBmpConverter.h>
 #include <ZipFile.h>
 
@@ -11,6 +12,7 @@ class BuildArena;  // lib/Memory
 #include "activities/home/FileBrowserActivity.h"
 
 class Epub;
+class CoverThumbSession;  // Epub/CoverThumbSession.h
 class Xtc;
 class Txt;
 
@@ -56,6 +58,16 @@ class ReaderActivity final : public Activity {
   // extraction ring and the decoders' working memory. Null uses the heap as before.
   static ThumbResult ensureCoverThumb(const std::string& bookPath, int width, int height,
                                       BuildArena* scratch = nullptr);
+  // Every (width, height) in `sizes` for this book, from ONE decode of an embedded EPUB JPEG cover
+  // (the Lyra carousel's two thumbnail sizes used to cost two full decodes). A sidecar image, an XTC
+  // or a TXT source keeps the per-size path. Ok only when every size is complete.
+  // `sliced` (Home's cover pass): when the cover is a JPEG the sliced converter takes, the
+  // conversion is STARTED instead of run here and handed over in *sliced, with nothing written yet;
+  // the result is then TransientFail and the caller drives the session (see CoverThumbSession).
+  // Otherwise *sliced stays null and the result is the one-shot conversion's.
+  static ThumbResult ensureCoverThumbs(const std::string& bookPath, const std::pair<int, int>* sizes, int count,
+                                       BuildArena* scratch = nullptr,
+                                       std::unique_ptr<CoverThumbSession>* sliced = nullptr);
   static ThumbResult ensureCoverThumb(const std::string& bookPath, int height, BuildArena* scratch = nullptr);
   // True only if a cover thumbnail BMP exists AND holds all its declared pixel rows. A thumbnail
   // whose write was interrupted (reboot/abort mid-decode) is left truncated on the SD card; it
@@ -100,13 +112,19 @@ class ReaderActivity final : public Activity {
     CoverExtractSession& operator=(const CoverExtractSession&) = delete;
 
    private:
+    void releaseChunk();
+
     std::unique_ptr<ZipFile> zip_;
     std::unique_ptr<ZipFile::EntryReader> reader_;
     FsFile dst_;
     std::string finalPath_;
     std::string destPath_;
+    BuildArena* scratch_ = nullptr;
+    BuildArena::Block chunkBlock_;  // reserved after the reader's block, released before it
     uint8_t* buf_ = nullptr;
-    size_t chunkBytes_ = 0;
+    bool bufInArena_ = false;
+    size_t requestedBytes_ = 0;  // what the caller asked for
+    size_t chunkBytes_ = 0;      // what buf_ holds: the request, or less when memory was short
   };
 
   // Begin a sliced ZIP extraction for the embedded cover of bookPath.

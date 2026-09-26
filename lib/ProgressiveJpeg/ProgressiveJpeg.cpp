@@ -32,6 +32,7 @@ bool isStartOfFrame(const uint8_t marker) {
 // one 512-byte buffer instead of one per scan.
 struct Source {
   FsFile* file = nullptr;
+  uint32_t base = 0;  // file offset of the JPEG's first byte; `pos` below is relative to it
   uint8_t buffer[INPUT_BUFFER] = {};
   uint32_t start = 0;
   uint16_t length = 0;
@@ -43,7 +44,7 @@ struct Source {
   // fails on SdFat: that is end of data too, which the bit reader pads with zeros like libjpeg.
   int at(const uint32_t pos) {
     if (pos - start >= length) {
-      if (!file->seek(pos)) return -1;
+      if (!file->seek(base + pos)) return -1;
       const int count = file->read(buffer, sizeof(buffer));
       ++reads;
       if (count > 0) bytesRead += static_cast<uint32_t>(count);
@@ -208,10 +209,46 @@ struct Layout {
   size_t maskOffset, coefOffset, pixelOffset, total;
 };
 
+// `options.shouldAbort` is polled every INDEX_POLL_BYTES: a 2 MB cover is seconds of SD reads,
+// and the caller's hook is where the watchdog gets fed.
+constexpr uint32_t INDEX_POLL_BYTES = 32 * 1024;
+// A Decoder::step() unit while indexing: about eight SD reads.
+constexpr uint32_t INDEX_STEP_BYTES = 4 * 1024;
+
+// Where the index pass stands, so it can stop after a byte budget and resume (Decoder::step):
+// either between segments, or inside an entropy-coded segment it is skipping.
+struct IndexCursor {
+  uint32_t p = 0;  // next byte to look at
+  uint32_t nextPoll = INDEX_POLL_BYTES;
+  bool started = false;    // SOI checked
+  bool inEntropy = false;  // skipping a scan's entropy-coded data
+};
+
+}  // namespace
+
+// Everything a decode keeps between Decoder::step() calls. It sits at the front of the workspace,
+// so a paused decode holds no memory of its own beyond the caller's block.
+struct Session {
+  enum class Phase : uint8_t { Index, Bands, Done };
+  State st;
+  ImageInfo info;
+  Geometry g;
+  Layout layout;
+  IndexCursor index;
+  uint8_t* workspace = nullptr;  // aligned; the Session itself is at offset 0
+  BandCallback callback = nullptr;
+  void* user = nullptr;
+  uint16_t nextBand = 0;
+  Phase phase = Phase::Index;
+  Result outcome = Result::Ok;  // once Done: what every further step() reports
+};
+
+namespace {
+
 Layout layoutFor(const Geometry& g) {
   const size_t blocks = static_cast<size_t>(g.bandBlockRows) * g.paddedCols;
   Layout l{};
-  l.maskOffset = alignUp(sizeof(State));
+  l.maskOffset = alignUp(sizeof(Session));
   l.coefOffset = alignUp(l.maskOffset + blocks * sizeof(uint64_t));
   l.pixelOffset = alignUp(l.coefOffset + blocks * g.kept * sizeof(int16_t));
   l.total = alignUp(l.pixelOffset + static_cast<size_t>(g.n) * g.paddedCols * g.n) + 8;  // + alignment slack
@@ -392,16 +429,47 @@ Result parseScan(State& st, uint32_t p, const uint32_t end) {
 
 // Walks the whole file once: tables, frame, and every luma scan's entry point. Entropy-coded
 // data has no length field, so each scan is skipped by looking for its terminating marker.
-// `options.shouldAbort` is polled every INDEX_POLL_BYTES: a 2 MB cover is seconds of SD reads,
-// and the caller's hook is where the watchdog gets fed.
-constexpr uint32_t INDEX_POLL_BYTES = 32 * 1024;
-
-Result indexFile(State& st, const DecodeOptions& options) {
+// One pass over the file: every table, the frame and each scan's data offset. Pending when
+// `budget` bytes of entropy data were skipped without reaching the end of the file; call again to
+// resume. UINT32_MAX never pauses (the one-shot decode).
+Result indexStep(State& st, IndexCursor& ic, const DecodeOptions& options, const uint32_t budget) {
   Source& src = st.source;
-  uint32_t nextPoll = INDEX_POLL_BYTES;
-  if (src.at(0) != 0xFF || src.at(1) != 0xD8) return inputFailure(src);
-  uint32_t p = 2;
+  if (!ic.started) {
+    if (src.at(0) != 0xFF || src.at(1) != 0xD8) return inputFailure(src);
+    ic.p = 2;
+    ic.started = true;
+  }
+  uint32_t& p = ic.p;
+  const uint32_t stopAt = budget >= UINT32_MAX - p ? UINT32_MAX : p + budget;
   for (;;) {
+    if (ic.inEntropy) {
+      // Skip the entropy-coded segment: stuffed 0xFF00 and RSTn belong to it, anything else ends it.
+      for (;;) {
+        const int b = src.at(p);
+        if (b < 0) break;
+        if (b != 0xFF) {
+          if (++p >= ic.nextPoll) {
+            ic.nextPoll = p + INDEX_POLL_BYTES;
+            if (options.shouldAbort && options.shouldAbort(options.abortUser)) return Result::Aborted;
+          }
+          if (p >= stopAt) return Result::Pending;  // still inside the segment: resume here
+          continue;
+        }
+        const int next = src.at(p + 1);
+        if (next < 0) break;
+        if (next == 0x00 || (next >= 0xD0 && next <= 0xD7)) {
+          p += 2;
+        } else if (next == 0xFF) {
+          ++p;
+        } else {
+          break;
+        }
+      }
+      ic.inEntropy = false;
+      if (src.at(p) < 0) break;
+      continue;
+    }
+
     int value = src.at(p);
     if (value < 0) break;  // truncated after the last complete segment: decode what we have
     if (value != 0xFF) return Result::InvalidData;
@@ -432,29 +500,8 @@ Result indexFile(State& st, const DecodeOptions& options) {
     } else if (marker == 0xDA) {
       result = parseScan(st, payload, end);
       if (result != Result::Ok) return result;
-      // Skip the entropy-coded segment: stuffed 0xFF00 and RSTn belong to it, anything else ends it.
       p = end;
-      for (;;) {
-        const int b = src.at(p);
-        if (b < 0) break;
-        if (b != 0xFF) {
-          if (++p >= nextPoll) {
-            nextPoll = p + INDEX_POLL_BYTES;
-            if (options.shouldAbort && options.shouldAbort(options.abortUser)) return Result::Aborted;
-          }
-          continue;
-        }
-        const int next = src.at(p + 1);
-        if (next < 0) break;
-        if (next == 0x00 || (next >= 0xD0 && next <= 0xD7)) {
-          p += 2;
-        } else if (next == 0xFF) {
-          ++p;
-        } else {
-          break;
-        }
-      }
-      if (src.at(p) < 0) break;
+      ic.inEntropy = true;
       continue;
     }
     if (result != Result::Ok) return result;
@@ -749,8 +796,19 @@ void idctBlock(const State& st, const int16_t* coef, const uint16_t* quant, cons
 
 // ---- band loop --------------------------------------------------------------------------
 
-Result decodeBands(State& st, const Geometry& g, uint8_t* workspace, const Layout& layout, const DecodeOptions& options,
-                   const BandCallback callback, void* user) {
+// Every luma scan's cursor at the start of its entropy data, before the first band.
+void initCursors(State& st) {
+  for (uint8_t s = 0; s < st.scanCount; ++s) {
+    Cursor& c = st.cursors[s];
+    c = Cursor{};
+    c.pos = st.scans[s].dataStart;
+    c.unitsToRestart = st.scans[s].restartInterval;
+  }
+}
+
+// One band: advance every scan across its block rows, then emit its output rows.
+Result decodeBand(State& st, const Geometry& g, uint8_t* workspace, const Layout& layout, const uint16_t band,
+                  const BandCallback callback, void* user) {
   auto* masks = reinterpret_cast<uint64_t*>(workspace + layout.maskOffset);
   auto* coefs = reinterpret_cast<int16_t*>(workspace + layout.coefOffset);
   uint8_t* pixels = workspace + layout.pixelOffset;
@@ -760,87 +818,76 @@ Result decodeBands(State& st, const Geometry& g, uint8_t* workspace, const Layou
   const uint16_t outHeight = static_cast<uint16_t>(st.height >> (3 - __builtin_ctz(g.n)));
   const uint16_t* quant = st.quant[st.comps[0].quantizer];
 
-  for (uint8_t s = 0; s < st.scanCount; ++s) {
-    Cursor& c = st.cursors[s];
-    c = Cursor{};
-    c.pos = st.scans[s].dataStart;
-    c.unitsToRestart = st.scans[s].restartInterval;
-  }
-
   auto blockAt = [&](const int bandRow, const int col) {
     const size_t index = static_cast<size_t>(bandRow) * g.paddedCols + col;
     return BlockRef{coefs + index * g.kept, masks + index};
   };
 
-  for (uint16_t band = 0; band < g.bandCount; ++band) {
-    if (options.shouldAbort && options.shouldAbort(options.abortUser)) return Result::Aborted;
-    memset(masks, 0, bandBlocks * sizeof(uint64_t));
-    memset(coefs, 0, bandBlocks * g.kept * sizeof(int16_t));
-    const int firstRow = band * g.bandBlockRows;
-
-    for (uint8_t s = 0; s < st.scanCount; ++s) {
-      const Scan& scan = st.scans[s];
-      BitReader in{st.source, st.cursors[s]};
-      if (scan.compCount > 1) {
-        // Interleaved (always a DC scan): one MCU row, chroma decoded only to stay in step.
-        for (uint16_t mx = 0; mx < g.mcuCols; ++mx) {
-          if (!beginUnit(in, scan)) return Result::InvalidData;
-          for (uint8_t k = 0; k < scan.compCount; ++k) {
-            const Component& comp = st.comps[scan.comp[k]];
-            for (uint8_t by = 0; by < comp.v; ++by) {
-              for (uint8_t bx = 0; bx < comp.h; ++bx) {
-                const BlockRef block = scan.comp[k] == 0 ? blockAt(by, mx * st.maxH + bx) : BlockRef{};
-                if (scan.ah == 0) {
-                  if (!decodeDcFirst(st, in, scan, k, block)) return Result::InvalidData;
-                } else {
-                  decodeDcRefine(in, scan, block);
-                }
+  memset(masks, 0, bandBlocks * sizeof(uint64_t));
+  memset(coefs, 0, bandBlocks * g.kept * sizeof(int16_t));
+  const int firstRow = band * g.bandBlockRows;
+  for (uint8_t s = 0; s < st.scanCount; ++s) {
+    const Scan& scan = st.scans[s];
+    BitReader in{st.source, st.cursors[s]};
+    if (scan.compCount > 1) {
+      // Interleaved (always a DC scan): one MCU row, chroma decoded only to stay in step.
+      for (uint16_t mx = 0; mx < g.mcuCols; ++mx) {
+        if (!beginUnit(in, scan)) return Result::InvalidData;
+        for (uint8_t k = 0; k < scan.compCount; ++k) {
+          const Component& comp = st.comps[scan.comp[k]];
+          for (uint8_t by = 0; by < comp.v; ++by) {
+            for (uint8_t bx = 0; bx < comp.h; ++bx) {
+              const BlockRef block = scan.comp[k] == 0 ? blockAt(by, mx * st.maxH + bx) : BlockRef{};
+              if (scan.ah == 0) {
+                if (!decodeDcFirst(st, in, scan, k, block)) return Result::InvalidData;
+              } else {
+                decodeDcRefine(in, scan, block);
               }
             }
           }
         }
-        continue;
       }
-      // Non-interleaved luma: whole block rows of the component's own (unpadded) grid.
-      const int lastRow = std::min<int>(firstRow + g.bandBlockRows, g.lumaRows);
-      for (int row = firstRow; row < lastRow; ++row) {
-        for (uint16_t col = 0; col < g.lumaCols; ++col) {
-          if (!beginUnit(in, scan)) return Result::InvalidData;
-          const BlockRef block = blockAt(row - firstRow, col);
-          bool ok = true;
-          if (scan.ss == 0) {
-            if (scan.ah == 0) {
-              ok = decodeDcFirst(st, in, scan, 0, block);
-            } else {
-              decodeDcRefine(in, scan, block);
-            }
+      continue;
+    }
+    // Non-interleaved luma: whole block rows of the component's own (unpadded) grid.
+    const int lastRow = std::min<int>(firstRow + g.bandBlockRows, g.lumaRows);
+    for (int row = firstRow; row < lastRow; ++row) {
+      for (uint16_t col = 0; col < g.lumaCols; ++col) {
+        if (!beginUnit(in, scan)) return Result::InvalidData;
+        const BlockRef block = blockAt(row - firstRow, col);
+        bool ok = true;
+        if (scan.ss == 0) {
+          if (scan.ah == 0) {
+            ok = decodeDcFirst(st, in, scan, 0, block);
           } else {
-            ok = scan.ah == 0 ? decodeAcFirst(st, in, scan, block) : decodeAcRefine(st, in, scan, block);
+            decodeDcRefine(in, scan, block);
           }
-          if (!ok) return Result::InvalidData;
+        } else {
+          ok = scan.ah == 0 ? decodeAcFirst(st, in, scan, block) : decodeAcRefine(st, in, scan, block);
         }
+        if (!ok) return Result::InvalidData;
       }
     }
-    if (st.source.ioError) return Result::IoError;
+  }
+  if (st.source.ioError) return Result::IoError;
 
-    // Emit one block row of output at a time; only the columns that reach the output are built.
-    const uint16_t colsNeeded = static_cast<uint16_t>((outWidth + g.n - 1) / g.n);
-    for (int r = 0; r < g.bandBlockRows; ++r) {
-      const int y = (firstRow + r) * g.n;
-      if (y >= outHeight) break;
-      for (uint16_t col = 0; col < colsNeeded; ++col) {
-        const BlockRef block = blockAt(r, col);
-        uint8_t* dst = pixels + static_cast<size_t>(col) * g.n;
-        if ((*block.mask & ~1ULL) == 0) {
-          fillDcBlock(block.coef[0], quant[0], g.n, dst, pixelStride);
-        } else {
-          idctBlock(st, block.coef, quant, g.n, dst, pixelStride);
-        }
+  // Emit one block row of output at a time; only the columns that reach the output are built.
+  const uint16_t colsNeeded = static_cast<uint16_t>((outWidth + g.n - 1) / g.n);
+  for (int r = 0; r < g.bandBlockRows; ++r) {
+    const int y = (firstRow + r) * g.n;
+    if (y >= outHeight) break;
+    for (uint16_t col = 0; col < colsNeeded; ++col) {
+      const BlockRef block = blockAt(r, col);
+      uint8_t* dst = pixels + static_cast<size_t>(col) * g.n;
+      if ((*block.mask & ~1ULL) == 0) {
+        fillDcBlock(block.coef[0], quant[0], g.n, dst, pixelStride);
+      } else {
+        idctBlock(st, block.coef, quant, g.n, dst, pixelStride);
       }
-      const uint16_t rows = static_cast<uint16_t>(std::min<int>(g.n, outHeight - y));
-      if (!callback(user, static_cast<uint16_t>(y), pixels, outWidth, rows, static_cast<uint16_t>(pixelStride))) {
-        return Result::Stopped;
-      }
+    }
+    const uint16_t rows = static_cast<uint16_t>(std::min<int>(g.n, outHeight - y));
+    if (!callback(user, static_cast<uint16_t>(y), pixels, outWidth, rows, static_cast<uint16_t>(pixelStride))) {
+      return Result::Stopped;
     }
   }
   return Result::Ok;
@@ -848,11 +895,11 @@ Result decodeBands(State& st, const Geometry& g, uint8_t* workspace, const Layou
 
 }  // namespace
 
-Result probe(FsFile& file, ImageInfo& info) {
+Result probe(FsFile& file, ImageInfo& info, const uint32_t base) {
   info = {};
-  if (!file || !file.seek(0)) return Result::InvalidData;
+  if (!file || !file.seek(base)) return Result::InvalidData;
   auto finish = [&](const Result result) {
-    file.seek(0);
+    file.seek(base);
     return result;
   };
   auto readByte = [&]() -> int {
@@ -919,53 +966,117 @@ size_t workspaceBytes(const ImageInfo& info, const uint8_t scaleShift) {
       .total;
 }
 
-Result decode(FsFile& file, const DecodeOptions& options, const BandCallback callback, void* user) {
+Result Decoder::begin(FsFile& file, const DecodeOptions& options, const BandCallback callback, void* user) {
+  end();
   if (!file || callback == nullptr || options.scaleShift > 3) return Result::InvalidData;
   ImageInfo info;
-  const Result probed = probe(file, info);
+  const Result probed = probe(file, info, options.base);
   if (probed != Result::Ok) return probed;
 
   const Geometry g = geometryFor(info.width, info.height, info.componentCount, info.maxHorizontal, info.maxVertical,
                                  options.scaleShift);
   const Layout layout = layoutFor(g);
 
-  std::unique_ptr<uint8_t[]> owned;
   uint8_t* base = options.workspace;
   size_t size = options.workspaceSize;
   if (!base) {
-    owned = makeUniqueNoThrow<uint8_t[]>(layout.total);
-    if (!owned) return Result::OutOfMemory;
-    base = owned.get();
+    owned_ = makeUniqueNoThrow<uint8_t[]>(layout.total);
+    if (!owned_) return Result::OutOfMemory;
+    base = owned_.get();
     size = layout.total;
   }
   // Align the caller's block; layoutFor() includes the slack this may consume.
   const size_t skew = (8 - (reinterpret_cast<uintptr_t>(base) & 7)) & 7;
-  if (size < layout.total || size - skew < layout.total - 8) return Result::OutOfMemory;
+  if (size < layout.total || size - skew < layout.total - 8) {
+    owned_.reset();
+    return Result::OutOfMemory;
+  }
   uint8_t* workspace = base + skew;
 
-  auto* st = new (workspace) State();
-  st->source.file = &file;
-  buildBasis(*st, g.n);
-  const uint32_t t0 = options.clock ? options.clock() : 0;
-  Result result = indexFile(*st, options);
-  const uint32_t t1 = options.clock ? options.clock() : 0;
-  if (result == Result::Ok) {
-    // The probe and the full index read the same SOF; disagreeing means the file changed shape.
-    if (st->width != info.width || st->height != info.height || st->compCount != info.componentCount) {
-      result = Result::InvalidData;
-    } else {
-      result = decodeBands(*st, g, workspace, layout, options, callback, user);
+  session_ = new (workspace) Session();
+  session_->info = info;
+  session_->g = g;
+  session_->layout = layout;
+  session_->workspace = workspace;
+  session_->callback = callback;
+  session_->user = user;
+  session_->st.source.file = &file;
+  session_->st.source.base = options.base;
+  buildBasis(session_->st, g.n);
+  file_ = &file;
+  options_ = options;
+  if (options_.stats) *options_.stats = DecodeStats{};
+  return Result::Ok;
+}
+
+Result Decoder::step(const uint16_t units) {
+  if (session_ == nullptr) return Result::InvalidData;
+  Session& ss = *session_;
+  if (ss.phase == Session::Phase::Done) return ss.outcome;
+  const uint32_t t0 = options_.clock ? options_.clock() : 0;
+  Result result = Result::Pending;
+  if (ss.phase == Session::Phase::Index) {
+    const uint32_t budget =
+        units == UINT16_MAX ? UINT32_MAX : static_cast<uint32_t>(std::max<uint16_t>(units, 1)) * INDEX_STEP_BYTES;
+    result = indexStep(ss.st, ss.index, options_, budget);
+    if (result == Result::Ok) {
+      // The probe and the full index read the same SOF; disagreeing means the file changed shape.
+      if (ss.st.width != ss.info.width || ss.st.height != ss.info.height || ss.st.compCount != ss.info.componentCount) {
+        result = Result::InvalidData;
+      } else {
+        initCursors(ss.st);
+        ss.phase = Session::Phase::Bands;
+        result = Result::Pending;
+      }
     }
+    if (options_.stats) options_.stats->indexMs += (options_.clock ? options_.clock() : 0) - t0;
+  } else {
+    const uint16_t count = std::max<uint16_t>(units, 1);
+    for (uint16_t i = 0; i < count && ss.nextBand < ss.g.bandCount; ++i) {
+      if (options_.shouldAbort && options_.shouldAbort(options_.abortUser)) {
+        result = Result::Aborted;
+        break;
+      }
+      const Result band = decodeBand(ss.st, ss.g, ss.workspace, ss.layout, ss.nextBand, ss.callback, ss.user);
+      if (band != Result::Ok) {
+        result = band;
+        break;
+      }
+      ++ss.nextBand;
+    }
+    if (result == Result::Pending && ss.nextBand >= ss.g.bandCount) {
+      ss.phase = Session::Phase::Done;
+      result = Result::Ok;
+    }
+    if (options_.stats) options_.stats->bandsMs += (options_.clock ? options_.clock() : 0) - t0;
   }
-  if (options.stats) {
-    const uint32_t t2 = options.clock ? options.clock() : 0;
-    options.stats->indexMs = t1 - t0;
-    options.stats->bandsMs = t2 - t1;
-    options.stats->reads = st->source.reads;
-    options.stats->bytesRead = st->source.bytesRead;
+  if (options_.stats) {
+    options_.stats->reads = ss.st.source.reads;
+    options_.stats->bytesRead = ss.st.source.bytesRead;
   }
-  st->~State();
-  file.seek(0);
+  if (result != Result::Pending) {
+    ss.phase = Session::Phase::Done;
+    ss.outcome = result;
+  }
+  return result;
+}
+
+void Decoder::end() {
+  if (session_ == nullptr) return;
+  session_->~Session();
+  session_ = nullptr;
+  owned_.reset();
+  if (file_) file_->seek(options_.base);
+  file_ = nullptr;
+}
+
+Result decode(FsFile& file, const DecodeOptions& options, const BandCallback callback, void* user) {
+  Decoder decoder;
+  Result result = decoder.begin(file, options, callback, user);
+  if (result != Result::Ok) return result;
+  do {
+    result = decoder.step(UINT16_MAX);  // one step indexes the whole file, the next decodes every band
+  } while (result == Result::Pending);
   return result;
 }
 
@@ -985,6 +1096,8 @@ const char* resultName(const Result result) {
       return "aborted";
     case Result::Stopped:
       return "stopped";
+    case Result::Pending:
+      return "pending";
   }
   return "unknown";
 }

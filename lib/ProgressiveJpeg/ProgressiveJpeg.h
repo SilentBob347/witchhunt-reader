@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 // Full decoder for progressive (SOF2) JPEGs: grayscale (luma) output at 1/1, 1/2, 1/4 or 1/8
 // scale, streamed top to bottom in bands, without a whole-image coefficient buffer.
@@ -32,6 +33,7 @@ enum class Result : uint8_t {
   OutOfMemory,
   Aborted,
   Stopped,  // the band callback asked to stop
+  Pending,  // Decoder::step(): more work remains
 };
 
 struct ImageInfo {
@@ -44,7 +46,9 @@ struct ImageInfo {
 
 // Reads marker segments through SOF and rewinds the file. Unsupported for anything
 // decode() would refuse on geometry alone (non-SOF2, precision, luma not at full sampling).
-Result probe(FsFile& file, ImageInfo& info);
+// `base`: where the JPEG starts in the file -- 0 for a file of its own, the entry's data offset for
+// an image stored uncompressed in a ZIP and read in place. Every offset is relative to it.
+Result probe(FsFile& file, ImageInfo& info, uint32_t base = 0);
 
 // Working memory decode() needs at output scale 1/2^scaleShift, including alignment slack.
 size_t workspaceBytes(const ImageInfo& info, uint8_t scaleShift);
@@ -66,9 +70,12 @@ struct DecodeStats {
 };
 
 struct DecodeOptions {
+  // Where the JPEG starts in the file (see probe()).
+  uint32_t base = 0;
   uint8_t scaleShift = 0;  // 0..3: output is floor(width >> s) x floor(height >> s)
   // Polled before every band and every 32 KB while indexing the file (the whole file is read
   // before the first band): a watchdog feed belongs here. True aborts with Result::Aborted.
+  // A Decoder driven in steps polls it the same way within each step.
   AbortCallback shouldAbort = nullptr;
   void* abortUser = nullptr;
   // Caller-provided working memory of at least workspaceBytes() (e.g. a scratch arena). When
@@ -83,6 +90,41 @@ struct DecodeOptions {
 // Every failure is reported before the first band is emitted unless the entropy data itself is
 // corrupt, so a caller can fall back to another decoder on Unsupported / OutOfMemory.
 Result decode(FsFile& file, const DecodeOptions& options, BandCallback callback, void* user);
+
+struct Session;
+
+// decode() in pieces, for a caller that must stay responsive between them (Home's cover pass
+// pauses for a button press and resumes where it stopped instead of starting over). decode() is
+// begin() + step() until done, so the output is identical however the work is sliced.
+//
+// All state lives at the front of the workspace; the file and the workspace must stay valid, and
+// the file open, until end(). Other reads of the same file between steps are fine: every read
+// seeks first.
+class Decoder {
+ public:
+  Decoder() = default;
+  ~Decoder() { end(); }
+  Decoder(const Decoder&) = delete;
+  Decoder& operator=(const Decoder&) = delete;
+
+  // Probes the file and claims the workspace. Ok: call step(). Anything else is final (the same
+  // results decode() reports before its first band).
+  Result begin(FsFile& file, const DecodeOptions& options, BandCallback callback, void* user);
+  // Does up to `units` of work: while indexing, a unit is 4 KB of the file; after that, one band.
+  // The index pass and the bands never share a step. Pending: call again. Ok: every band was
+  // emitted. Anything else is final; a finished decode reports its outcome again.
+  Result step(uint16_t units);
+  // Releases the workspace (when the decoder took its own) and rewinds the file to the JPEG's
+  // start. Safe to call at any point, and more than once.
+  void end();
+  bool active() const { return session_ != nullptr; }
+
+ private:
+  Session* session_ = nullptr;
+  std::unique_ptr<uint8_t[]> owned_;
+  FsFile* file_ = nullptr;
+  DecodeOptions options_{};
+};
 
 const char* resultName(Result result);
 

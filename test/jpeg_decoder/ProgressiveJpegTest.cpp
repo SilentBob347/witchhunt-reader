@@ -226,6 +226,131 @@ TEST(ProgressiveJpeg, RunsInACallerWorkspaceAndRefusesAShortOne) {
   EXPECT_EQ(refused.bands, 0);
 }
 
+// Home's cover pass drives the decoder a slice at a time and reads other files in between. However
+// the work is cut, the rows must be the one-shot decode's, byte for byte.
+struct SteppedRun {
+  Capture capture;
+  int indexSteps = 0;
+  int bandSteps = 0;
+  ProgressiveJpeg::Result result = ProgressiveJpeg::Result::Ok;
+};
+
+SteppedRun decodeStepped(const std::string& name, const int shift, const uint16_t units) {
+  SteppedRun run;
+  FsFile file;
+  EXPECT_TRUE(file.openForRead(fixture(name)));
+  ProgressiveJpeg::DecodeOptions options;
+  options.scaleShift = static_cast<uint8_t>(shift);
+  ProgressiveJpeg::Decoder decoder;
+  run.result = decoder.begin(file, options, Capture::accept, &run.capture);
+  if (run.result != ProgressiveJpeg::Result::Ok) return run;
+  EXPECT_TRUE(decoder.active());
+  for (int guard = 0; guard < 100000; ++guard) {
+    const int bandsBefore = run.capture.bands;
+    run.result = decoder.step(units);
+    (run.capture.bands == bandsBefore ? run.indexSteps : run.bandSteps)++;
+    // Someone else moves the file position between slices.
+    file.seek(3);
+    uint8_t junk[7];
+    file.read(junk, sizeof(junk));
+    if (run.result != ProgressiveJpeg::Result::Pending) break;
+  }
+  decoder.end();
+  EXPECT_FALSE(decoder.active());
+  EXPECT_EQ(file.position(), 0u) << "end() rewinds to the JPEG's start";
+  file.close();
+  return run;
+}
+
+class ProgressiveJpegStepped : public testing::TestWithParam<std::tuple<const char*, int>> {};
+
+TEST_P(ProgressiveJpegStepped, MatchesTheOneShotDecode) {
+  const auto& [jpg, shift] = GetParam();
+  Capture oneShot;
+  ASSERT_EQ(decode(jpg, shift, oneShot), ProgressiveJpeg::Result::Ok);
+
+  for (const uint16_t units : {uint16_t{1}, uint16_t{3}, uint16_t{UINT16_MAX}}) {
+    const SteppedRun run = decodeStepped(jpg, shift, units);
+    ASSERT_EQ(run.result, ProgressiveJpeg::Result::Ok) << ProgressiveJpeg::resultName(run.result);
+    EXPECT_TRUE(run.capture.orderOk);
+    EXPECT_EQ(run.capture.image.w, oneShot.image.w);
+    EXPECT_EQ(run.capture.image.h, oneShot.image.h);
+    EXPECT_TRUE(run.capture.image.px == oneShot.image.px) << jpg << " units=" << units;
+    if (units == 1) {
+      EXPECT_GT(run.indexSteps, 1) << "a 4 KB index step must not read the whole file";
+      // A band is one MCU row: one callback per block row it holds (two for 4:2:0).
+      EXPECT_GT(run.bandSteps, 1);
+      EXPECT_LE(run.bandSteps, run.capture.bands);
+      EXPECT_GE(run.bandSteps * 2, run.capture.bands) << "one band per unit";
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(Fixtures, ProgressiveJpegStepped,
+                         testing::Combine(testing::Values("prog_full_420.jpg", "prog_full_gray.jpg",
+                                                          "prog_full_444_rst.jpg"),
+                                          testing::Values(0, 1, 3)));
+
+// A pass that gives up halfway (the reader opened a book) must leave nothing behind, and the next
+// attempt starts clean.
+TEST(ProgressiveJpeg, EndMidDecodeReleasesAndRestartsClean) {
+  Capture oneShot;
+  ASSERT_EQ(decode("prog_full_420.jpg", 1, oneShot), ProgressiveJpeg::Result::Ok);
+
+  FsFile file;
+  ASSERT_TRUE(file.openForRead(fixture("prog_full_420.jpg")));
+  ProgressiveJpeg::DecodeOptions options;
+  options.scaleShift = 1;
+  Capture partial;
+  ProgressiveJpeg::Decoder decoder;
+  ASSERT_EQ(decoder.begin(file, options, Capture::accept, &partial), ProgressiveJpeg::Result::Ok);
+  ProgressiveJpeg::Result r = ProgressiveJpeg::Result::Pending;
+  while (r == ProgressiveJpeg::Result::Pending && partial.bands < 2) r = decoder.step(1);
+  ASSERT_EQ(r, ProgressiveJpeg::Result::Pending);
+  decoder.end();
+  decoder.end();  // idempotent
+  EXPECT_EQ(file.position(), 0u);
+  EXPECT_EQ(decoder.step(1), ProgressiveJpeg::Result::InvalidData) << "no session after end()";
+
+  Capture again;
+  ASSERT_EQ(decoder.begin(file, options, Capture::accept, &again), ProgressiveJpeg::Result::Ok);
+  do {
+    r = decoder.step(2);
+  } while (r == ProgressiveJpeg::Result::Pending);
+  EXPECT_EQ(r, ProgressiveJpeg::Result::Ok);
+  EXPECT_TRUE(again.image.px == oneShot.image.px);
+  file.close();
+}
+
+TEST(ProgressiveJpeg, StepPollsTheAbortHook) {
+  FsFile file;
+  ASSERT_TRUE(file.openForRead(fixture("prog_full_gray.jpg")));  // one block row per band
+  struct Hook {
+    int calls = 0;
+    int abortAt = 0;
+    static bool poll(void* user) {
+      auto& h = *static_cast<Hook*>(user);
+      return ++h.calls >= h.abortAt;
+    }
+  } hook;
+  hook.abortAt = 3;  // two bands, then abort before the third
+  ProgressiveJpeg::DecodeOptions options;
+  options.shouldAbort = Hook::poll;
+  options.abortUser = &hook;
+  Capture capture;
+  ProgressiveJpeg::Decoder decoder;
+  ASSERT_EQ(decoder.begin(file, options, Capture::accept, &capture), ProgressiveJpeg::Result::Ok);
+  ProgressiveJpeg::Result r;
+  do {
+    r = decoder.step(1);
+  } while (r == ProgressiveJpeg::Result::Pending);
+  EXPECT_EQ(r, ProgressiveJpeg::Result::Aborted);
+  EXPECT_EQ(capture.bands, 2);
+  EXPECT_EQ(decoder.step(1), ProgressiveJpeg::Result::Aborted) << "a finished decode keeps its outcome";
+  decoder.end();
+  file.close();
+}
+
 // Smaller output keeps fewer coefficients per block: the working set has to shrink with it.
 TEST(ProgressiveJpeg, WorkspaceShrinksWithScale) {
   ProgressiveJpeg::ImageInfo info;

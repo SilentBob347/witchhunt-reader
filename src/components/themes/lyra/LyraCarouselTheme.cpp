@@ -208,6 +208,29 @@ std::string gCacheKey;
 // cold-cache path intact — covers arriving there re-arm this on every decode — while a
 // warm boot stops paying a doomed 48 KB allocation attempt per render.
 std::string gAllocFailedKey;
+// A lent region (HomeActivity's secondary framebuffer, after its cover pass) the one cached frame
+// lives in instead of the heap. Null: frames come from malloc, as before.
+uint8_t* gFrameRegion = nullptr;
+size_t gFrameRegionBytes = 0;
+static_assert(kFrameCount == 1, "the lent region holds exactly one frame");
+
+uint8_t* allocFrame(const size_t bytes) {
+  if (gFrameRegion != nullptr && gFrameRegionBytes >= bytes) return gFrameRegion;
+  return static_cast<uint8_t*>(malloc(bytes));
+}
+
+// The cached strip: full width, from just above the centre cover's outline to just below the
+// author/title lines.
+struct FrameRegion {
+  int y;
+  int h;
+};
+FrameRegion carouselFrameRegion(const GfxRenderer& renderer) {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  return FrameRegion{metrics.homeTopPadding - kCenterOutlineW, metrics.homeCoverTileHeight + kCenterOutlineW + 8 +
+                                                                   kDotSize + 6 + renderer.getLineHeight(kTitleFontId) +
+                                                                   2 + renderer.getLineHeight(kTitleFontId) + 4};
+}
 
 int findFrameSlot(int bookIdx) {
   for (int i = 0; i < kFrameCount; ++i) {
@@ -219,7 +242,7 @@ int findFrameSlot(int bookIdx) {
 void freeFrameCache() {
   for (int i = 0; i < kFrameCount; ++i) {
     if (gCachedFrames[i]) {
-      free(gCachedFrames[i]);
+      if (gCachedFrames[i] != gFrameRegion) free(gCachedFrames[i]);
       gCachedFrames[i] = nullptr;
     }
     gCachedFrameBookIdx[i] = -1;
@@ -243,6 +266,18 @@ void LyraCarouselTheme::invalidateFrameCache() {
 void LyraCarouselTheme::markFrameCacheDirty() {
   gFrameCacheDirty = true;
   gAllocFailedKey.clear();  // a cover just landed, so the rebuild is worth retrying
+}
+
+size_t LyraCarouselTheme::frameCacheRegionBytes(const GfxRenderer& renderer) const {
+  const FrameRegion region = carouselFrameRegion(renderer);
+  return renderer.getRegionByteSize(0, region.y, renderer.getScreenWidth(), region.h);
+}
+
+void LyraCarouselTheme::setFrameCacheRegion(uint8_t* region, const size_t bytes) {
+  freeFrameCache();  // a frame in the old storage is gone either way
+  gAllocFailedKey.clear();
+  gFrameRegion = region;
+  gFrameRegionBytes = region != nullptr ? bytes : 0;
 }
 
 void LyraCarouselTheme::onBookWillClose(const std::string& /*path*/, Epub* /*epub*/, Xtc* xtc, Txt* /*txt*/) {
@@ -325,9 +360,9 @@ bool LyraCarouselTheme::tryFastHomeRender(GfxRenderer& renderer, const std::vect
   // white — clearScreen() provides the background; header/menu/hints are drawn
   // fresh every call — so we only need to cache the cover tile itself.
   // This saves ~10 KB vs caching the full framebuffer (~52 KB on X3, ~48 KB on X4).
-  const int regionY = metrics.homeTopPadding - kCenterOutlineW;
-  const int regionH = metrics.homeCoverTileHeight + kCenterOutlineW + 8 + kDotSize + 6 +
-                      renderer.getLineHeight(kTitleFontId) + 2 + renderer.getLineHeight(kTitleFontId) + 4;
+  const FrameRegion frameRegion = carouselFrameRegion(renderer);
+  const int regionY = frameRegion.y;
+  const int regionH = frameRegion.h;
   const size_t regionBytes = renderer.getRegionByteSize(0, regionY, pageWidth, regionH);
 
   // Build cache key from book paths
@@ -357,7 +392,7 @@ bool LyraCarouselTheme::tryFastHomeRender(GfxRenderer& renderer, const std::vect
     gCachedFrameBytes = regionBytes;
     const int frameCount = std::min(bookCount, kFrameCount);
     for (int i = 0; i < frameCount; ++i) {
-      gCachedFrames[i] = static_cast<uint8_t*>(malloc(regionBytes));
+      gCachedFrames[i] = allocFrame(regionBytes);
       if (!gCachedFrames[i]) {
         LOG_DBG("CAROUSEL",
                 "tryFastHomeRender: malloc failed for cover region %d (%u bytes, %u free) — skipping until the book "
@@ -384,7 +419,7 @@ bool LyraCarouselTheme::tryFastHomeRender(GfxRenderer& renderer, const std::vect
     slotIdx = 0;
   }
   if (!gCachedFrames[slotIdx]) {
-    gCachedFrames[slotIdx] = static_cast<uint8_t*>(malloc(gCachedFrameBytes));
+    gCachedFrames[slotIdx] = allocFrame(gCachedFrameBytes);
     if (!gCachedFrames[slotIdx]) {
       LOG_DBG("CAROUSEL", "tryFastHomeRender: malloc failed for cover region %d — retrying next render", slotIdx);
       return false;
