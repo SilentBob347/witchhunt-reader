@@ -89,8 +89,12 @@ std::vector<uint8_t> buildFont(const uint32_t (&firstCp)[SdCardFont::MAX_STYLES]
   return b;
 }
 
+// Named after the running test: ctest -j runs each test in its own process, and a shared path
+// lets one test's "wb" truncate the file while another is still loading it.
 std::string writeTemp(const std::vector<uint8_t>& bytes) {
-  const auto path = std::filesystem::temp_directory_path() / "sd_font_intervals_test.cpfont";
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      (std::string("sd_font_intervals_") + testing::UnitTest::GetInstance()->current_test_info()->name() + ".cpfont");
   FILE* f = std::fopen(path.string().c_str(), "wb");
   EXPECT_NE(f, nullptr);
   std::fwrite(bytes.data(), 1, bytes.size(), f);
