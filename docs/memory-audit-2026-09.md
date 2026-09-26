@@ -1359,6 +1359,33 @@ clock-minute or battery status refresh no longer takes the buffer back from B: i
 holds the borrow and is drawn when B hands it back (`77a51bc34`) — every render discards B's live
 build, and a 7–15 s build rarely survived the minute tick.
 
+*Run 21 (X3, 22:49, all of the above flashed, cache wiped):*
+
+| Chapter 3, built from a wiped cache | run 19 | run 21 |
+|---|---:|---:|
+| free at build start | 44 972 | 44 960 |
+| lowest page boundary | 22 036 | **26 244** |
+| true low (allocator minimum) | 12 864 | **23 912** |
+| heap cost to the true low | 32.1 KB | **21.0 KB** |
+
+Chapter 4 from the reading state (38 816 free) cost 13.1 KB to its lowest page boundary (run 19:
+16.1 KB); arena peaks as in every run (47 868 / 45 884). A borrowed build of the heaviest chapter
+started at B's new 35 KB floor would therefore bottom near 14 KB, well clear of the parser's 9 KB
+abort. B itself did not run: the reader never came within 50 pages of a chapter's end (it stopped
+on page 49 of 180 and page 27 of 147), which is B's runway gate, not its heap gate — while waiting
+on page 49 B saw 36 432 free and 29 684 contiguous, which the old 40 KB floor would have refused
+and the new one admits. So the B build and the deferred clock refresh remain to be seen on device.
+
+The session's lowest point now comes from rendering, not building: 15 320 during a page turn's
+image decode and 17 948 during a font prewarm.
+
+The image lane made 11 attempts, 9 of them preempted by page turns, 17.1 s of decode thrown away;
+one page (Chapter 4, page 23) was started six times and lost five of them while the reader turned
+a page every ~2 s. Each attempt restarts the decode from scratch. The page turn itself was handled
+a median 460 ms after the aborted decode returned, which the 300 ms double-click window on that
+button accounts for most of. Candidate: once a page's decode has been preempted twice, start it
+again only after the longer 1.5 s pause.
+
 ## 9. Appendix — where the numbers come from
 
 - Device runs (X3, firmware at PR #310's tip): run 3 = `device_run3.log` (14:19, wiped cache, blocking build), run 4 = `device_run4.log` (15:13), run 5 = `device.log` (15:19, after the SAX-in-arena fix).
