@@ -14,6 +14,8 @@
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 
+#include <cstddef>
+
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "Epub.h"
@@ -50,10 +52,7 @@ inline void logReaderLaunchMemSnapshot(const char*) {}
 // ── CoverExtractSession ──────────────────────────────────────────────────────
 
 ReaderActivity::CoverExtractSession::~CoverExtractSession() {
-  if (buf_) {
-    free(buf_);
-    buf_ = nullptr;
-  }
+  releaseChunk();  // before reader_ goes: its region block lies below the chunk's
   if (dst_.isOpen()) dst_.close();
   if (!destPath_.empty()) Storage.remove(destPath_.c_str());
   // reader_ destructor closes entry; zip_ destructor is harmless
@@ -63,6 +62,7 @@ bool ReaderActivity::CoverExtractSession::begin(const std::string& epubPath, con
                                                 const std::string& destPath, BuildArena* scratch) {
   finalPath_ = destPath;
   destPath_ = destPath + ".part";
+  scratch_ = (scratch != nullptr && scratch->valid()) ? scratch : nullptr;
   zip_ = std::unique_ptr<ZipFile>(new ZipFile(epubPath));
   // The read buffer and inflate ring sit in the lent region when there is one (held across
   // the session's steps), else on the heap.
@@ -80,32 +80,69 @@ bool ReaderActivity::CoverExtractSession::begin(const std::string& epubPath, con
   return true;
 }
 
+void ReaderActivity::CoverExtractSession::releaseChunk() {
+  if (buf_ != nullptr) {
+    if (bufInArena_) {
+      scratch_->release(chunkBlock_);
+    } else {
+      free(buf_);
+    }
+  }
+  buf_ = nullptr;
+  bufInArena_ = false;
+  chunkBytes_ = 0;
+}
+
 ReaderActivity::CoverExtractSession::Status ReaderActivity::CoverExtractSession::continueStep(size_t chunkBytes) {
   if (!reader_ || !reader_->isOpen()) return Status::Error;
 
-  if (!buf_ || chunkBytes_ != chunkBytes) {
-    // Halve the request rather than abandon the cover. Device-observed on X4: a 16 KB chunk
-    // failed with ~74 KB free — plenty of heap, just not that much of it contiguous after a
-    // carousel's worth of cover work — and the book silently lost its thumbnail for the whole
-    // session. A smaller chunk only costs more inflate steps, which are sliced across ticks
-    // anyway, so degrading beats failing. 1 KB is still 400+ SD writes for a 450 KB cover, which
-    // is slow but finishes; below that the extract is not worth starting.
-    constexpr size_t MIN_CHUNK_BYTES = 1024;
-    free(buf_);
-    buf_ = nullptr;
+  if (!buf_ || requestedBytes_ != chunkBytes) {
+    releaseChunk();
+    requestedBytes_ = chunkBytes;
     size_t want = chunkBytes;
-    while (!buf_ && want >= MIN_CHUNK_BYTES) {
+    // First the lent region, which already holds the reader's 1 KB read buffer and inflate ring
+    // (32 KB for any cover larger than that): it leaves ~18 KB of the X3's 52 272-byte region and
+    // ~14 KB of the X4's 48 000, so a 16 KB chunk fits on the X3 and an 8 KB one on the X4. On the
+    // heap the 16 KB chunk failed with ~17 KB free (X3 2026-09-27, extracting a 467 KB cover).
+    constexpr size_t MIN_REGION_CHUNK_BYTES = 4096;
+    if (scratch_ != nullptr) {
+      const size_t room = scratch_->capacity() - scratch_->used();
+      const size_t slack = alignof(std::max_align_t);
+      while (want >= MIN_REGION_CHUNK_BYTES && want + slack > room) want /= 2;
+      if (want >= MIN_REGION_CHUNK_BYTES) {
+        chunkBlock_ = scratch_->reserveBlock();
+        buf_ = static_cast<uint8_t*>(scratch_->alloc(want));
+        if (buf_ != nullptr) {
+          bufInArena_ = true;
+        } else {
+          scratch_->release(chunkBlock_);
+        }
+      }
+      if (buf_ == nullptr) want = chunkBytes;
+    }
+    // Else the heap. Halve the request rather than abandon the cover. Device-observed on X4: a
+    // 16 KB chunk failed with ~74 KB free -- plenty of heap, just not that much of it contiguous
+    // after a carousel's worth of cover work -- and the book silently lost its thumbnail for the
+    // whole session. A smaller chunk only costs more inflate steps, which are sliced across ticks
+    // anyway, so degrading beats failing. 1 KB is still 400+ SD writes for a 450 KB cover, which is
+    // slow but finishes; below that the extract is not worth starting.
+    constexpr size_t MIN_CHUNK_BYTES = 1024;
+    while (buf_ == nullptr && want >= MIN_CHUNK_BYTES) {
       buf_ = static_cast<uint8_t*>(malloc(want));
       if (!buf_) want /= 2;
     }
     if (!buf_) {
       LOG_ERR("CEX", "OOM allocating chunk buffer (wanted %zu, gave up below %zu)", chunkBytes, MIN_CHUNK_BYTES);
       chunkBytes_ = 0;
+      requestedBytes_ = 0;
       return Status::Error;
     }
+    // Logged once per allocation. The request is remembered separately from what was granted:
+    // comparing the request against the granted size made every step after a shortfall free the
+    // buffer, retry the full size, fail and log again (~50 times for one 467 KB cover).
     if (want != chunkBytes) {
-      LOG_DBG("CEX", "Chunk buffer degraded %zu -> %zu bytes (heap too fragmented for the full size)", chunkBytes,
-              want);
+      LOG_DBG("CEX", "Chunk buffer %zu -> %zu bytes (%s)", chunkBytes, want,
+              bufInArena_ ? "what the lent region has room for" : "heap too fragmented for the full size");
     }
     chunkBytes_ = want;
   }

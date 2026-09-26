@@ -1,6 +1,7 @@
 #pragma once
 class BuildArena;  // lib/Memory
 
+#include <BuildArena.h>
 #include <PngToBmpConverter.h>
 #include <ZipFile.h>
 
@@ -111,13 +112,19 @@ class ReaderActivity final : public Activity {
     CoverExtractSession& operator=(const CoverExtractSession&) = delete;
 
    private:
+    void releaseChunk();
+
     std::unique_ptr<ZipFile> zip_;
     std::unique_ptr<ZipFile::EntryReader> reader_;
     FsFile dst_;
     std::string finalPath_;
     std::string destPath_;
+    BuildArena* scratch_ = nullptr;
+    BuildArena::Block chunkBlock_;  // reserved after the reader's block, released before it
     uint8_t* buf_ = nullptr;
-    size_t chunkBytes_ = 0;
+    bool bufInArena_ = false;
+    size_t requestedBytes_ = 0;  // what the caller asked for
+    size_t chunkBytes_ = 0;      // what buf_ holds: the request, or less when memory was short
   };
 
   // Begin a sliced ZIP extraction for the embedded cover of bookPath.
