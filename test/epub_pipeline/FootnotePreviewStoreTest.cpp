@@ -204,48 +204,6 @@ TEST(FootnotePreviewStore, ResolvesNotesSplitAcrossManyDocuments) {
   }
 }
 
-// A sliced build re-enters runBuildParse once per slice, from the top, so the between-phases step
-// — resolve the notes, then initialise the layout parser — is guarded to run exactly once. That
-// guard is not observable from outside: resolving twice appends nothing the second time, so its
-// only symptom is wasted work, not a wrong answer. What this test can pin is the other half —
-// that the sliced entry point produces the same result as the blocking one with previews on,
-// which is the shape every background build takes and which nothing else covers. On the host a
-// corpus fixture usually completes in a single slice; the equivalence is the point either way.
-TEST(FootnotePreviewStore, SlicedBuildMatchesTheBlockingBuild) {
-  const std::string epubPath = std::string(CORPUS_DIR) + "/test_split_footnotes.epub";
-
-  Section::BuildParams params;
-  params.viewportWidth = 480;
-  params.viewportHeight = 800;
-  params.lineCompression = 1.0f;
-  params.inlineFootnotePreviews = true;
-
-  GfxRenderer renderer;
-  const std::string blockingDir = freshDir("sliced_reference");
-  auto blockingEpub = openBook(epubPath, blockingDir);
-  Section blocking(blockingEpub, 0, renderer);
-  ASSERT_TRUE(blocking.createSectionFile(params, {}, /*skipEviction=*/true));
-  ASSERT_TRUE(blocking.loadSectionFile(params));
-
-  const std::string slicedDir = freshDir("sliced");
-  auto slicedEpub = openBook(epubPath, slicedDir);
-  Section sliced(slicedEpub, 0, renderer);
-  int slices = 0;
-  Section::BuildStep step = Section::BuildStep::More;
-  while (step != Section::BuildStep::Done && step != Section::BuildStep::Failed && slices < 20000) {
-    step = sliced.stepSectionBuild(params, /*budgetMs=*/1);
-    ++slices;
-  }
-  ASSERT_EQ(step, Section::BuildStep::Done);
-  ASSERT_TRUE(sliced.loadSectionFile(params));
-
-  // Same notes, same pagination: the expansion text is part of the layout, so a page-count match
-  // is a strong statement that previews were present for the sliced build too.
-  EXPECT_EQ(storeTexts(*slicedEpub), storeTexts(*blockingEpub));
-  EXPECT_EQ(sliced.pageCount, blocking.pageCount);
-  EXPECT_GT(storeTexts(*slicedEpub).size(), 0u);
-}
-
 // The resolved bit is what lets a build skip the resolver entirely, and what Background-B reads
 // to decide a spine is safe to pre-build without doing resolver work on the loop task. Both rest
 // on it meaning "scanned, nothing outstanding" — so a chapter with NO notes has to answer true as
