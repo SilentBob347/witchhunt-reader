@@ -218,7 +218,42 @@ TEST_P(ImageParkFixture, WithoutACheckpointPathAStopIsDiscarded) {
   EXPECT_FALSE(fs::exists(PixelCache::partPathFor(c.cachePath)));
 }
 
+// prog_full_420_base_rst.jpg: baseline with a restart marker every 3 MCUs, so a parked TJpgDec
+// decode resumes with the restart counters mid-interval and, every third row, on a boundary.
 INSTANTIATE_TEST_SUITE_P(ProgressiveAndBaseline, ImageParkFixture,
-                         testing::Values("prog_full_420.jpg", "prog_full_420_base.jpg", "prog_full_gray.jpg"));
+                         testing::Values("prog_full_420.jpg", "prog_full_420_base.jpg", "prog_full_gray.jpg",
+                                         "prog_full_420_base_rst.jpg"));
+
+// Guards the restart fixture itself: restart markers only change the entropy coding, so the same
+// picture with and without them must decode to the same caches -- else the park tests above would
+// compare a resumed decode against a wrong reference and prove nothing.
+TEST(ImageParkRestartFixture, RestartMarkersDecodeLikeTheirTwin) {
+  const fs::path work = fs::temp_directory_path() / "img_park_rst_twin";
+  fs::remove_all(work);
+  fs::create_directories(work);
+  GfxRenderer renderer;
+  const auto decodeTo = [&](const char* jpg, const std::string& tag) {
+    RenderConfig c;
+    c.x = 12;
+    c.y = 30;
+    c.maxWidth = 150;
+    c.maxHeight = 104;
+    c.useExactDimensions = true;
+    c.monochromeOutput = true;
+    c.cachePath = (work / (tag + "_bw.pxc")).string();
+    c.companionCachePath = (work / (tag + "_grey.pxc")).string();
+    JpegToFramebufferConverter converter;
+    EXPECT_TRUE(converter.decodeToFramebuffer(std::string(JPEG_FIXTURE_DIR "/") + jpg, renderer, c));
+    std::ifstream bw(c.cachePath, std::ios::binary);
+    std::ifstream grey(c.companionCachePath, std::ios::binary);
+    std::vector<uint8_t> out{std::istreambuf_iterator<char>(bw), std::istreambuf_iterator<char>()};
+    out.insert(out.end(), std::istreambuf_iterator<char>(grey), std::istreambuf_iterator<char>());
+    return out;
+  };
+  const auto plain = decodeTo("prog_full_420_base.jpg", "plain");
+  ASSERT_GT(plain.size(), 2 * PixelCache::PXC_HEADER_BYTES);
+  EXPECT_EQ(decodeTo("prog_full_420_base_rst.jpg", "rst"), plain);
+  fs::remove_all(work);
+}
 
 }  // namespace

@@ -41,6 +41,9 @@ Fixtures:
                      every scan is non-interleaved. Reference: prog_full_gray.y.pgm.
   prog_full_444_rst.jpg  4:4:4, 150x90, restart marker every 3 blocks/MCUs, so every scan
                      crosses restart boundaries inside and between bands.
+  prog_full_420_base_rst.jpg  prog_full_420_base.jpg's picture, baseline, restart marker every 3
+                     MCUs: with 13 MCUs a row, restarts fall inside rows and, every third row,
+                     exactly on a row boundary -- where a parked TJpgDec decode resumes.
   thin_lines_prog.jpg    thin_lines_gray.jpg's picture as a progressive JPEG (libjpeg script).
                      Through JpegToFramebufferConverter it must keep every line: the DC-only
                      preview it replaced shows 1/8 resolution, where they all blur away.
@@ -160,6 +163,8 @@ busy_picture(203, 141).save(os.path.join(HERE, "prog_full_420.jpg"), "JPEG", qua
 save_reference("prog_full_420.jpg", "prog_full_420.y.pgm")
 busy_picture(203, 141).save(os.path.join(HERE, "prog_full_420_base.jpg"), "JPEG", quality=90, subsampling=2,
                              progressive=False, optimize=False)
+busy_picture(203, 141).save(os.path.join(HERE, "prog_full_420_base_rst.jpg"), "JPEG", quality=90, subsampling=2,
+                             progressive=False, optimize=False, restart_marker_blocks=3)
 busy_picture(157, 99, "L").save(os.path.join(HERE, "prog_full_gray.jpg"), "JPEG", quality=90,
                                  progressive=True, optimize=True)
 save_reference("prog_full_gray.jpg", "prog_full_gray.y.pgm")
