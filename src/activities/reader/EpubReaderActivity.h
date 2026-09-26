@@ -414,6 +414,9 @@ class EpubReaderActivity final : public Activity {
   bool backgroundBuildNeedsResolve_ = false;
   // Last WaitHeap gate evaluation; the heap-walk checks re-run at most ~1×/s.
   unsigned long backgroundBuildGateCheckMs_ = 0;
+  // A clock-minute / battery status refresh held back while Background-B holds the secondary
+  // buffer (shouldSkipPeriodicUpdate); endBackgroundBorrow requests it when the buffer returns.
+  mutable bool statusRefreshDeferred_ = false;
   // Image lane (memory audit 2026-09, R7): between page turns, decode the pixel caches of the
   // images in a window of pages so the turn that reaches them replays a cache instead of running
   // a 1-4 s decode. Ranked above Background-B's look-ahead build. The window is the page on

@@ -1420,6 +1420,13 @@ void EpubReaderActivity::endBackgroundBorrow() {
   }
   LOG_INF("ERS", "Background-B: returned secondary buffer (spine %d, %s, preemptions=%u)", backgroundBuildSpineIndex_,
           buildWasLive ? "build discarded" : "no build live", static_cast<unsigned>(backgroundPreemptCount_));
+  // A status refresh (clock minute, battery step) was held back while the buffer was lent; the
+  // buffer is home, so draw it now. Not when a render is what took the buffer back: render()
+  // clears the flag before it gets here, since it redraws the status bar anyway.
+  if (statusRefreshDeferred_) {
+    statusRefreshDeferred_ = false;
+    requestUpdate();
+  }
 }
 
 void EpubReaderActivity::stepBackgroundSectionBuild() {
@@ -4631,6 +4638,9 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
 
+  // Every render pass redraws the status bar, so a refresh held back for Background-B is paid by
+  // this one (cleared before recoverSecondaryBufferIfNeeded, which may end B's borrow).
+  statusRefreshDeferred_ = false;
   recoverSecondaryBufferIfNeeded();
 
   const int spineCount = epub->getSpineItemsCount();
@@ -5787,6 +5797,14 @@ void EpubReaderActivity::renderBackgroundDebugOverlay() const {
 }
 
 bool EpubReaderActivity::shouldSkipPeriodicUpdate() const {
+  // Background-B holds the secondary buffer: any render takes it back, and taking it back
+  // discards B's live build (endBackgroundBorrow). A clock-minute or battery tick would do that
+  // once a minute, and a build takes ~7-15 s of slices -- so a status refresh waits for B to hand
+  // the buffer back (endBackgroundBorrow asks for it then). A page turn still renders at once.
+  if (backgroundBorrowActive_) {
+    statusRefreshDeferred_ = true;
+    return true;
+  }
   if (lastStatusBarPage < 0) return false;  // no baseline yet — let the first render happen
   const int currentPage = section ? section->currentPage + 1 : -1;
   if (currentPage != lastStatusBarPage) return false;
