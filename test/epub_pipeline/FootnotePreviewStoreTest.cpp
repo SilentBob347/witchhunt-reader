@@ -254,16 +254,20 @@ TEST(FootnotePreviewStore, ResolvedSpineIsNotScannedAgain) {
 // wrong merge still looks right. These tests give it several passes over hundreds of notes, with
 // key hashes that interleave the two sides arbitrarily, and check the three properties a reader
 // depends on: every note is findable, the index is ordered so the binary search can find it, and
-// re-resolving does not grow it.
+// a note reached again from another chapter is not stored twice.
 namespace {
 
 // A book of `chapters` chapters, each with `notesPerChapter` callers into one shared notes
 // document. Deliberately minimal — no size padding, no front matter; the shapes those cover are
 // the subject of FootnoteResolveSliceTest. Note text is a function of the note's id so the test
 // can assert the exact string that came back, not merely that something did.
+//
+// With `citePreviousChapter`, every chapter after the first also calls the previous chapter's
+// notes again, the way a shared notes document gets cited from more than one place.
 std::string noteTextFor(const int id) { return "Note " + std::to_string(id) + " body text for the merge test."; }
 
-std::string makeManyNotesBook(const std::string& dir, const int chapters, const int notesPerChapter) {
+std::string makeManyNotesBook(const std::string& dir, const int chapters, const int notesPerChapter,
+                              const bool citePreviousChapter = false) {
   test_zip::StoredZipWriter zip;
   std::string manifest, spine, notesBodies;
   int noteId = 0;
@@ -276,6 +280,11 @@ std::string makeManyNotesBook(const std::string& dir, const int chapters, const 
               "\"><sup>*</sup></a> and after it.</p>\n";
       notesBodies += "<p id=\"ft_" + id + "\"><a href=\"" + name + "#ft" + id + "\"><sup>*</sup></a>" +
                      noteTextFor(noteId) + "</p>\n";
+    }
+    if (citePreviousChapter && c > 0) {
+      for (int id = (c - 1) * notesPerChapter + 1; id <= c * notesPerChapter; ++id) {
+        body += "<p>As noted before<a href=\"notes.xhtml#ft_" + std::to_string(id) + "\"><sup>*</sup></a>.</p>\n";
+      }
     }
     zip.add("OEBPS/" + name,
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<html xmlns=\"http://www.w3.org/1999/xhtml\">"
@@ -389,26 +398,33 @@ TEST(FootnotePreviewStore, MergesHundredsOfNotesAcrossPasses) {
   EXPECT_EQ(wrong, 0) << wrong << " notes resolved to another note's text";
 }
 
-// Re-resolving a chapter whose notes are all stored must leave the index alone, not append a
-// second copy of every row. What makes that true is contains() filtering the pass's targets
-// against the on-disk index before anything is appended -- the pass then has nothing to add and
-// short-circuits, so the merge is never reached at all. (Verified: breaking commit()'s tie rule
-// does not fail this test, because no tie ever arises.)
-TEST(FootnotePreviewStore, ReResolvingDoesNotGrowTheMergedIndex) {
-  const std::string dir = freshDir("merge_idempotent");
-  const std::string book = makeManyNotesBook(dir, /*chapters=*/3, /*notesPerChapter=*/60);
+// A note a chapter reaches that an earlier chapter already stored must not be appended again.
+// What makes that true is contains() filtering the pass's targets against the on-disk index before
+// anything is appended; the pass then appends only the new notes and merges them with the parked
+// index. Here every pass after the first has 120 targets, half of them already on disk. (A second
+// resolve of the SAME spine cannot reach any of this: the resolved bit returns before the scan.)
+TEST(FootnotePreviewStore, NotesCitedAgainFromAnotherChapterAreNotStoredTwice) {
+  constexpr int kChapters = 3;
+  constexpr int kPerChapter = 60;
+  const std::string dir = freshDir("merge_overlap");
+  const std::string book = makeManyNotesBook(dir, kChapters, kPerChapter, /*citePreviousChapter=*/true);
   auto epub = openBook(book, dir + "/cache");
 
-  for (int c = 0; c < 3; ++c) ASSERT_TRUE(FootnotePreviews::resolveSpine(*epub, c));
-  const OnDiskIndex first = readIndex(*epub);
-  const uintmax_t sizeAfterFirst = storeSize(*epub);
-  ASSERT_EQ(first.count, 180);
+  for (int c = 0; c < kChapters; ++c) {
+    ASSERT_TRUE(FootnotePreviews::resolveSpine(*epub, c)) << "chapter " << c << " failed to resolve";
+  }
+  const OnDiskIndex index = readIndex(*epub);
+  EXPECT_EQ(index.count, kChapters * kPerChapter) << "notes cited from two chapters were stored twice";
 
-  for (int c = 0; c < 3; ++c) ASSERT_TRUE(FootnotePreviews::resolveSpine(*epub, c));
-  const OnDiskIndex second = readIndex(*epub);
-  EXPECT_EQ(second.count, first.count) << "a second pass over the same spines grew the index";
-  EXPECT_EQ(second.rows, first.rows) << "a second pass rewrote the index differently";
-  EXPECT_EQ(storeSize(*epub), sizeAfterFirst) << "a second pass grew the store on disk";
+  FootnotePreviews::Lookup lookup;
+  ASSERT_TRUE(lookup.open(epub->getCachePath(), epub.get(), /*currentSpineIndex=*/0));
+  int missing = 0;
+  for (int id = 1; id <= kChapters * kPerChapter; ++id) {
+    std::string text;
+    const std::string href = "notes.xhtml#ft_" + std::to_string(id);
+    if (!lookup.find(href.c_str(), text) || text != noteTextFor(id)) ++missing;
+  }
+  EXPECT_EQ(missing, 0) << missing << " notes do not resolve to their own text";
 }
 
 // A notes document's entries open with a link back to the caller they belong to, and those
