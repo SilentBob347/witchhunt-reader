@@ -1801,6 +1801,14 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
         park::readAll(checkpoint, &parked, 1) && park::sameDecode(parked, parkKey) &&
         parked.sinkBytes == park::sinkBytes(ctx) && parked.finalRows >= 0 && parked.finalRows <= destHeight) {
       resuming = true;
+    } else if (!ctx.caching) {
+      // This pass writes no cache -- the heap gate refused one -- so it cannot disturb the parked
+      // partial files. Leave the parked decode for a pass that can resume it: throwing it away here
+      // made a page render on a tight heap discard what the image lane had already decoded. (A pass
+      // that does cache, even a coarse one, supersedes the checkpoint below: keeping it past a pass
+      // that could cache risks an image that is never cached at all.)
+      LOG_INF("JPG", "Leaving a parked decode for a pass with room to cache: %s", imagePath.c_str());
+      if (checkpoint) checkpoint.close();
     } else {
       LOG_INF("JPG", "Discarding a parked decode that no longer matches: %s", imagePath.c_str());
       if (checkpoint) checkpoint.close();

@@ -176,6 +176,39 @@ TEST_P(ImageParkFixture, ADamagedPartialFileStartsOverNextTime) {
   EXPECT_EQ(read(c.cachePath), read(ref.cachePath));
 }
 
+// A pass that cannot cache (the heap gate refused one) must not throw a parked decode away: it
+// draws without touching the parked partial files, and the next pass with room resumes. It used to
+// discard the checkpoint, so a page render on a tight heap undid the image lane's work.
+TEST_P(ImageParkFixture, APassWithoutRoomToCacheLeavesTheParkedDecode) {
+  const RenderConfig ref = config("ref", 150, 104, false);
+  ASSERT_FALSE(decodeOnce(ref, 0));
+
+  const RenderConfig c = config("tight");
+  ASSERT_TRUE(decodeOnce(c, 3));
+  const std::string part = PixelCache::partPathFor(c.cachePath);
+  ASSERT_TRUE(fs::exists(c.checkpointPath));
+  const auto partBefore = read(part);
+  const auto checkpointBefore = read(c.checkpointPath);
+
+  // Room to decode (a progressive decode needs 16 KB), none to cache (band + 20 KB).
+  const uint32_t savedHeap = ESP.getFreeHeap();
+  ESP.setFreeHeap(18 * 1024);
+  {
+    JpegToFramebufferConverter converter;
+    converter.decodeToFramebuffer(image(), renderer, c);  // baseline refuses outright below 28 KB
+  }
+  ESP.setFreeHeap(savedHeap);
+
+  EXPECT_FALSE(fs::exists(c.cachePath)) << "nothing was cached";
+  EXPECT_EQ(read(c.checkpointPath), checkpointBefore) << "the parked decode is left as it was";
+  EXPECT_EQ(read(part), partBefore);
+
+  ASSERT_FALSE(decodeOnce(c, 0)) << "the next pass with room resumes and finishes";
+  EXPECT_FALSE(fs::exists(c.checkpointPath));
+  EXPECT_EQ(read(c.cachePath), read(ref.cachePath));
+  EXPECT_EQ(read(c.companionCachePath), read(ref.companionCachePath));
+}
+
 // Without a checkpoint path a stopped decode is thrown away, as before, and leaves nothing.
 TEST_P(ImageParkFixture, WithoutACheckpointPathAStopIsDiscarded) {
   const RenderConfig c = config("nockpt", 150, 104, false);
