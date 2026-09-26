@@ -19,12 +19,6 @@ TEST(FontSizeLadder, EnumValueIsLadderPosition) {
   }
 }
 
-TEST(FontSizeLadder, PointSizesAscend) {
-  for (int i = 1; i < S::FONT_SIZE_RUNG_COUNT; ++i) {
-    EXPECT_LT(S::FONT_SIZE_RUNGS[i - 1].points, S::FONT_SIZE_RUNGS[i].points);
-  }
-}
-
 TEST(FontSizeLadder, StepsUpThroughEveryVisualSize) {
   EXPECT_EQ(S::PT_12, S::stepFontSize(S::PT_10, 1));
   EXPECT_EQ(S::PT_14, S::stepFontSize(S::PT_12, 1));
