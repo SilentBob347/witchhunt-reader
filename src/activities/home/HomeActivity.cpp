@@ -732,6 +732,10 @@ bool HomeActivity::keepRegionAsFrameCache() {
   coverScratch_.reset();
   theme.setFrameCacheRegion(lentRegion_, lentRegionBytes_);
   frameCacheInRegion_ = true;
+  // The fallback cover buffer (20 592 B on the X3) is dead weight from here on: the fast path
+  // serves every render. Left allocated it held Home at ~28 KB free for the rest of the visit
+  // instead of ~49 KB (X3, 2026-09-27). If the region goes back early the fallback re-stores it.
+  freeCoverBuffer();
   LOG_DBG("HOME", "Kept the lent framebuffer as the carousel frame cache (%u of %u bytes, free=%lu)",
           static_cast<unsigned>(wanted), static_cast<unsigned>(lentRegionBytes_),
           static_cast<unsigned long>(esp_get_free_heap_size()));
