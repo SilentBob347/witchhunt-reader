@@ -5,11 +5,11 @@
 //     identically to each other and to the committed golden. Regenerate
 //     intentionally changed goldens with: UPDATE_GOLDENS=1 ctest -R EpubPipeline
 //
-// Every case runs twice: once with font-size normalization OFF (the tight ±3%
-// float-rounding dead zone) and once ON (the ±10% band that snaps publisher
-// near-body <span font-size:0.92em> wrappers back to native size). The two
-// settings produce genuinely different layout, so each has its own golden:
-// <book>.golden.txt for OFF and <book>.norm.golden.txt for ON.
+// Every book runs with font-size normalization OFF (the tight ±3% float-rounding
+// dead zone). The books whose layout normalization actually changes also run
+// with it ON (the ±10% band that snaps publisher near-body
+// <span font-size:0.92em> wrappers back to native size), against a golden of
+// their own: <book>.golden.txt for OFF, <book>_norm.golden.txt for ON.
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -46,6 +46,10 @@ void PrintTo(const Case& c, std::ostream* os) {
 
 std::string stem(const std::string& path) { return fs::path(path).stem().string(); }
 
+// The corpus books whose layout normalization changes. For every other book the ON dump is
+// byte-identical to OFF, so an ON case would only re-assert the OFF golden under a second name.
+const char* const kNormalizationSensitiveBooks[] = {"test_font_normalization", "test_font_sizes"};
+
 // Distinguishes the two variants' cache dirs and golden files. OFF keeps the
 // historical unsuffixed golden name so its committed layout stays reviewable
 // across the normalization change.
@@ -65,6 +69,15 @@ std::string runOnce(const Case& c, const std::string& cacheDir) {
 // Unique per (book, variant) so the two variants never share a cache dir.
 std::string caseCacheDir(const Case& c, const std::string& tag) {
   return freshCacheDir(stem(c.epub) + variantSuffix(c) + "_" + tag);
+}
+
+bool readFile(const fs::path& path, std::string& out) {
+  std::ifstream in(path);
+  if (!in) return false;
+  std::stringstream bytes;
+  bytes << in.rdbuf();
+  out = bytes.str();
+  return true;
 }
 
 class EpubPipelineTest : public testing::TestWithParam<Case> {};
@@ -93,16 +106,23 @@ TEST_P(EpubPipelineTest, MatchesGolden) {
     std::ofstream(goldenPath) << dump;
     GTEST_SKIP() << "golden regenerated: " << goldenPath;
   }
-  std::ifstream in(goldenPath);
-  ASSERT_TRUE(in) << "missing golden " << goldenPath << " — run with UPDATE_GOLDENS=1 to create it";
-  std::stringstream golden;
-  golden << in.rdbuf();
-  EXPECT_EQ(golden.str(), dump) << "layout drift vs golden for " << c.epub
-                                << " (fontSizeNormalization=" << (c.fontSizeNormalization ? "on" : "off")
-                                << ") — if intentional, regenerate with UPDATE_GOLDENS=1 and explain in the commit";
+  std::string golden;
+  ASSERT_TRUE(readFile(goldenPath, golden))
+      << "missing golden " << goldenPath << " — run with UPDATE_GOLDENS=1 to create it";
+  EXPECT_EQ(golden, dump) << "layout drift vs golden for " << c.epub
+                          << " (fontSizeNormalization=" << (c.fontSizeNormalization ? "on" : "off")
+                          << ") — if intentional, regenerate with UPDATE_GOLDENS=1 and explain in the commit";
+
+  // The ON case is only worth its golden while normalization still changes this book's layout.
+  if (c.fontSizeNormalization) {
+    std::string offGolden;
+    ASSERT_TRUE(readFile(fs::path(GOLDEN_DIR) / (stem(c.epub) + ".golden.txt"), offGolden));
+    EXPECT_NE(offGolden, dump) << c.epub << " no longer lays out differently with normalization ON; "
+                               << "drop it from kNormalizationSensitiveBooks and delete its _norm golden";
+  }
 }
 
-// Every corpus book crossed with both font-size-normalization settings.
+// Every corpus book with normalization OFF, plus ON for the books it changes.
 std::vector<Case> corpusCases() {
   std::vector<std::string> paths;
   for (const auto& entry : fs::directory_iterator(CORPUS_DIR)) {
@@ -113,7 +133,11 @@ std::vector<Case> corpusCases() {
   std::vector<Case> cases;
   for (const auto& path : paths) {
     cases.push_back(Case{path, /*fontSizeNormalization=*/false});
-    cases.push_back(Case{path, /*fontSizeNormalization=*/true});
+    const auto* const sensitive =
+        std::find(std::begin(kNormalizationSensitiveBooks), std::end(kNormalizationSensitiveBooks), stem(path));
+    if (sensitive != std::end(kNormalizationSensitiveBooks)) {
+      cases.push_back(Case{path, /*fontSizeNormalization=*/true});
+    }
   }
   return cases;
 }
