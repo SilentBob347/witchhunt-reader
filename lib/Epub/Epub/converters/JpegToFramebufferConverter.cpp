@@ -1823,6 +1823,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   }
   park::BaselineState baseline{};
 
+  const unsigned long resumeStart = millis();
   if (resuming) {
     // Decoder, then caches, then the pipeline's carried state; any refusal drops the lot and this
     // decode fails (the next one starts over, with no checkpoint in the way).
@@ -1868,7 +1869,8 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
       return false;
     }
     ctx.finalDstRows = parked.finalRows;
-    LOG_INF("JPG", "Resumed a parked decode at row %d/%d: %s", parked.finalRows, destHeight, imagePath.c_str());
+    LOG_INF("JPG", "Resumed a parked decode at row %d/%d in %lu ms: %s", parked.finalRows, destHeight,
+            millis() - resumeStart, imagePath.c_str());
   } else {
     if (ctx.caching) {
       if (!ctx.cache.begin(config.cachePath, destWidth, destHeight, config.x, config.y, maxBlockDstRows)) {
@@ -1896,6 +1898,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   bool runDcPreview = dcPreview;
   bool aborted = false;  // stopped for input between two rows of blocks
   bool isParked = false;
+  unsigned long parkMs = 0;
   if (fullProgressive) {
     ProgressiveJpeg::Result result =
         resuming ? ProgressiveJpeg::Result::Ok
@@ -1913,8 +1916,10 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
       aborted = true;
       progressiveResult = ProgressiveJpegDc::Result::Aborted;
       if (checkpointable) {
+        const unsigned long parkStart = millis();
         isParked =
             park::parkDecode(ctx, config, parkKey, [&](FsFile& out) { return progressive.writeCheckpoint(out); });
+        parkMs = millis() - parkStart;
       }
     }
     const uint16_t bandsDone = progressive.bandsDone();
@@ -1922,7 +1927,9 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     progressive.end();
     progressiveWorkspace.reset();
     if (isParked) {
-      LOG_INF("JPG", "Parked at band %u/%u, row %d/%d: %s", bandsDone, bandCount, ctx.finalDstRows, destHeight,
+      LOG_INF("JPG", "Parked at band %u/%u, row %d/%d in %lu ms (%u B of state): %s", bandsDone, bandCount,
+              ctx.finalDstRows, destHeight, parkMs,
+              static_cast<unsigned>(sizeof(park::Header) + park::sinkBytes(ctx) + progressive.checkpointSize()),
               imagePath.c_str());
     } else if (!aborted && result != ProgressiveJpeg::Result::Ok) {
       LOG_ERR("JPG", "Progressive JPEG full decode failed (%s)%s: %s", ProgressiveJpeg::resultName(result),
@@ -1965,10 +1972,12 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
       baseline.marker = jdec.marker;
       memcpy(baseline.dcv, jdec.dcv, sizeof(baseline.dcv));
       baseline.nextByte = static_cast<uint32_t>(file.position() - jdec.dctr);
+      const unsigned long parkStart = millis();
       isParked = park::parkDecode(ctx, config, parkKey, [&](FsFile& out) { return park::writeAll(out, &baseline, 1); });
+      parkMs = millis() - parkStart;
       if (isParked) {
-        LOG_INF("JPG", "Parked at MCU row y=%u, row %d/%d: %s", static_cast<unsigned>(cursor.y), ctx.finalDstRows,
-                destHeight, imagePath.c_str());
+        LOG_INF("JPG", "Parked at MCU row y=%u, row %d/%d in %lu ms: %s", static_cast<unsigned>(cursor.y),
+                ctx.finalDstRows, destHeight, parkMs, imagePath.c_str());
       }
     }
   }
