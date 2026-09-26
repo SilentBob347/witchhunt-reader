@@ -516,21 +516,32 @@ TEST(FootnoteResolveSlice, SharedNotesDocumentShapeSlicesIdentically) {
   EXPECT_EQ(storeTexts(*slicedEpub), expected);
 }
 
-// Front matter with no callers at all still has to end up marked resolved, in the same book as
-// chapters that do have them. A book whose front matter looked permanently unresolved would send
-// Background-B back to refusing spines — the shape of issue #211, one level down.
+// The resolved bit means "scanned, nothing outstanding", NOT "has notes". A spine without callers
+// has to answer true once scanned: Background-B holds back heap for the resolver on any spine that
+// answers false, and the footnote list only trusts a store miss on a spine that answers true. It is
+// also per spine -- resolving one, or streaming a notes document for its note text, marks no other.
 TEST(FootnoteResolveSlice, SpinesWithoutNotesAreMarkedInABookThatHasThem) {
   const std::string dir = freshDir("shared_frontmatter");
   auto epub = openBook(makeSharedNotesBook(dir, {{4 * 1024, 5}}), dir);
+  constexpr int kChapter = 2;   // after the two front-matter documents
+  constexpr int kNotesDoc = 3;  // note bodies; its only links point back at their callers
+  const auto resolved = [&](const int spine) { return FootnotePreviews::spineResolved(epub->getCachePath(), spine); };
 
   for (int spine = 0; spine < 2; ++spine) {
-    EXPECT_FALSE(FootnotePreviews::spineResolved(epub->getCachePath(), spine)) << spine;
+    EXPECT_FALSE(resolved(spine)) << spine;
     ASSERT_GT(resolveStepByStep(*epub, spine), 0) << spine;
-    EXPECT_TRUE(FootnotePreviews::spineResolved(epub->getCachePath(), spine)) << spine;
+    EXPECT_TRUE(resolved(spine)) << spine;
   }
   EXPECT_TRUE(storeTexts(*epub).empty()) << "front matter has no notes to store";
+  EXPECT_FALSE(resolved(kChapter)) << "resolving one spine must not mark another";
 
-  ASSERT_GT(resolveStepByStep(*epub, 2), 0);
+  ASSERT_GT(resolveStepByStep(*epub, kChapter), 0);
+  EXPECT_TRUE(resolved(kChapter));
+  EXPECT_EQ(storeTexts(*epub).size(), 5u);
+  EXPECT_FALSE(resolved(kNotesDoc)) << "streaming a notes document for its notes is not scanning it for callers";
+
+  ASSERT_GT(resolveStepByStep(*epub, kNotesDoc), 0);
+  EXPECT_TRUE(resolved(kNotesDoc));
   EXPECT_EQ(storeTexts(*epub).size(), 5u);
 }
 

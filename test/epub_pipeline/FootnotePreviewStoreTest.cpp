@@ -179,26 +179,6 @@ TEST(FootnotePreviewStore, ResolvesNotesSplitAcrossManyDocuments) {
   }
 }
 
-// The resolved bit is what lets a build skip the resolver entirely, and what Background-B reads
-// to decide a spine is safe to pre-build without doing resolver work on the loop task. Both rest
-// on it meaning "scanned, nothing outstanding" — so a chapter with NO notes has to answer true as
-// well, or a book without footnotes would look permanently unresolved and never get look-ahead.
-TEST(FootnotePreviewStore, MarksSpinesResolvedIncludingOnesWithoutNotes) {
-  const std::string cacheDir = freshDir("resolved_bits");
-  auto epub = openBook(kCorpusEpub, cacheDir);
-
-  EXPECT_FALSE(FootnotePreviews::spineResolved(epub->getCachePath(), kChapterSpine));
-  EXPECT_FALSE(FootnotePreviews::spineResolved(epub->getCachePath(), kNotesSpine));
-
-  ASSERT_TRUE(FootnotePreviews::resolveSpine(*epub, kChapterSpine));
-  EXPECT_TRUE(FootnotePreviews::spineResolved(epub->getCachePath(), kChapterSpine));
-  EXPECT_FALSE(FootnotePreviews::spineResolved(epub->getCachePath(), kNotesSpine));
-
-  // notes.xhtml carries note bodies and no callers of its own. Nothing to store, bit set anyway.
-  ASSERT_TRUE(FootnotePreviews::resolveSpine(*epub, kNotesSpine));
-  EXPECT_TRUE(FootnotePreviews::spineResolved(epub->getCachePath(), kNotesSpine));
-}
-
 // With the bit set the resolver must not read the document at all — not the banked XHTML, not the
 // archive. Removing both is the only way to assert that from outside, and it is the property the
 // per-build cost rests on: before the bit existed, every rebuild re-scanned the whole spine with a
