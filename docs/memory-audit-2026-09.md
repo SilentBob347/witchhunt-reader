@@ -1324,6 +1324,23 @@ the device a borrowed Chapter 3 build costs 32.1 KB of heap to its trough, 9.2 K
 spike; without it the trough would sit near 22 KB, with 37 KB of the arena idle at the same moment.
 Device versus host overall: 32.1 vs 38.2 KB (0.84) — byte buffers exact, objects smaller.
 
+*Run 20 (X3, 22:34, after `5ce8564ee` moved the probe buffers and the footnote resolver's SAX
+state into the arena):* Chapter 3 from 44 576 free built identically (180 pages, arena peak
+47 868, parse lane 34 264) and the session's heap minimum — 18 676, set before the reader opened —
+did not move during the build: the build's true low was ≥ 18 676 where run 19's was 12 864, a gain
+of ≥ 5.8 KB against the host's 6.7 KB. Page-boundary and chunk lows are unchanged (~22 KB), as they
+should be: only the in-chunk spike went. Chapter 4 from a tighter reading state (36 492 free,
+14 836 contiguous — run 19 had 39 836 / 27 636) built in one pass with no low-heap warning,
+boundary low 20 308, arena peak 45 884. The reader menu's cache clear now removes `img/` without
+an error.
+
+With the build's spike gone, the session's heap minimum is set elsewhere: **the font prewarm of an
+ordinary page render** (page 5 of Chapter 3, no image): free fell from 33 316 to 12 476 inside the
+prewarm — a ~20.8 KB transient while new glyph groups are decompressed — and ended 4.4 KB lower.
+Run 19's 12 532 was the same event. That is the next item on the heap's critical path; it happens
+with the secondary framebuffer resident (the page is being drawn), so the lent region is not
+available to it.
+
 ## 9. Appendix — where the numbers come from
 
 - Device runs (X3, firmware at PR #310's tip): run 3 = `device_run3.log` (14:19, wiped cache, blocking build), run 4 = `device_run4.log` (15:13), run 5 = `device.log` (15:19, after the SAX-in-arena fix).
