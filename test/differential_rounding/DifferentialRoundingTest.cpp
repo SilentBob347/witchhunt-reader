@@ -103,12 +103,6 @@ int textWidthSC(const char* str) {
   return w;
 }
 
-// Simulate the old absolute-snap gap for comparison
-int absoluteGap(int32_t startFP, int32_t advanceFP, int32_t kernFP) {
-  int32_t nextFP = startFP + advanceFP + kernFP;
-  return fp4::toPixel(nextFP) - fp4::toPixel(startFP);
-}
-
 }  // namespace
 
 // ============================================================================
@@ -135,25 +129,6 @@ TEST(Fp4Math, RoundingBoundaries) {
   EXPECT_EQ(fp4::toPixel(137 + (-9)), 8);  // 128 = 8.0 exact
   EXPECT_EQ(fp4::toPixel(137 + (-5)), 8);  // 132 = 8.25
   EXPECT_EQ(fp4::toPixel(137 + (-1)), 9);  // 136 = 8.5 (half rounds up)
-}
-
-TEST(Fp4Math, OldApproachInconsistency) {
-  // 'oo' pair: advance=145 (9.0625px), kern=-3 (-0.1875px), combined=142 (8.875px)
-  const int32_t advance = 145;
-  const int32_t kern = -3;
-
-  int minGap = 999, maxGap = -999;
-  for (int startPx = 0; startPx < 100; startPx++) {
-    for (int frac = 0; frac < 16; frac++) {
-      int32_t startFP = fp4::fromPixel(startPx) + frac;
-      int gap = absoluteGap(startFP, advance, kern);
-      if (gap < minGap) minGap = gap;
-      if (gap > maxGap) maxGap = gap;
-    }
-  }
-
-  // Absolute snap produces inconsistent gaps depending on subpixel phase.
-  EXPECT_GE(maxGap - minGap, 1);
 }
 
 TEST(Fp4Math, ExhaustiveKernRange) {
