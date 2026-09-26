@@ -1,8 +1,7 @@
 # Declaration-level parser tests. These also have a standalone driver in
 # test/run_epub_css_test.sh (which compiles the real Logging.cpp and so needs the Arduino
 # framework headers); building them here too means they run in the default ctest sweep
-# on any host, which is where a regression would otherwise go unnoticed. Hand-rolled
-# asserts and its own main(), so no gtest_main.
+# on any host, which is where a regression would otherwise go unnoticed.
 add_executable(CssParserTest
   CssParserTest.cpp
   ${REPO_ROOT}/test/zip_entry_reader/LoggingStub.cpp
@@ -25,9 +24,12 @@ target_include_directories(CssParserTest PRIVATE
   ${REPO_ROOT}/test/shims
 )
 
-target_link_libraries(CssParserTest PRIVATE crosspoint_test_common)
+target_link_libraries(CssParserTest PRIVATE
+  crosspoint_test_common
+  GTest::gtest_main
+)
 
-add_test(NAME CssParser.Declarations COMMAND CssParserTest)
+gtest_discover_tests(CssParserTest)
 
 # Shims (HalStorage.h, LoggingStub.cpp with uzlib checksum stubs) are shared
 # with the ZipEntryReaderTest harness — keep them in test/zip_entry_reader.
