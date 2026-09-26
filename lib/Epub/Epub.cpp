@@ -1530,6 +1530,120 @@ ThumbResult Epub::generateThumbBmp(int width, int height, bool allowExtract, Bui
   return ThumbResult::Ok;
 }
 
+ThumbResult Epub::generateThumbBmps(const std::pair<int, int>* sizes, const int count, const bool allowExtract,
+                                    BuildArena* scratch) const {
+  constexpr int kMax = JpegToBmpConverter::kMaxTargets;
+  if (sizes == nullptr || count < 1 || count > kMax) return ThumbResult::TransientFail;
+
+  // Which sizes still need a BMP. A sentinel on any of them answers for the cover as a whole: it is
+  // written only when the cover itself is absent or undecodable, which no size can change.
+  bool needed[kMax] = {};
+  int neededCount = 0;
+  for (int i = 0; i < count; ++i) {
+    const std::string path = getThumbBmpPath(sizes[i].first, sizes[i].second);
+    FsFile existing;
+    if (Storage.openFileForRead("EBP", path, existing)) {
+      const uint32_t sz = existing.size();
+      existing.close();
+      if (sz == 0) {
+        LOG_DBG("EBP", "Sentinel found for %dx%d thumb, skipping retry", sizes[i].first, sizes[i].second);
+        return ThumbResult::StructurallyAbsent;
+      }
+      if (coverBmpComplete(path)) continue;
+      LOG_DBG("EBP", "Existing %dx%d thumb is truncated — regenerating", sizes[i].first, sizes[i].second);
+    }
+    needed[i] = true;
+    ++neededCount;
+  }
+  if (neededCount == 0) return ThumbResult::Ok;
+  const auto sentinelAll = [&] {
+    for (int i = 0; i < count; ++i) {
+      if (needed[i]) writeThumbSentinel(getThumbBmpPath(sizes[i].first, sizes[i].second));
+    }
+  };
+
+  // The same structural answers as the single-size overload, before the transient bail.
+  if (getCoverItemHref().empty()) {
+    LOG_DBG("EBP", "No cover item — writing structural sentinels for %d thumb size(s)", neededCount);
+    sentinelAll();
+    return ThumbResult::StructurallyAbsent;
+  }
+  if (coverImageCachedButUnsupported()) {
+    LOG_ERR("EBP", "Cached cover.img is not a supported format — writing structural sentinels");
+    sentinelAll();
+    return ThumbResult::StructurallyAbsent;
+  }
+
+  FsFile coverImage;
+  uint32_t coverBase = 0;
+  if (coverImageCachedAndValid(allowExtract)) {
+    if (!Storage.openFileForRead("EBP", getCoverImageCachePath(), coverImage)) return ThumbResult::TransientFail;
+  } else if (!openStoredCoverInPlace(coverImage, &coverBase)) {
+    LOG_DBG("EBP", "cover.img not cached/valid for %d thumb size(s) — transient, deferring", neededCount);
+    return ThumbResult::TransientFail;
+  }
+
+  const auto detectedFormat = detectCoverImageFormat(coverImage, coverBase);
+  if (detectedFormat == ImageFormatDetector::Format::Unknown) {
+    LOG_ERR("EBP", "Cached cover image is not a supported format — writing structural sentinels");
+    coverImage.close();
+    sentinelAll();
+    return ThumbResult::StructurallyAbsent;
+  }
+
+  // Open every output before decoding. Opening for write truncates, and a 0-byte thumb reads as a
+  // "no cover" sentinel, so whatever was opened is removed again on any way out that fails.
+  FsFile thumbs[kMax];
+  const auto removeOutputs = [&] {
+    for (int i = 0; i < count; ++i) {
+      if (!needed[i]) continue;
+      if (thumbs[i]) thumbs[i].close();
+      Storage.remove(getThumbBmpPath(sizes[i].first, sizes[i].second).c_str());
+    }
+  };
+  for (int i = 0; i < count; ++i) {
+    if (needed[i] && !Storage.openFileForWrite("EBP", getThumbBmpPath(sizes[i].first, sizes[i].second), thumbs[i])) {
+      coverImage.close();
+      removeOutputs();
+      return ThumbResult::TransientFail;
+    }
+  }
+
+  bool success = false;
+  if (detectedFormat == ImageFormatDetector::Format::Jpeg) {
+    JpegToBmpConverter::BmpTarget targets[kMax];
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+      if (needed[i]) targets[n++] = JpegToBmpConverter::BmpTarget{&thumbs[i], sizes[i].first, sizes[i].second};
+    }
+    LOG_DBG("EBP", "Generating %d thumb BMP(s) from one JPEG cover decode", n);
+    success = JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(coverImage, targets, n, scratch);
+  } else {
+    // PNG: one conversion per size, each from the start of the image.
+    success = true;
+    for (int i = 0; i < count && success; ++i) {
+      if (!needed[i]) continue;
+      LOG_DBG("EBP", "Generating %dx%d thumb BMP from PNG cover image", sizes[i].first, sizes[i].second);
+      success = coverImage.seek(coverBase) && PngToBmpConverter::pngFileTo1BitBmpStreamWithSize(
+                                                  coverImage, thumbs[i], sizes[i].first, sizes[i].second);
+    }
+  }
+  coverImage.close();
+
+  if (!success) {
+    // Whether aborted for input or a plain decode failure, this is transient: drop every partial
+    // thumb (never leave one as a false sentinel) and let the caller retry / count it.
+    LOG_DBG("EBP", "Thumb decode for %d size(s) did not complete — removing partials, transient", neededCount);
+    removeOutputs();
+    return ThumbResult::TransientFail;
+  }
+  for (int i = 0; i < count; ++i) {
+    if (needed[i]) thumbs[i].close();
+  }
+  LOG_DBG("EBP", "Generated %d thumb BMP(s) from one cover decode", neededCount);
+  return ThumbResult::Ok;
+}
+
 uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size, const bool trailingNullByte) const {
   if (itemHref.empty()) {
     LOG_DBG("EBP", "Failed to read item, empty href");

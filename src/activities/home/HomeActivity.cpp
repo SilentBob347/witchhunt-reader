@@ -426,10 +426,26 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
           // Cover decode needs ~42 KB contiguous heap — free the frame cache first.
           invalidateFrameCacheSafely();
 
+          // Every size of this book still missing, from ONE decode of the cover (memory audit 2026-09,
+          // R9 item 2): the carousel's 340x540 and 200x390 thumbs used to be two full decodes of the
+          // same JPEG -- ~4.5 s each for a 1.3 MB progressive cover on the X3.
+          std::pair<int, int> pending[JpegToBmpConverter::kMaxTargets];
+          int pendingCount = 0;
+          pending[pendingCount++] = sz;
+          for (size_t j = i + 1; j < thumbSizes.size() && pendingCount < JpegToBmpConverter::kMaxTargets; j++) {
+            const auto& other = thumbSizes[j];
+            if (!ReaderActivity::isCoverThumbComplete(
+                    UITheme::getCoverThumbPath(placeholder, other.first, other.second), other.first, other.second)) {
+              pending[pendingCount++] = other;
+            }
+          }
+
           // Try synchronous decode first (handles JPEG and cached covers).
           CooperativeAbort::clearAborted();
-          const ThumbResult res = ReaderActivity::ensureCoverThumb(book.path, sz.first, sz.second, coverScratch_.get());
-          LOG_DBG("HOME", "ensureCoverThumb(%dx%d) for %s: %s", sz.first, sz.second, book.path.c_str(),
+          const ThumbResult res =
+              ReaderActivity::ensureCoverThumbs(book.path, pending, pendingCount, coverScratch_.get());
+          LOG_DBG("HOME", "ensureCoverThumbs(%dx%d, %d size(s)) for %s: %s", sz.first, sz.second, pendingCount,
+                  book.path.c_str(),
                   res == ThumbResult::Ok                   ? "ok"
                   : res == ThumbResult::StructurallyAbsent ? "absent"
                                                            : "transient");
@@ -479,10 +495,11 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
             break;
           }
           // One decode done — yield back to loop() so input can be serviced.
-          // nextThumbSizeIndex advances past this size; next call continues from i+1.
+          // nextThumbSizeIndex advances past this size; next call continues from i+1 (any size the
+          // decode just wrote alongside it checks valid there and is skipped).
           nextThumbSizeIndex = i + 1;
-          if (nextThumbSizeIndex < thumbSizes.size()) {
-            // More sizes remain for this book — stay on current book next call.
+          if (nextThumbSizeIndex < thumbSizes.size() && pendingCount < static_cast<int>(thumbSizes.size() - i)) {
+            // Sizes remain that this decode did not cover — stay on current book next call.
             yieldAfterDecode();
             return;
           }

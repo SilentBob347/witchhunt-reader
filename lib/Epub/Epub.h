@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Epub/BookMetadataCache.h"
@@ -214,6 +215,12 @@ class Epub {
   // `scratch`: a lent region for the JPEG decoder's working memory (see JpegToBmpConverter).
   ThumbResult generateThumbBmp(int height, bool allowExtract = true, BuildArena* scratch = nullptr) const;
   ThumbResult generateThumbBmp(int width, int height, bool allowExtract = true, BuildArena* scratch = nullptr) const;
+  // Every size in `sizes` (width, height) that is not already a complete thumbnail, from ONE decode
+  // of a JPEG cover (a PNG cover is converted once per size). Same sentinel / transient contract as
+  // the single-size overload, answered for the cover as a whole: Ok when every size is complete.
+  // At most JpegToBmpConverter::kMaxTargets sizes. See JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes.
+  ThumbResult generateThumbBmps(const std::pair<int, int>* sizes, int count, bool allowExtract = true,
+                                BuildArena* scratch = nullptr) const;
   uint8_t* readItemContentsToBytes(const std::string& itemHref, size_t* size = nullptr,
                                    bool trailingNullByte = false) const;
   bool readItemContentsToStream(const std::string& itemHref, Print& out, size_t chunkSize) const;

@@ -511,6 +511,41 @@ ThumbResult ReaderActivity::ensureCoverThumb(const std::string& bookPath, int wi
   return ThumbResult::TransientFail;
 }
 
+ThumbResult ReaderActivity::ensureCoverThumbs(const std::string& bookPath, const std::pair<int, int>* sizes,
+                                              const int count, BuildArena* scratch) {
+  if (sizes == nullptr || count < 1) return ThumbResult::TransientFail;
+  // Only an embedded EPUB cover has the one-decode path; a sidecar (the preferred source when
+  // present), an XTC or a TXT book converts each size on its own, exactly as before.
+  if (count == 1 || count > JpegToBmpConverter::kMaxTargets || !FsHelpers::hasEpubExtension(bookPath) ||
+      !sidecarCoverPath(bookPath).empty()) {
+    for (int i = 0; i < count; ++i) {
+      const ThumbResult r = ensureCoverThumb(bookPath, sizes[i].first, sizes[i].second, scratch);
+      if (r != ThumbResult::Ok) return r;
+    }
+    return ThumbResult::Ok;
+  }
+
+  const std::string dir = bookCacheDir(bookPath);
+  bool allValid = true;
+  for (int i = 0; i < count; ++i) {
+    const std::string file =
+        dir + "/thumb_" + std::to_string(sizes[i].first) + "x" + std::to_string(sizes[i].second) + ".bmp";
+    if (thumbFileValid(file, sizes[i].first, sizes[i].second)) continue;
+    allValid = false;
+    removeStaleThumb(file);
+    // As in ensureCoverThumb: a sentinel an older build left for a transient failure must not
+    // stop a cover that is now present from being decoded.
+    healStaleEpubSentinel(bookPath, file);
+  }
+  if (allValid) return ThumbResult::Ok;
+
+  Epub epub(bookPath, "/.crosspoint");
+  // loadForCover(): the cover reference without building book.bin; allowExtract=false: decode only
+  // an already-cached (or stored) cover -- the sliced beginCoverExtractSession owns the inflate.
+  if (!epub.loadForCover(scratch)) return ThumbResult::TransientFail;
+  return epub.generateThumbBmps(sizes, count, /*allowExtract=*/false, scratch);
+}
+
 ThumbResult ReaderActivity::ensureCoverThumb(const std::string& bookPath, int height, BuildArena* scratch) {
   const std::string dir = bookCacheDir(bookPath);
   const std::string name = "thumb_" + std::to_string(height) + ".bmp";

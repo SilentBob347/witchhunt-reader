@@ -473,3 +473,119 @@ TEST(JpegToBmpConverter, CropModeEmitsExactTargetHeightOverfill) {
   EXPECT_EQ(le32(out.buf, 18), 30);
   EXPECT_EQ(le32(out.buf, 22), -10);
 }
+
+// ---------------------------------------------------------------------------
+// One decode, two thumbnails (memory audit 2026-09, R9 item 2): the Lyra carousel needs a 340x540
+// and a 200x390 thumb of every cover, and each used to be a separate full decode of the JPEG. The
+// multi-target entry decodes once, at the DCT scale the LARGEST target needs, and feeds every
+// target its own resampler and ditherer from the same source rows.
+//  - The largest target's BMP must be byte-identical to a single conversion of that size: same
+//    decode scale, same resampling, same dither.
+//  - A smaller target resamples from the larger one's finer source rows (a single conversion
+//    would have picked a coarser DCT scale), so its bits differ; it must still be a complete BMP
+//    of exactly its box, and the same picture: compared on 4x4 block darkness, not per pixel,
+//    because error diffusion reacts to +-1 gray differences.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Unpacks a top-down 1-bit BMP into one byte per pixel (0/1).
+std::vector<uint8_t> unpack1BitBmp(const std::vector<uint8_t>& bmp, int& width, int& height) {
+  width = le32(bmp, 18);
+  height = std::abs(le32(bmp, 22));
+  const uint32_t dataOffset = static_cast<uint32_t>(le32(bmp, 10));
+  const int stride = ((width + 31) / 32) * 4;
+  std::vector<uint8_t> px(static_cast<size_t>(width) * height);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t byte = dataOffset + static_cast<size_t>(y) * stride + x / 8;
+      if (byte >= bmp.size()) return {};
+      px[static_cast<size_t>(y) * width + x] = (bmp[byte] >> (7 - (x % 8))) & 1;
+    }
+  }
+  return px;
+}
+
+std::vector<uint8_t> convertSingle1Bit(const char* name, const int w, const int h) {
+  FsFile file;
+  EXPECT_TRUE(file.openForRead(fixture(name)));
+  MemoryPrint out;
+  EXPECT_TRUE(JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(file, out, w, h));
+  file.close();
+  return out.buf;
+}
+
+// Mean absolute difference of 4x4 block means, in [0, 1].
+double blockMeanDifference(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, const int w, const int h) {
+  double total = 0;
+  int blocks = 0;
+  for (int by = 0; by + 4 <= h; by += 4) {
+    for (int bx = 0; bx + 4 <= w; bx += 4) {
+      int sa = 0, sb = 0;
+      for (int y = by; y < by + 4; ++y) {
+        for (int x = bx; x < bx + 4; ++x) {
+          sa += a[static_cast<size_t>(y) * w + x];
+          sb += b[static_cast<size_t>(y) * w + x];
+        }
+      }
+      total += std::abs(sa - sb) / 16.0;
+      ++blocks;
+    }
+  }
+  return blocks > 0 ? total / blocks : 1.0;
+}
+
+void expectTwoTargetsFromOneDecode(const char* name) {
+  SCOPED_TRACE(name);
+  constexpr int kLargeW = 90, kLargeH = 60;  // needs the 1/2 DCT scale on a 203x141 source
+  constexpr int kSmallW = 40, kSmallH = 28;  // alone it would take 1/4
+
+  FsFile file;
+  ASSERT_TRUE(file.openForRead(fixture(name)));
+  MemoryPrint large;
+  MemoryPrint small;
+  const JpegToBmpConverter::BmpTarget targets[2] = {{&large, kLargeW, kLargeH}, {&small, kSmallW, kSmallH}};
+  ASSERT_TRUE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, targets, 2));
+  file.close();
+
+  EXPECT_EQ(large.buf, convertSingle1Bit(name, kLargeW, kLargeH)) << "largest target must match a lone conversion";
+
+  int w = 0, h = 0, sw = 0, sh = 0;
+  const auto smallPx = unpack1BitBmp(small.buf, w, h);
+  const auto soloPx = unpack1BitBmp(convertSingle1Bit(name, kSmallW, kSmallH), sw, sh);
+  ASSERT_EQ(w, kSmallW);
+  ASSERT_EQ(h, kSmallH);
+  ASSERT_EQ(sw, w);
+  ASSERT_EQ(sh, h);
+  ASSERT_EQ(smallPx.size(), static_cast<size_t>(w) * h);  // every row present
+  EXPECT_LT(blockMeanDifference(smallPx, soloPx, w, h), 0.15);
+}
+
+}  // namespace
+
+TEST(JpegToBmpConverter, TwoTargetsFromOneBaselineDecode) { expectTwoTargetsFromOneDecode("prog_full_420_base.jpg"); }
+
+TEST(JpegToBmpConverter, TwoTargetsFromOneProgressiveDecode) { expectTwoTargetsFromOneDecode("prog_full_420.jpg"); }
+
+// The order of the targets does not matter: the decode scale follows the largest wherever it sits.
+TEST(JpegToBmpConverter, TwoTargetsSmallFirstStillDecodesAtTheLargestScale) {
+  FsFile file;
+  ASSERT_TRUE(file.openForRead(fixture("prog_full_420.jpg")));
+  MemoryPrint small;
+  MemoryPrint large;
+  const JpegToBmpConverter::BmpTarget targets[2] = {{&small, 40, 28}, {&large, 90, 60}};
+  ASSERT_TRUE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, targets, 2));
+  file.close();
+  EXPECT_EQ(large.buf, convertSingle1Bit("prog_full_420.jpg", 90, 60));
+}
+
+TEST(JpegToBmpConverter, TwoTargetsRejectsBadArguments) {
+  FsFile file;
+  ASSERT_TRUE(file.openForRead(fixture("prog_full_420.jpg")));
+  MemoryPrint out;
+  const JpegToBmpConverter::BmpTarget three[3] = {{&out, 10, 10}, {&out, 10, 10}, {&out, 10, 10}};
+  EXPECT_FALSE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, three, 3));
+  EXPECT_FALSE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, nullptr, 1));
+  const JpegToBmpConverter::BmpTarget noSink[1] = {{nullptr, 10, 10}};
+  EXPECT_FALSE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, noSink, 1));
+  file.close();
+}

@@ -56,6 +56,11 @@ class ReaderActivity final : public Activity {
   // extraction ring and the decoders' working memory. Null uses the heap as before.
   static ThumbResult ensureCoverThumb(const std::string& bookPath, int width, int height,
                                       BuildArena* scratch = nullptr);
+  // Every (width, height) in `sizes` for this book, from ONE decode of an embedded EPUB JPEG cover
+  // (the Lyra carousel's two thumbnail sizes used to cost two full decodes). A sidecar image, an XTC
+  // or a TXT source keeps the per-size path. Ok only when every size is complete.
+  static ThumbResult ensureCoverThumbs(const std::string& bookPath, const std::pair<int, int>* sizes, int count,
+                                       BuildArena* scratch = nullptr);
   static ThumbResult ensureCoverThumb(const std::string& bookPath, int height, BuildArena* scratch = nullptr);
   // True only if a cover thumbnail BMP exists AND holds all its declared pixel rows. A thumbnail
   // whose write was interrupted (reboot/abort mid-decode) is left truncated on the SD card; it

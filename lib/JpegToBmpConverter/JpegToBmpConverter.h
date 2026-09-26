@@ -27,4 +27,18 @@ class JpegToBmpConverter {
   // Convert to 1-bit BMP (black and white only, no grays) for fast home screen rendering
   static bool jpegFileTo1BitBmpStreamWithSize(FsFile& jpegFile, Print& bmpOut, int targetMaxWidth, int targetMaxHeight,
                                               BuildArena* scratch = nullptr);
+
+  // One 1-bit, crop-fitted BMP per target from a SINGLE decode (the Lyra carousel's two cover
+  // thumbnails): the DCT pre-scale is the one the largest target needs, and every target gets its
+  // own resampler, ditherer and BMP stream fed from the same source rows, so each is still dithered
+  // once from gray -- never rescaled after dithering. The largest target's BMP is byte-identical to
+  // what jpegFileTo1BitBmpStreamWithSize writes for it alone. False when any output failed.
+  static constexpr int kMaxTargets = 2;
+  struct BmpTarget {
+    Print* out;
+    int maxWidth;
+    int maxHeight;
+  };
+  static bool jpegFileTo1BitBmpStreamsWithSizes(FsFile& jpegFile, const BmpTarget* targets, int count,
+                                                BuildArena* scratch = nullptr);
 };

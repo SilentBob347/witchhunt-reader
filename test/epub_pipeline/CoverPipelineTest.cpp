@@ -194,4 +194,84 @@ TEST_F(CoverPipelineFixture, StoredCoverThumbMatchesTheExtractedPath) {
   }
 }
 
+// R9 item 2 (memory audit 2026-09): the Lyra carousel's two thumbnail sizes come from ONE decode of
+// the cover. Both routes a cover can take -- an extracted cover.img, and a JPEG stored uncompressed
+// and decoded in place out of the archive -- must write both BMPs complete, and the larger must be
+// byte-identical to generating that size alone (same decode scale, resampling and dither).
+std::string readFileString(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+TEST_F(CoverPipelineFixture, BothCarouselThumbsFromOneJpegDecode) {
+  const std::string jpeg = readFileString(JPEG_FIXTURE_DIR "/prog_full_420.jpg");
+  ASSERT_GT(jpeg.size(), 1000u);
+  const std::pair<int, int> sizes[2] = {{90, 60}, {40, 28}};
+
+  // Reference: the larger size generated on its own, from an extracted cover.img.
+  const std::string refBook = makeEpub(work / "ref.epub", "cover.jpg", jpeg, "R");
+  std::string reference;
+  {
+    Epub epub(refBook, (work / "ref").string());
+    ASSERT_TRUE(epub.loadForCover());
+    const fs::path img = epub.getCoverImageCachePath();
+    fs::create_directories(img.parent_path());
+    std::ofstream(img.string(), std::ios::binary) << jpeg;
+    ASSERT_EQ(epub.generateThumbBmp(90, 60, /*allowExtract=*/false), ThumbResult::Ok);
+    reference = readFileString(epub.getThumbBmpPath(90, 60));
+  }
+  ASSERT_FALSE(reference.empty());
+
+  for (const bool inPlace : {false, true}) {
+    SCOPED_TRACE(inPlace ? "stored entry decoded in place" : "extracted cover.img");
+    Epub::clearCoverMetadataMemo();
+    const std::string book = makeEpub(work / (inPlace ? "inplace.epub" : "cached.epub"), "cover.jpg", jpeg, "T");
+    Epub epub(book, (work / (inPlace ? "inplace" : "cached")).string());
+    ASSERT_TRUE(epub.loadForCover());
+    if (!inPlace) {
+      const fs::path img = epub.getCoverImageCachePath();
+      fs::create_directories(img.parent_path());
+      std::ofstream(img.string(), std::ios::binary) << jpeg;
+    }
+    ASSERT_EQ(epub.generateThumbBmps(sizes, 2, /*allowExtract=*/false), ThumbResult::Ok);
+    EXPECT_EQ(readFileString(epub.getThumbBmpPath(90, 60)), reference);
+    const std::string small = readFileString(epub.getThumbBmpPath(40, 28));
+    ASSERT_GE(small.size(), 62u);
+    // 40x28 1-bit, top-down: 62-byte header + 28 rows of 8 bytes.
+    EXPECT_EQ(small.size(), 62u + 28u * 8u);
+    // A second call finds both complete and decodes nothing.
+    EXPECT_EQ(epub.generateThumbBmps(sizes, 2, /*allowExtract=*/false), ThumbResult::Ok);
+  }
+}
+
+// A cover the OPF does not declare leaves a structural sentinel for every size at once.
+TEST_F(CoverPipelineFixture, BothCarouselThumbsGetSentinelsWhenTheCoverIsAbsent) {
+  const std::string opf =
+      "<?xml version=\"1.0\"?><package version=\"2.0\" xmlns=\"http://www.idpf.org/2007/opf\">"
+      "<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>N</dc:title></metadata>"
+      "<manifest><item id=\"c1\" href=\"c1.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>"
+      "<spine><itemref idref=\"c1\"/></spine></package>";
+  test_zip::StoredZipWriter zip;
+  zip.add("mimetype", "application/epub+zip");
+  zip.add("META-INF/container.xml",
+          "<?xml version=\"1.0\"?><container version=\"1.0\" "
+          "xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile "
+          "full-path=\"content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>");
+  zip.add("content.opf", opf);
+  zip.add("c1.xhtml", "<html><body><p>x</p></body></html>");
+  const std::string book = (work / "nocover.epub").string();
+  zip.write(book);
+
+  // loadForCover() refuses a book without a cover item (the caller then counts a transient, as
+  // for one size); a full load is what reaches generateThumbBmps' own structural answer.
+  Epub epub(book, (work / "nc").string());
+  ASSERT_TRUE(epub.load(true));
+  const std::pair<int, int> sizes[2] = {{90, 60}, {40, 28}};
+  EXPECT_EQ(epub.generateThumbBmps(sizes, 2, /*allowExtract=*/false), ThumbResult::StructurallyAbsent);
+  for (const auto& sz : sizes) {
+    ASSERT_TRUE(fs::exists(epub.getThumbBmpPath(sz.first, sz.second)));
+    EXPECT_EQ(fs::file_size(epub.getThumbBmpPath(sz.first, sz.second)), 0u) << "0-byte sentinel";
+  }
+}
+
 }  // namespace
