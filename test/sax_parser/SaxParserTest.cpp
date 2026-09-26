@@ -162,7 +162,9 @@ TEST(SaxParser, ByteOffsetAdvances) {
   ASSERT_TRUE(p.feed(bytes, strlen(xml)));
   ASSERT_TRUE(p.finalize());
 
-  EXPECT_GT(state.offsetAtChild, 0u);
+  // "<root><child>" is 13 bytes. yxml has no end-of-start-tag token, so the start callback waits
+  // for the next token -- the 't' of "text" -- and the offset is the byte after it.
+  EXPECT_EQ(state.offsetAtChild, 14u);
 }
 
 TEST(SaxParser, HtmlEntityRoutedToDefaultCb) {
