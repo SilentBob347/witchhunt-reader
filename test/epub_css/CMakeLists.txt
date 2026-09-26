@@ -1,7 +1,5 @@
-# Declaration-level parser tests. These also have a standalone driver in
-# test/run_epub_css_test.sh (which compiles the real Logging.cpp and so needs the Arduino
-# framework headers); building them here too means they run in the default ctest sweep
-# on any host, which is where a regression would otherwise go unnoticed.
+# Declaration-level parser tests: inline-style and declaration parsing, no stylesheet
+# cache. Pure host code, so they run in the default ctest sweep on any host.
 add_executable(CssParserTest
   CssParserTest.cpp
   ${REPO_ROOT}/test/zip_entry_reader/LoggingStub.cpp
