@@ -1153,8 +1153,8 @@ hand-off measured 43 556 free / 23 540 contiguous a few milliseconds later.
 
 **R9 — the cold Home's cover pipeline (R1b follow-up).** *Filed
 2026-09-26; item (1a) done the same evening; (2), (3) and (1b) done
-2026-09-27 on branch `home/lyra-carousel-covers`, host-validated, device
-validation pending (see the end of this entry).* (1a)
+2026-09-27 on branch `home/lyra-carousel-covers` and device-validated on the
+X3 in runs 22a–c (see the end of this entry); the X4 is pending.* (1a)
 The thumbnail converter's row pipeline (MCU strip, row buffer, scaling
 accumulators) now comes from the lent region in a block of its own, with
 the heap floor at 8 KB when it does — run 15 showed this refusal on every
@@ -1214,6 +1214,27 @@ deferred, not restarted from the first scan.
   2026-08-05) the thumbnail generators' "already complete" check demanded
   8 bpp, so it never matched a 1-bit thumb and every generator call decoded
   again. Latent, because callers check first; fixed.
+
+*Runs 22a–c (2026-09-27, X3, cache wiped, buttons pressed throughout):* all
+five covers (two progressive, three baseline) went through the sliced
+sessions, both sizes from one decode, with no restart. Menu-row redraws
+served by the frame cache took 5–8 ms from clearScreen to displayBuffer
+against ~354 ms redrawn from SD; a carousel move still refills it. Home kept
+~50 KB free after the handover once the 20 KB fallback buffer was freed
+there (it had held Home at 28 KB). The runs also turned up three fixes, all
+in this branch: the cover extractor freed and reallocated its chunk buffer on
+every step after a shortfall (~50 times per large cover; it now allocates
+once, 16 KB from the lent region on the X3); redraws during loading took
+0.6–1.1 s because the sessions kept running beside them on the shared core
+(the pass now sleeps while `GfxRenderer::isComposingFrame()`: the Deckhand
+window went from 626–1116 ms to 199–336 ms); and the fallback buffer above.
+Still open: one redraw at 832 ms during the Brazilian Wilderness extraction,
+at the same point in two runs and so tied to that extraction rather than to
+the CPU sharing; the synchronous cover-metadata load before an extraction
+blocks the loop 0.8–2.9 s (1.9 s of it the 230 KB OPF of a book never
+opened); and a session heap minimum of ~11.8 KB that falls in the Settings /
+clear-cache window none of the captures contain. The X4 has not run the
+branch.
 
 *Device check:* wipe the book caches, open Home on the carousel, and press
 buttons while covers load. Expect `Started progressive cover session` /
