@@ -1,10 +1,9 @@
 // Full-pipeline equivalence tests over the synthetic corpus:
-//  1. Determinism — two cold runs over the same book produce byte-identical dumps.
-//  2. Warm-path equivalence — a run served from the section cache dumps
+//  1. Warm-path equivalence — a run served from the section cache dumps
 //     identically to the cold run that built it.
-//  3. Golden equivalence — the dump matches the committed golden for every
-//     synthetic corpus book. Regenerate intentionally changed goldens with:
-//     UPDATE_GOLDENS=1 ctest -R EpubPipeline
+//  2. Golden equivalence — two cold builds of every synthetic corpus book dump
+//     identically to each other and to the committed golden. Regenerate
+//     intentionally changed goldens with: UPDATE_GOLDENS=1 ctest -R EpubPipeline
 //
 // Every case runs twice: once with font-size normalization OFF (the tight ±3%
 // float-rounding dead zone) and once ON (the ±10% band that snaps publisher
@@ -70,13 +69,6 @@ std::string caseCacheDir(const Case& c, const std::string& tag) {
 
 class EpubPipelineTest : public testing::TestWithParam<Case> {};
 
-TEST_P(EpubPipelineTest, ColdRunsAreDeterministic) {
-  const Case c = GetParam();
-  const std::string dump1 = runOnce(c, caseCacheDir(c, "a"));
-  const std::string dump2 = runOnce(c, caseCacheDir(c, "b"));
-  EXPECT_EQ(dump1, dump2) << "two cold builds of " << c.epub << " diverged";
-}
-
 TEST_P(EpubPipelineTest, WarmRunMatchesColdRun) {
   const Case c = GetParam();
   const std::string cacheDir = caseCacheDir(c, "warm");
@@ -85,9 +77,12 @@ TEST_P(EpubPipelineTest, WarmRunMatchesColdRun) {
   EXPECT_EQ(cold, warm) << "cache-served layout of " << c.epub << " differs from the build that wrote it";
 }
 
+// Built twice, into separate cache dirs: a nondeterministic build (an uninitialised field, a
+// pointer-ordered container) can match the golden once by luck, and must not be allowed to write one.
 TEST_P(EpubPipelineTest, MatchesGolden) {
   const Case c = GetParam();
-  const std::string dump = runOnce(c, caseCacheDir(c, "golden"));
+  const std::string dump = runOnce(c, caseCacheDir(c, "a"));
+  ASSERT_EQ(dump, runOnce(c, caseCacheDir(c, "b"))) << "two cold builds of " << c.epub << " diverged";
   const fs::path goldenPath = fs::path(GOLDEN_DIR) / (stem(c.epub) + variantSuffix(c) + ".golden.txt");
 
   if (std::getenv("UPDATE_GOLDENS")) {
