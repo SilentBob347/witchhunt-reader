@@ -17,6 +17,7 @@
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "Epub.h"
+#include "Epub/CoverThumbSession.h"
 #include "EpubReaderActivity.h"
 #include "KOReaderCredentialStore.h"
 #include "MdReaderActivity.h"
@@ -512,7 +513,9 @@ ThumbResult ReaderActivity::ensureCoverThumb(const std::string& bookPath, int wi
 }
 
 ThumbResult ReaderActivity::ensureCoverThumbs(const std::string& bookPath, const std::pair<int, int>* sizes,
-                                              const int count, BuildArena* scratch) {
+                                              const int count, BuildArena* scratch,
+                                              std::unique_ptr<CoverThumbSession>* sliced) {
+  if (sliced != nullptr) sliced->reset();
   if (sizes == nullptr || count < 1) return ThumbResult::TransientFail;
   // Only an embedded EPUB cover has the one-decode path; a sidecar (the preferred source when
   // present), an XTC or a TXT book converts each size on its own, exactly as before.
@@ -543,6 +546,10 @@ ThumbResult ReaderActivity::ensureCoverThumbs(const std::string& bookPath, const
   // loadForCover(): the cover reference without building book.bin; allowExtract=false: decode only
   // an already-cached (or stored) cover -- the sliced beginCoverExtractSession owns the inflate.
   if (!epub.loadForCover(scratch)) return ThumbResult::TransientFail;
+  if (sliced != nullptr) {
+    *sliced = epub.beginThumbSession(sizes, count, scratch);
+    if (*sliced) return ThumbResult::TransientFail;  // started, nothing written yet: the caller drives it
+  }
   return epub.generateThumbBmps(sizes, count, /*allowExtract=*/false, scratch);
 }
 

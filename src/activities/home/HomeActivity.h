@@ -13,6 +13,7 @@
 
 #include "../Activity.h"
 #include "./FileBrowserActivity.h"
+#include "Epub/CoverThumbSession.h"
 #include "HomeMenu.h"
 #include "ReadingStats.h"
 #include "activities/reader/ReaderActivity.h"
@@ -43,6 +44,15 @@ class HomeActivity final : public Activity {
   std::unique_ptr<BuildArena> coverScratch_;
   size_t nextRecentCoverIndex = 0;
   size_t nextThumbSizeIndex = 0;  // which thumb size within the current book is next
+
+  // Phase 0: a JPEG cover's missing carousel sizes, from one decode run in slices (memory audit
+  // 2026-09, R9 item 3). A press pauses it where it stands; it resumes on the next pass instead of
+  // starting over. Holds its decoder state in coverScratch_ between slices (declared after it, so
+  // it goes first) and removes its partial thumbnails if it goes unfinished.
+  std::unique_ptr<CoverThumbSession> thumbSession;
+  size_t thumbSessionSizeIndex = 0;  // the first size it writes (nextThumbSizeIndex when it began)
+  int thumbSessionCovered = 0;       // how many sizes it writes
+  bool thumbSessionFailed = false;   // set on error: the retry for that book runs one-shot
 
   // Phase 1: sliced ZIP extraction of cover.img (only needed for large embedded PNG covers)
   std::unique_ptr<ReaderActivity::CoverExtractSession> extractSession;
@@ -130,6 +140,7 @@ class HomeActivity final : public Activity {
   // the CPU to 10 MHz mid-burst and the next decode tick would crawl (observed: a ~1.5 s
   // cover decode taking ~25 s). Hold full speed until every recent cover is resolved.
   bool skipLoopDelay() override {
-    return (firstRenderDone && !recentsLoaded) || recentsLoading || extractSession != nullptr || pngSession != nullptr;
+    return (firstRenderDone && !recentsLoaded) || recentsLoading || extractSession != nullptr ||
+           pngSession != nullptr || thumbSession != nullptr;
   }
 };

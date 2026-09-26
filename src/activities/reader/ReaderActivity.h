@@ -11,6 +11,7 @@ class BuildArena;  // lib/Memory
 #include "activities/home/FileBrowserActivity.h"
 
 class Epub;
+class CoverThumbSession;  // Epub/CoverThumbSession.h
 class Xtc;
 class Txt;
 
@@ -59,8 +60,13 @@ class ReaderActivity final : public Activity {
   // Every (width, height) in `sizes` for this book, from ONE decode of an embedded EPUB JPEG cover
   // (the Lyra carousel's two thumbnail sizes used to cost two full decodes). A sidecar image, an XTC
   // or a TXT source keeps the per-size path. Ok only when every size is complete.
+  // `sliced` (Home's cover pass): when the cover is a JPEG the sliced converter takes, the
+  // conversion is STARTED instead of run here and handed over in *sliced, with nothing written yet;
+  // the result is then TransientFail and the caller drives the session (see CoverThumbSession).
+  // Otherwise *sliced stays null and the result is the one-shot conversion's.
   static ThumbResult ensureCoverThumbs(const std::string& bookPath, const std::pair<int, int>* sizes, int count,
-                                       BuildArena* scratch = nullptr);
+                                       BuildArena* scratch = nullptr,
+                                       std::unique_ptr<CoverThumbSession>* sliced = nullptr);
   static ThumbResult ensureCoverThumb(const std::string& bookPath, int height, BuildArena* scratch = nullptr);
   // True only if a cover thumbnail BMP exists AND holds all its declared pixel rows. A thumbnail
   // whose write was interrupted (reboot/abort mid-decode) is left truncated on the SD card; it

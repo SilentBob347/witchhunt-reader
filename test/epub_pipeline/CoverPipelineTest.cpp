@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "Epub.h"
+#include "Epub/CoverThumbSession.h"
 #include "StoredZipWriter.h"
 
 namespace fs = std::filesystem;
@@ -247,6 +248,88 @@ TEST_F(CoverPipelineFixture, BothCarouselThumbsFromOneJpegDecode) {
     EXPECT_EQ(epub.generateThumbBmps(sizes, 2, /*allowExtract=*/false), ThumbResult::Ok);
     EXPECT_EQ(readFileString(epub.getThumbBmpPath(90, 60)), reference);
   }
+}
+
+// R9 item 3: the same two thumbnails, converted in slices the way Home's cover pass drives them.
+// Both routes must write exactly what the one-shot generateThumbBmps writes; a session abandoned
+// mid-decode (Home left for a book) must leave no partial thumbnail behind; and a cover the
+// one-shot path owns (a sentinel, both sizes already complete) must not start a session.
+TEST_F(CoverPipelineFixture, SlicedCarouselThumbsMatchTheOneShotDecode) {
+  const std::pair<int, int> sizes[2] = {{90, 60}, {40, 28}};
+  for (const char* fixture : {"prog_full_420.jpg", "prog_full_420_base.jpg"}) {
+    const std::string jpeg = readFileString(std::string(JPEG_FIXTURE_DIR "/") + fixture);
+    ASSERT_GT(jpeg.size(), 1000u);
+    for (const bool inPlace : {false, true}) {
+      SCOPED_TRACE(std::string(fixture) + (inPlace ? ", stored entry decoded in place" : ", extracted cover.img"));
+      const std::string tag = std::string(inPlace ? "ip_" : "cc_") + fixture;
+      const std::string book = makeEpub(work / (tag + ".epub"), "cover.jpg", jpeg, "T");
+      const auto prime = [&](Epub& epub) {
+        ASSERT_TRUE(epub.loadForCover());
+        if (!inPlace) {
+          const fs::path img = epub.getCoverImageCachePath();
+          fs::create_directories(img.parent_path());
+          std::ofstream(img.string(), std::ios::binary) << jpeg;
+        }
+      };
+
+      // Reference: the one-shot conversion.
+      Epub::clearCoverMetadataMemo();
+      std::string refLarge, refSmall;
+      {
+        Epub epub(book, (work / (tag + "_ref")).string());
+        prime(epub);
+        ASSERT_EQ(epub.generateThumbBmps(sizes, 2, /*allowExtract=*/false), ThumbResult::Ok);
+        refLarge = readFileString(epub.getThumbBmpPath(90, 60));
+        refSmall = readFileString(epub.getThumbBmpPath(40, 28));
+      }
+
+      Epub::clearCoverMetadataMemo();
+      Epub epub(book, (work / (tag + "_sliced")).string());
+      prime(epub);
+
+      // Abandoned halfway: nothing left behind, not even a 0-byte file (that would read as "no cover").
+      {
+        auto session = epub.beginThumbSession(sizes, 2);
+        ASSERT_NE(session, nullptr);
+        EXPECT_EQ(session->outputCount(), 2);
+        for (int i = 0; i < 3; ++i) ASSERT_EQ(session->continueSteps(1), CoverThumbSession::Status::Running);
+      }
+      EXPECT_FALSE(fs::exists(epub.getThumbBmpPath(90, 60)));
+      EXPECT_FALSE(fs::exists(epub.getThumbBmpPath(40, 28)));
+
+      // Driven to the end, one unit at a time.
+      {
+        auto session = epub.beginThumbSession(sizes, 2);
+        ASSERT_NE(session, nullptr);
+        auto status = CoverThumbSession::Status::Running;
+        int units = 0;
+        while (status == CoverThumbSession::Status::Running && units < 100000) {
+          status = session->continueSteps(1);
+          ++units;
+        }
+        EXPECT_EQ(status, CoverThumbSession::Status::Done);
+        EXPECT_GT(units, 4);
+      }
+      EXPECT_EQ(readFileString(epub.getThumbBmpPath(90, 60)), refLarge);
+      EXPECT_EQ(readFileString(epub.getThumbBmpPath(40, 28)), refSmall);
+
+      // Both complete: nothing to start. A sentinel on either: left to the one-shot path.
+      EXPECT_EQ(epub.beginThumbSession(sizes, 2), nullptr);
+      fs::remove(epub.getThumbBmpPath(40, 28));
+      std::ofstream(epub.getThumbBmpPath(40, 28), std::ios::binary).close();
+      EXPECT_EQ(epub.beginThumbSession(sizes, 2), nullptr);
+    }
+  }
+}
+
+// A PNG cover keeps its own sliced path (PngDecodeSession); the JPEG session does not take it.
+TEST_F(CoverPipelineFixture, SlicedCarouselThumbsLeavePngCoversAlone) {
+  const std::string book = makeEpub(work / "png.epub", "cover.png", pngString(), "P");
+  Epub epub(book, (work / "png").string());
+  ASSERT_TRUE(epub.loadForCover());
+  const std::pair<int, int> sizes[2] = {{90, 60}, {40, 28}};
+  EXPECT_EQ(epub.beginThumbSession(sizes, 2), nullptr);
+  EXPECT_FALSE(fs::exists(epub.getThumbBmpPath(90, 60)));
 }
 
 // A cover the OPF does not declare leaves a structural sentinel for every size at once.

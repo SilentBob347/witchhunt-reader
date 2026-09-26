@@ -295,6 +295,51 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
   // this size across all continueStep() calls (realloc only if the size changes).
   constexpr size_t COVER_EXTRACT_CHUNK = 16384;
 
+  // ── Sliced JPEG cover drain ──────────────────────────────────────────────────
+  // One decode writes every missing carousel size (R9 item 2); it runs here a unit at a time -- an
+  // MCU row of a baseline cover; 4 KB of the index pass, then a band, of a progressive one -- in
+  // bursts of COVER_SLICE_BUDGET_MS. A queued press pauses it where it stands (R9 item 3): the
+  // one-shot decode it replaces threw the work away and started over, seconds per press on a
+  // large progressive cover.
+  if (thumbSession) {
+    const uint32_t deadline = millis() + COVER_SLICE_BUDGET_MS;
+    auto status = CoverThumbSession::Status::Running;
+    while (status == CoverThumbSession::Status::Running) {
+      status = thumbSession->continueSteps(1);
+      if (status == CoverThumbSession::Status::Running &&
+          (mappedInput.hasPendingInput() || static_cast<int32_t>(millis() - deadline) >= 0)) {
+        recentsLoading = false;  // pause between units; resume on the next call
+        return;
+      }
+    }
+    thumbSession.reset();
+    RecentBook& book = recentBooks[nextRecentCoverIndex];
+    if (status == CoverThumbSession::Status::Done) {
+      LOG_DBG("HOME", "Cover session complete for %s (%d size(s))", book.path.c_str(), thumbSessionCovered);
+      // As after a one-shot decode: sizes this decode did not cover keep the book current.
+      nextThumbSizeIndex = thumbSessionSizeIndex + 1;
+      if (nextThumbSizeIndex < thumbSizes.size() &&
+          static_cast<size_t>(thumbSessionCovered) < thumbSizes.size() - thumbSessionSizeIndex) {
+        yieldAfterDecode();
+        return;
+      }
+      const std::string placeholder = ReaderActivity::coverThumbPlaceholder(book.path);
+      if (book.coverBmpPath != placeholder) {
+        RECENT_BOOKS.updateBook(book.path, book.title, book.author, book.series, placeholder);
+        book.coverBmpPath = placeholder;
+      }
+      nextRecentCoverIndex++;
+      nextThumbSizeIndex = 0;
+      yieldAfterDecode();
+      return;
+    }
+    // The session removed its partial thumbnails. Retry this size once with the one-shot decode,
+    // whose own failure then walks the usual ladder and counts toward the book's budget.
+    LOG_ERR("HOME", "Cover session failed for %s — retrying one-shot", book.path.c_str());
+    thumbSessionFailed = true;
+    nextThumbSizeIndex = thumbSessionSizeIndex;
+  }
+
   // ── Cover extract session drain ──────────────────────────────────────────────
   // Sliced ZIP extraction of cover.img for a large embedded PNG cover. Burst-drain
   // chunks within the time budget; when done, fall through to beginPngThumbSession.
@@ -440,10 +485,23 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
             }
           }
 
-          // Try synchronous decode first (handles JPEG and cached covers).
+          // A JPEG cover that is cached or stored in place starts as a sliced session (drained at the
+          // top of this function); everything else decodes here, one-shot.
           CooperativeAbort::clearAborted();
-          const ThumbResult res =
-              ReaderActivity::ensureCoverThumbs(book.path, pending, pendingCount, coverScratch_.get());
+          std::unique_ptr<CoverThumbSession> started;
+          const ThumbResult res = ReaderActivity::ensureCoverThumbs(
+              book.path, pending, pendingCount, coverScratch_.get(), thumbSessionFailed ? nullptr : &started);
+          thumbSessionFailed = false;  // consumed
+          if (started) {
+            thumbSession = std::move(started);
+            thumbSessionSizeIndex = i;
+            thumbSessionCovered = pendingCount;
+            nextThumbSizeIndex = i;
+            LOG_DBG("HOME", "Started %s cover session for %s (%d size(s))",
+                    thumbSession->progressive() ? "progressive" : "baseline", book.path.c_str(), pendingCount);
+            recentsLoading = false;
+            return;
+          }
           LOG_DBG("HOME", "ensureCoverThumbs(%dx%d, %d size(s)) for %s: %s", sz.first, sz.second, pendingCount,
                   book.path.c_str(),
                   res == ThumbResult::Ok                   ? "ok"
@@ -643,8 +701,9 @@ void HomeActivity::restoreSecondaryBuffer(bool callerHoldsRenderLock) {
   // end-of-loading caller runs from loop() with no lock held and passes false.
   if (!secondaryBufferLent) return;
   const auto doRestore = [this]() {
-    // Anything still holding a block in the lent region goes first: an abandoned extract or
-    // PNG session at exit would otherwise release into a region the display owns again.
+    // Anything still holding a block in the lent region goes first: an abandoned extract, PNG or
+    // JPEG session at exit would otherwise release into a region the display owns again.
+    thumbSession.reset();
     extractSession.reset();
     pngSession.reset();
     coverScratch_.reset();
@@ -701,6 +760,8 @@ void HomeActivity::onEnter() {
   firstRenderDone = false;
   nextRecentCoverIndex = 0;
   nextThumbSizeIndex = 0;
+  thumbSession.reset();
+  thumbSessionFailed = false;
   extractSession.reset();
   pngSession.reset();
   pngSessionFiles.close();

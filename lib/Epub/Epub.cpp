@@ -22,6 +22,7 @@
 #include <limits>
 #include <optional>
 
+#include "Epub/CoverThumbSession.h"
 #include "Epub/HashUtils.h"
 #include "Epub/ImageFormatDetector.h"
 #include "Epub/parsers/ContainerParser.h"
@@ -1664,6 +1665,98 @@ ThumbResult Epub::generateThumbBmps(const std::pair<int, int>* sizes, const int 
   }
   LOG_DBG("EBP", "Generated %d thumb BMP(s) from one cover decode", neededCount);
   return ThumbResult::Ok;
+}
+
+std::unique_ptr<CoverThumbSession> Epub::beginThumbSession(const std::pair<int, int>* sizes, const int count,
+                                                           BuildArena* scratch) const {
+  constexpr int kMax = JpegToBmpConverter::kMaxTargets;
+  if (sizes == nullptr || count < 1 || count > kMax) return nullptr;
+
+  // The same checks generateThumbBmps makes first, minus the answers it writes: any sentinel, or
+  // every size already complete, is left to it.
+  bool needed[kMax] = {};
+  int neededCount = 0;
+  for (int i = 0; i < count; ++i) {
+    const std::string path = getThumbBmpPath(sizes[i].first, sizes[i].second);
+    FsFile existing;
+    if (Storage.openFileForRead("EBP", path, existing)) {
+      const uint32_t sz = existing.size();
+      existing.close();
+      if (sz == 0) return nullptr;
+      if (thumbBmpComplete(path, sizes[i].first, sizes[i].second)) continue;
+    }
+    needed[i] = true;
+    ++neededCount;
+  }
+  if (neededCount == 0 || getCoverItemHref().empty() || coverImageCachedButUnsupported()) return nullptr;
+
+  std::unique_ptr<CoverThumbSession> session(new (std::nothrow) CoverThumbSession());
+  if (!session) return nullptr;
+  uint32_t coverBase = 0;
+  if (coverImageCachedAndValid(/*allowExtract=*/false)) {
+    if (!Storage.openFileForRead("EBP", getCoverImageCachePath(), session->cover_)) return nullptr;
+  } else if (!openStoredCoverInPlace(session->cover_, &coverBase)) {
+    return nullptr;
+  }
+  if (detectCoverImageFormat(session->cover_, coverBase) != ImageFormatDetector::Format::Jpeg) return nullptr;
+
+  JpegToBmpConverter::BmpTarget targets[kMax];
+  for (int i = 0; i < count; ++i) {
+    if (!needed[i]) continue;
+    const int n = session->count_;
+    session->paths_[n] = getThumbBmpPath(sizes[i].first, sizes[i].second);
+    // Opening for write truncates; from here on the session removes this path unless it finishes.
+    session->count_ = n + 1;
+    if (!Storage.openFileForWrite("EBP", session->paths_[n], session->thumbs_[n])) return nullptr;
+    targets[n] = JpegToBmpConverter::BmpTarget{&session->thumbs_[n], sizes[i].first, sizes[i].second};
+  }
+  session->jpeg_ = JpegThumbSession::begin(session->cover_, targets, session->count_, scratch);
+  if (!session->jpeg_) return nullptr;
+  LOG_DBG("EBP", "Sliced %s cover conversion for %d thumb size(s)",
+          session->jpeg_->progressive() ? "progressive" : "baseline", session->count_);
+  return session;
+}
+
+bool CoverThumbSession::progressive() const { return jpeg_ != nullptr && jpeg_->progressive(); }
+
+CoverThumbSession::Status CoverThumbSession::continueSteps(const uint16_t units) {
+  if (status_ != Status::Running) return status_;
+  if (!jpeg_) {
+    status_ = Status::Error;
+    removeOutputs();
+    return status_;
+  }
+  const auto st = jpeg_->continueSteps(units);
+  if (st == JpegThumbSession::Status::Running) return Status::Running;
+  jpeg_.reset();  // flushes (a no-op once Done) before the files close
+  if (st == JpegThumbSession::Status::Done) {
+    for (int i = 0; i < count_; ++i) thumbs_[i].close();
+    cover_.close();
+    status_ = Status::Done;
+    LOG_DBG("EBP", "Generated %d thumb BMP(s) from one sliced cover decode", count_);
+  } else {
+    status_ = Status::Error;
+    removeOutputs();
+    LOG_DBG("EBP", "Sliced thumb decode for %d size(s) failed — removed partials, transient", count_);
+  }
+  return status_;
+}
+
+void CoverThumbSession::removeOutputs() {
+  jpeg_.reset();
+  for (int i = 0; i < count_; ++i) {
+    if (thumbs_[i]) thumbs_[i].close();
+    Storage.remove(paths_[i].c_str());
+  }
+  if (cover_) cover_.close();
+}
+
+CoverThumbSession::~CoverThumbSession() {
+  if (status_ != Status::Done) {
+    removeOutputs();
+  } else if (cover_) {
+    cover_.close();
+  }
 }
 
 uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size, const bool trailingNullByte) const {
