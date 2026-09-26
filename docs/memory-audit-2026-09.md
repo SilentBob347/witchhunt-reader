@@ -1066,12 +1066,28 @@ current section builds (C holds the borrow, or the buffer is released), so
 the image on the target page of a chapter jump is always a foreground
 decode. (c) The lane scans from the next page and inside the current
 section only: the page on screen showing a placeholder, and the next
-chapter's opening page, lie outside its window. Candidates, not started:
-warm the on-screen page's placeholder image and redraw once its cache
-exists (a lazy load, ~4 s after landing instead of a blocking press), and
-once B has built the next section, warm its first pages across the
-boundary. (B itself sat in Probe all run — 140 pages of Chapter 3 ahead
-exceed its 50-page runway — by design.) The background lanes today parse the next section (B) or the
+chapter's opening page, lay outside its window. (B itself sat in Probe
+all run — 140 pages of Chapter 3 ahead exceed its 50-page runway — by
+design.)
+
+*After run 17, the window was widened (device validation pending):* it
+now starts at the page on screen. A large-image placeholder there, or an
+image the render could not afford to decode, is warmed after the usual
+settle and the page redrawn from the new cache — a lazy load about 1.5 s
+plus the decode after landing, with no press; the redraw is skipped when
+input is already waiting. When the five pages ahead run past the
+section's end, the window continues into the next section's first pages
+if their cache exists (built by B, or an earlier session); a no-CSS
+fallback cache is skipped because the reader rebuilds it on entry, and
+B's completion clears the lane's clean-window mark so a window scanned
+before the cache existed is looked at again. The scan checks for input
+between page loads. One latent defect fixed on the way: a failed decode
+writes no cache, so a page with a broken or unsupported image stayed
+"uncached" and the lane retried it on every loop tick; such a page now
+gets two attempts per session (an attempt preempted by input does not
+count) and is then skipped. What still cannot be reached: the target
+page of a chapter jump while its section builds, because the lane has no
+scratch until the build returns the buffer. The background lanes today parse the next section (B) or the
 current one (C) and leave image decode to the page turn that reaches the
 image. A reader five pages from an undecoded image should not be spending
 its idle time laying out a section fifty pages away. Add a background lane
