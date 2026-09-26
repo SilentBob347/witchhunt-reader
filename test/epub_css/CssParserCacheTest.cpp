@@ -46,8 +46,8 @@ static void trackAlloc(size_t sz) { g_liveBytes.fetch_add(sz); }
 // Reaching the real allocator underneath our own malloc/free overrides. Same technique as
 // test/epub_pipeline/HeapTrack.cpp: on Windows go straight to the Win32 heap (there is no
 // dlsym/RTLD_NEXT, which is why this suite used to be skipped entirely on MSYS/UCRT64 and
-// showed up as a permanent EpubCssPerformanceTest_NOT_BUILT failure); elsewhere resolve the
-// next malloc in the chain, with the glibc weak symbols as a fallback.
+// showed up as a permanent EpubCssPerformanceTest_NOT_BUILT failure under its old name);
+// elsewhere resolve the next malloc in the chain, with the glibc weak symbols as a fallback.
 #if defined(_WIN32)
 static void* rawAlloc(size_t bytes) { return HeapAlloc(GetProcessHeap(), 0, bytes); }
 static void rawFree(void* p) {
@@ -211,7 +211,7 @@ static std::filesystem::path uniqueTempPath(const char* suffix) {
   const unsigned pid = static_cast<unsigned>(getpid());
 #endif
   char name[96];
-  std::snprintf(name, sizeof(name), "cssperf-%u-%u-%llx%s", pid, static_cast<unsigned>(counter.fetch_add(1)), stamp,
+  std::snprintf(name, sizeof(name), "csscache-%u-%u-%llx%s", pid, static_cast<unsigned>(counter.fetch_add(1)), stamp,
                 suffix);
   return std::filesystem::temp_directory_path() / name;
 }
@@ -331,7 +331,7 @@ TEST(CssParser, KeepsOnlyInvisibleValuesOfInvisibilityProperties) {
   std::filesystem::remove(cssPath, rmEc);  // best-effort; see removePath()
 }
 
-TEST(CssParserPerf, CacheSaveLoadAndLowHeapLookup) {
+TEST(CssParserCache, CompileLoadAndLowHeapLookup) {
   const std::string epubPath = FIXTURE_EPUB;
   const char* cssEntry = "OEBPS/styles/large.css";
   const std::string cacheDir = makeTempDir();
