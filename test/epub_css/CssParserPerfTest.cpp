@@ -510,7 +510,9 @@ TEST(CssParserArena, ResidentAndIndexMatchHeapResolution) {
 // index — still resolving identically to the heap path. Uses a stylesheet whose every rule is
 // unique so the pooled resident can't shrink it (unlike the Calibre-style fixture above).
 TEST(CssParserArena, IndexOnlyFallbackMatchesHeapResolution) {
-  constexpr int kDistinct = 400;  // 400 unique styles: pooled ~44 KB, offset index ~3.2 KB
+  // 400 unique styles: resident is a 3.2 KB index plus a 6.8 KB pool (17 B/style, measured);
+  // the offset index alone is 3.2 KB.
+  constexpr int kDistinct = 400;
   std::string css;
   for (int i = 0; i < kDistinct; ++i) {
     css += ".u" + std::to_string(i) + " { margin-top: " + std::to_string(i + 1) +
@@ -538,16 +540,19 @@ TEST(CssParserArena, IndexOnlyFallbackMatchesHeapResolution) {
   ASSERT_TRUE(parser.loadFromCache());
   const std::vector<CssStyle> heapStyles = resolveAll(parser);
 
-  // Arena fits the 8 B/rule offset index (~3.2 KB) but not the ~44 KB distinct-style pool, so
-  // loadArenaResident falls back to the disk-backed index.
-  BuildArena arena(8 * 1024);
+  // Arena fits the 8 B/rule offset index with 256 B to spare, so loadArenaResident falls back
+  // to the disk-backed index. Sized from the index, not the measured pool: 400 distinct records
+  // cost at least their 400 length bytes, so no improvement in style compression can make the
+  // resident layout fit and quietly turn this into a second resident test.
+  const size_t indexBytes = static_cast<size_t>(kDistinct) * 8u;
+  BuildArena arena(indexBytes + 256);
   ASSERT_TRUE(arena.valid());
   parser.clear();
   parser.setIndexArena(&arena);
   parser.setLeanResolve(true);
   ASSERT_TRUE(parser.loadFromCache());
-  EXPECT_LT(arena.used(), static_cast<size_t>(kDistinct) * 16u)
-      << "expected the offset index, not the (much larger) distinct-style pool";
+  EXPECT_FALSE(parser.isArenaResident()) << "expected the offset index, not the distinct-style pool";
+  EXPECT_EQ(arena.used(), indexBytes) << "the offset index should be all that is left in the arena";
   const std::vector<CssStyle> indexStyles = resolveAll(parser);
   for (size_t i = 0; i < probes.size(); ++i) {
     EXPECT_TRUE(stylesEqual(heapStyles[i], indexStyles[i])) << "index-only mismatch at " << i;
