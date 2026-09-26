@@ -8,6 +8,7 @@
 
 #include <array>
 #include <climits>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -379,14 +380,23 @@ class ChapterHtmlSlimParser final : public Print {
   // matches one of these, it records the label as if the element were an inline
   // doc-pagebreak marker. Anchors already labeled this way are not re-recorded if the
   // same element also carries an inline pagebreak attribute.
-  std::vector<std::pair<std::string, std::string>> externalPageBreakAnchors;
+  //
+  // Packed: each entry is "id\0label\0", back to back (memory audit 2026-09, build inventory: the
+  // vector of std::string pairs this replaces held ~3.5 KB of heap for the whole build on a
+  // 72-anchor chapter; the same entries are ~0.9 KB here). Scanned linearly, as the vector was.
+  std::string externalPageBreakAnchorPool;
+  uint16_t externalPageBreakAnchorCount = 0;
+  size_t externalPageBreakLabelBytes = 0;  // sum of label lengths + NULs, to size pageBreakLabelPool
   // Optional label for the start of this XHTML file (NCX entries with no fragment).
   std::string topOfFilePageLabel;
   bool topOfFilePageLabelEmitted = false;
 
   // Page break label mapping: stores the printed page label from EPUB pagebreak markers
-  // and the section page index where that printed page begins.
-  std::vector<std::pair<uint16_t, std::string>> pageBreakLabels;
+  // and the section page index where that printed page begins. Packed like the anchors above:
+  // the page indices in one vector, the labels NUL-separated in one string, in the same order
+  // (was a vector of {uint16_t, std::string}, 28 B per entry on the device before any text).
+  std::vector<uint16_t> pageBreakLabelPages;
+  std::string pageBreakLabelPool;
 
   // Paragraph index tracking for XPath-to-page lookup table.
   // Counts <p> sibling indices (1-based, matching XPath convention) during page building.
@@ -726,12 +736,29 @@ class ChapterHtmlSlimParser final : public Print {
     if (currentTextBlock) currentTextBlock->releaseLayoutScratch();
   }
   const std::string& getAnchorSpillPath() const { return anchorSpillPath; }
-  const std::vector<std::pair<uint16_t, std::string>>& getPageBreakLabels() const { return pageBreakLabels; }
+  size_t pageBreakLabelCount() const { return pageBreakLabelPages.size(); }
+  // Heap held by the label record (for the SCT heap trace).
+  size_t pageBreakLabelHeapBytes() const {
+    return pageBreakLabelPages.capacity() * sizeof(uint16_t) + pageBreakLabelPool.capacity();
+  }
+  // Calls f(pageIndex, label, labelLength) for every recorded printed-page label, in document order.
+  template <typename F>
+  void forEachPageBreakLabel(F&& f) const {
+    const char* label = pageBreakLabelPool.c_str();
+    for (const uint16_t page : pageBreakLabelPages) {
+      const size_t len = std::strlen(label);
+      f(page, label, len);
+      label += len + 1;
+    }
+  }
   const std::vector<ParagraphLutEntry>& getParagraphLutPerPage() const { return paragraphLutPerPage; }
 
   // Supplies printed-page labels from NCX <pageList> for this chapter. `anchors` maps
   // HTML id -> label; an entry with an empty id applies to the first page of this file.
-  void setExternalPageBreakAnchors(std::vector<std::pair<std::string, std::string>> anchors);
+  // Filled entry by entry (no intermediate container): begin, one add per anchor, end.
+  void beginExternalPageBreakAnchors();
+  void addExternalPageBreakAnchor(const std::string& id, const std::string& label);
+  void endExternalPageBreakAnchors();
 
   // Supplies the body font's sibling-size ladder (see FontSizeLadder). Blocks whose
   // effective font size differs from the body resolve to the nearest real font on it.

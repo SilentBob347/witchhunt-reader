@@ -1010,14 +1010,17 @@ void ChapterHtmlSlimParser::recordPageBreakLabel(const std::string& label) {
     return;
   }
   // The section file stores the count as a uint16.
-  if (pageBreakLabels.size() >= 65535) {
+  if (pageBreakLabelPages.size() >= 65535) {
     noteCapOverflow(kCapPageLabels, "printed-page labels per chapter");
     return;
   }
 
   // Record the printed page label for the current rendered section page.
-  // Do not alter pagination; the reader keeps its own page breaks.
-  pageBreakLabels.emplace_back(static_cast<uint16_t>(completedPageCount), label);
+  // Do not alter pagination; the reader keeps its own page breaks. A label is text from the
+  // page list or the markup, never containing a NUL, so the pool's separators are unambiguous.
+  pageBreakLabelPages.push_back(static_cast<uint16_t>(completedPageCount));
+  pageBreakLabelPool.append(label);
+  pageBreakLabelPool.push_back('\0');
 }
 
 void ChapterHtmlSlimParser::wireTextBlock() {
@@ -1061,25 +1064,39 @@ void ChapterHtmlSlimParser::releasePageBlock() {
   }
 }
 
-void ChapterHtmlSlimParser::setExternalPageBreakAnchors(std::vector<std::pair<std::string, std::string>> anchors) {
-  externalPageBreakAnchors.clear();
-  externalPageBreakAnchors.reserve(anchors.size());
-  // One label per matched anchor plus the top-of-file one: size it here so the per-page record
-  // never doubles mid-parse (inline pagebreak markers past this hint still grow it normally).
-  pageBreakLabels.reserve(anchors.size() + 1);
+void ChapterHtmlSlimParser::beginExternalPageBreakAnchors() {
+  externalPageBreakAnchorPool.clear();
+  externalPageBreakAnchorCount = 0;
+  externalPageBreakLabelBytes = 0;
   topOfFilePageLabel.clear();
   topOfFilePageLabelEmitted = false;
-  for (auto& [id, label] : anchors) {
-    if (id.empty()) {
-      // NCX pageTarget with no fragment (e.g. "OEBPS/c9_split_000.xhtml") — applies to the
-      // first rendered page of this chapter. Keep only the first such entry if multiple.
-      if (topOfFilePageLabel.empty()) {
-        topOfFilePageLabel = std::move(label);
-      }
-    } else {
-      externalPageBreakAnchors.emplace_back(std::move(id), std::move(label));
+}
+
+void ChapterHtmlSlimParser::addExternalPageBreakAnchor(const std::string& id, const std::string& label) {
+  if (id.empty()) {
+    // NCX pageTarget with no fragment (e.g. "OEBPS/c9_split_000.xhtml") — applies to the
+    // first rendered page of this chapter. Keep only the first such entry if multiple.
+    if (topOfFilePageLabel.empty()) {
+      topOfFilePageLabel = label;
+      externalPageBreakLabelBytes += label.size() + 1;
     }
+    return;
   }
+  if (externalPageBreakAnchorCount == UINT16_MAX) return;  // the page list itself is u16-counted
+  externalPageBreakAnchorPool.append(id);
+  externalPageBreakAnchorPool.push_back('\0');
+  externalPageBreakAnchorPool.append(label);
+  externalPageBreakAnchorPool.push_back('\0');
+  externalPageBreakAnchorCount++;
+  externalPageBreakLabelBytes += label.size() + 1;
+}
+
+void ChapterHtmlSlimParser::endExternalPageBreakAnchors() {
+  externalPageBreakAnchorPool.shrink_to_fit();
+  // One label per matched anchor plus the top-of-file one: size the record here so it never
+  // doubles mid-parse (inline pagebreak markers past this hint still grow it normally).
+  pageBreakLabelPages.reserve(externalPageBreakAnchorCount + 1u);
+  pageBreakLabelPool.reserve(externalPageBreakLabelBytes);
 }
 
 void ChapterHtmlSlimParser::attachPendingFloatImage(BlockStyle& bs) {
@@ -1476,13 +1493,18 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
   // Match id against NCX-supplied pagebreak anchors (printed page list). If matched,
   // treat this element as if it carried an inline doc-pagebreak marker.
   std::string externalLabel;
-  if (!isPageBreakMarker && !idAttr.empty() && !self->externalPageBreakAnchors.empty()) {
-    for (const auto& [extId, extLabel] : self->externalPageBreakAnchors) {
-      if (extId == idAttr) {
-        externalLabel = extLabel;
+  if (!isPageBreakMarker && !idAttr.empty() && self->externalPageBreakAnchorCount > 0) {
+    const char* entry = self->externalPageBreakAnchorPool.c_str();
+    for (uint16_t i = 0; i < self->externalPageBreakAnchorCount; ++i) {
+      const size_t idLen = std::strlen(entry);
+      const char* extLabel = entry + idLen + 1;
+      const size_t labelLen = std::strlen(extLabel);
+      if (idLen == idAttr.size() && std::memcmp(entry, idAttr.data(), idLen) == 0) {
+        externalLabel.assign(extLabel, labelLen);
         isPageBreakMarker = true;
         break;
       }
+      entry = extLabel + labelLen + 1;
     }
   }
 

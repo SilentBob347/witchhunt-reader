@@ -1073,29 +1073,6 @@ Section::BuildPhaseResult Section::runBuildSetup(BuildState& st) {
     }
   }
 
-  // Load printed-page list entries (NCX <pageList> or EPUB 3 nav page-list) for this
-  // chapter's href, if any. Format: u16 count, then per entry: writeString(href),
-  // writeString(anchor), writeString(label).
-  std::vector<std::pair<std::string, std::string>> externalPageBreakAnchors;
-  {
-    const auto pageListPath = epub->getCachePath() + "/pagelist.bin";
-    FsFile pageListFile;
-    if (Storage.exists(pageListPath.c_str()) && Storage.openFileForRead("SCT", pageListPath, pageListFile)) {
-      uint16_t count = 0;
-      serialization::readPod(pageListFile, count);
-      for (uint16_t i = 0; i < count; i++) {
-        std::string href, anchor, label;
-        serialization::readString(pageListFile, href);
-        serialization::readString(pageListFile, anchor);
-        serialization::readString(pageListFile, label);
-        if (href == st.localPath) {
-          externalPageBreakAnchors.emplace_back(std::move(anchor), std::move(label));
-        }
-      }
-      pageListFile.close();
-    }
-  }
-
   // The visitor's completePageFn captures &st.lut: BuildState lives in a stable unique_ptr,
   // so this reference is valid for the visitor's whole lifetime, including across slices.
   st.visitor = std::make_unique<ChapterHtmlSlimParser>(
@@ -1104,7 +1081,30 @@ Section::BuildPhaseResult Section::runBuildSetup(BuildState& st) {
       [this, &st](std::unique_ptr<Page> page) { st.lut.emplace_back(this->onPageComplete(std::move(page))); },
       p.embeddedStyle, st.contentBase, st.imageBasePath, p.imageRendering, std::move(tocAnchors), st.progressFn,
       st.cssParser, epub->getImageManifest());
-  st.visitor->setExternalPageBreakAnchors(std::move(externalPageBreakAnchors));
+  // Load printed-page list entries (NCX <pageList> or EPUB 3 nav page-list) for this
+  // chapter's href, if any, straight into the parser's packed store (no intermediate vector of
+  // string pairs: memory audit 2026-09, build inventory). Format: u16 count, then per entry:
+  // writeString(href), writeString(anchor), writeString(label).
+  st.visitor->beginExternalPageBreakAnchors();
+  {
+    const auto pageListPath = epub->getCachePath() + "/pagelist.bin";
+    FsFile pageListFile;
+    if (Storage.exists(pageListPath.c_str()) && Storage.openFileForRead("SCT", pageListPath, pageListFile)) {
+      uint16_t count = 0;
+      serialization::readPod(pageListFile, count);
+      std::string href, anchor, label;  // reused across entries
+      for (uint16_t i = 0; i < count; i++) {
+        serialization::readString(pageListFile, href);
+        serialization::readString(pageListFile, anchor);
+        serialization::readString(pageListFile, label);
+        if (href == st.localPath) {
+          st.visitor->addExternalPageBreakAnchor(anchor, label);
+        }
+      }
+      pageListFile.close();
+    }
+  }
+  st.visitor->endExternalPageBreakAnchors();
   st.visitor->setFontSizeLadder(p.fontSizeLadder);
   // Anchors stream to SD as they are found rather than accumulating in the parser; the
   // finalizer below copies the spill into the section file's anchor map. Set before setup(),
@@ -1601,12 +1601,12 @@ Section::BuildPhaseResult Section::runBuildFinalize(BuildState& st) {
     // the question this trace was added to ask. Reported via getAnchorCount() so the line still
     // says how many the chapter had, next to the bytes they would have cost resident.
     const size_t anchorBytes = visitor.getAnchorCount() * sizeof(std::pair<std::string, uint16_t>);
-    const size_t labelBytes = visitor.getPageBreakLabels().size() * sizeof(std::pair<uint16_t, std::string>);
+    const size_t labelBytes = visitor.pageBreakLabelHeapBytes();
     const size_t lutBytes = visitor.getParagraphLutPerPage().size() * 8;
     LOG_INF("HEAP",
             "spine=%d retained: anchors=%u (~%uB, spilled) pageBreakLabels=%u (~%uB) paraLut=%u (~%uB) lut=%u (~%uB)",
             spineIndex, static_cast<unsigned>(visitor.getAnchorCount()), static_cast<unsigned>(anchorBytes),
-            static_cast<unsigned>(visitor.getPageBreakLabels().size()), static_cast<unsigned>(labelBytes),
+            static_cast<unsigned>(visitor.pageBreakLabelCount()), static_cast<unsigned>(labelBytes),
             static_cast<unsigned>(visitor.getParagraphLutPerPage().size()), static_cast<unsigned>(lutBytes),
             static_cast<unsigned>(lut.size()), static_cast<unsigned>(lut.size() * sizeof(uint32_t)));
   }
@@ -1634,12 +1634,13 @@ Section::BuildPhaseResult Section::runBuildFinalize(BuildState& st) {
 
   // Write printed page label map for EPUB pagebreak markers.
   const uint32_t pageBreakMapOffset = file.position();
-  const auto& pageBreakLabelsLocal = visitor.getPageBreakLabels();
-  serialization::writePod(file, static_cast<uint16_t>(pageBreakLabelsLocal.size()));
-  for (const auto& [page, label] : pageBreakLabelsLocal) {
+  serialization::writePod(file, static_cast<uint16_t>(visitor.pageBreakLabelCount()));
+  visitor.forEachPageBreakLabel([this](const uint16_t page, const char* label, const size_t len) {
+    // Byte-for-byte what serialization::writeString writes: u32 length, then the bytes.
     serialization::writePod(file, page);
-    serialization::writeString(file, label);
-  }
+    serialization::writePod(file, static_cast<uint32_t>(len));
+    file.write(reinterpret_cast<const uint8_t*>(label), len);
+  });
 
   // Write per-page paragraph LUT: count + array of {xhtmlByteOffset(u32), paragraphIndex(u16)}.
   // The byte offset lets findXPathForParagraph seek near the target paragraph without scanning
@@ -1701,7 +1702,7 @@ Section::BuildPhaseResult Section::runBuildFinalize(BuildState& st) {
   // (see pageBreakLabelsPending_ for why they are not copied from the parser here). Swap, not
   // clear(), so a rebuilt section also gives back the previous build's block.
   std::vector<std::pair<uint16_t, std::string>>().swap(this->pageBreakLabels);
-  pageBreakLabelsPending_ = !visitor.getPageBreakLabels().empty();
+  pageBreakLabelsPending_ = visitor.pageBreakLabelCount() > 0;
 
   file.close();
 
