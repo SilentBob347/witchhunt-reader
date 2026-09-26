@@ -23,9 +23,11 @@
 #include <vector>
 
 #include "BitmapHelpers.h"
+#include "BuildArena.h"
 #include "HalStorage.h"  // FsFile (stdio-backed shim)
 #include "JpegToBmpConverter.h"
 #include "Print.h"
+#include "ProgressiveJpeg.h"
 #include "ProgressiveJpegDc.h"
 
 #ifndef FIXTURE_DIR
@@ -587,5 +589,173 @@ TEST(JpegToBmpConverter, TwoTargetsRejectsBadArguments) {
   EXPECT_FALSE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, nullptr, 1));
   const JpegToBmpConverter::BmpTarget noSink[1] = {{nullptr, 10, 10}};
   EXPECT_FALSE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, noSink, 1));
+  file.close();
+}
+
+// ---------------------------------------------------------------------------
+// JpegThumbSession (memory audit 2026-09, R9 item 3): Home's cover pass converts a cover a few
+// units at a time and checks for input in between. However the work is sliced, and whatever the
+// caller does with the file between slices, the BMPs must be the one-shot conversion's.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct SessionRun {
+  std::vector<uint8_t> large;
+  std::vector<uint8_t> small;
+  int calls = 0;
+  JpegThumbSession::Status status = JpegThumbSession::Status::Error;
+  bool started = false;
+  bool progressive = false;
+};
+
+SessionRun runSession(const char* name, const uint16_t units, BuildArena* scratch = nullptr) {
+  SessionRun run;
+  FsFile file;
+  EXPECT_TRUE(file.openForRead(fixture(name)));
+  MemoryPrint large;
+  MemoryPrint small;
+  const JpegToBmpConverter::BmpTarget targets[2] = {{&large, 90, 60}, {&small, 40, 28}};
+  {
+    auto session = JpegThumbSession::begin(file, targets, 2, scratch);
+    run.started = session != nullptr;
+    if (!session) return run;
+    run.progressive = session->progressive();
+    do {
+      run.status = session->continueSteps(units);
+      ++run.calls;
+      uint8_t junk[5];  // the caller reads elsewhere in the file between slices
+      file.seek(1);
+      file.read(junk, sizeof(junk));
+    } while (run.status == JpegThumbSession::Status::Running && run.calls < 100000);
+  }
+  file.close();
+  run.large = large.buf;
+  run.small = small.buf;
+  return run;
+}
+
+std::pair<std::vector<uint8_t>, std::vector<uint8_t>> convertTwoOneShot(const char* name) {
+  FsFile file;
+  EXPECT_TRUE(file.openForRead(fixture(name)));
+  MemoryPrint large;
+  MemoryPrint small;
+  const JpegToBmpConverter::BmpTarget targets[2] = {{&large, 90, 60}, {&small, 40, 28}};
+  EXPECT_TRUE(JpegToBmpConverter::jpegFileTo1BitBmpStreamsWithSizes(file, targets, 2));
+  file.close();
+  return {large.buf, small.buf};
+}
+
+void expectSessionMatchesOneShot(const char* name, const bool progressive) {
+  SCOPED_TRACE(name);
+  const auto oneShot = convertTwoOneShot(name);
+  ASSERT_FALSE(oneShot.first.empty());
+  for (const uint16_t units : {uint16_t{1}, uint16_t{7}, uint16_t{UINT16_MAX}}) {
+    const SessionRun run = runSession(name, units);
+    ASSERT_TRUE(run.started) << "units=" << units;
+    EXPECT_EQ(run.progressive, progressive);
+    EXPECT_EQ(run.status, JpegThumbSession::Status::Done) << "units=" << units;
+    EXPECT_EQ(run.large, oneShot.first) << "units=" << units;
+    EXPECT_EQ(run.small, oneShot.second) << "units=" << units;
+    if (units == 1) {
+      EXPECT_GT(run.calls, 4) << "one unit must not finish the image";
+    }
+  }
+}
+
+}  // namespace
+
+TEST(JpegThumbSession, BaselineSlicesMatchTheOneShotConversion) {
+  expectSessionMatchesOneShot("prog_full_420_base.jpg", false);
+}
+
+TEST(JpegThumbSession, ProgressiveSlicesMatchTheOneShotConversion) {
+  expectSessionMatchesOneShot("prog_full_420.jpg", true);
+}
+
+TEST(JpegThumbSession, OddDimensionBaselineCompletes) {
+  const auto oneShot = convertTwoOneShot("odd_420.jpg");
+  const SessionRun run = runSession("odd_420.jpg", 1);
+  ASSERT_TRUE(run.started);
+  EXPECT_EQ(run.status, JpegThumbSession::Status::Done);
+  EXPECT_EQ(run.large, oneShot.first);
+  EXPECT_EQ(run.small, oneShot.second);
+}
+
+// In a lent region the session holds its blocks across slices and gives every byte back when it
+// goes -- Home returns the region to the display right after.
+TEST(JpegThumbSession, HoldsItsRegionBlocksUntilItGoes) {
+  for (const char* name : {"prog_full_420_base.jpg", "prog_full_420.jpg"}) {
+    SCOPED_TRACE(name);
+    const auto oneShot = convertTwoOneShot(name);
+    BuildArena arena(64 * 1024);
+    ASSERT_TRUE(arena.valid());
+    FsFile file;
+    ASSERT_TRUE(file.openForRead(fixture(name)));
+    MemoryPrint large;
+    MemoryPrint small;
+    const JpegToBmpConverter::BmpTarget targets[2] = {{&large, 90, 60}, {&small, 40, 28}};
+    {
+      auto session = JpegThumbSession::begin(file, targets, 2, &arena);
+      ASSERT_NE(session, nullptr);
+      EXPECT_GT(arena.used(), 0u) << "decoder memory and row pipeline come from the region";
+      const size_t held = arena.used();
+      auto status = JpegThumbSession::Status::Running;
+      while (status == JpegThumbSession::Status::Running) {
+        status = session->continueSteps(2);
+        EXPECT_EQ(arena.used(), held) << "nothing is taken or given back between slices";
+      }
+      EXPECT_EQ(status, JpegThumbSession::Status::Done);
+      EXPECT_EQ(session->continueSteps(1), JpegThumbSession::Status::Done) << "a finished session stays finished";
+    }
+    EXPECT_EQ(arena.used(), 0u);
+    file.close();
+    EXPECT_EQ(large.buf, oneShot.first);
+    EXPECT_EQ(small.buf, oneShot.second);
+  }
+}
+
+// Home leaves mid-cover (a book is opened): the session goes unfinished and must leave the
+// region empty so it can go back to the display.
+TEST(JpegThumbSession, AbandonedMidDecodeReleasesEverything) {
+  for (const char* name : {"prog_full_420_base.jpg", "prog_full_420.jpg"}) {
+    SCOPED_TRACE(name);
+    BuildArena arena(64 * 1024);
+    FsFile file;
+    ASSERT_TRUE(file.openForRead(fixture(name)));
+    MemoryPrint large;
+    MemoryPrint small;
+    const JpegToBmpConverter::BmpTarget targets[2] = {{&large, 90, 60}, {&small, 40, 28}};
+    {
+      auto session = JpegThumbSession::begin(file, targets, 2, &arena);
+      ASSERT_NE(session, nullptr);
+      for (int i = 0; i < 3; ++i) EXPECT_EQ(session->continueSteps(1), JpegThumbSession::Status::Running);
+    }
+    EXPECT_EQ(arena.used(), 0u);
+    file.close();
+  }
+}
+
+// A progressive image only the DC preview takes is not sliced; the caller converts it one-shot.
+TEST(JpegThumbSession, RefusesWhatOnlyTheDcPreviewTakes) {
+  FsFile file;
+  ASSERT_TRUE(file.openForRead(fixture("progressive_420.jpg")));
+  MemoryPrint out;
+  const JpegToBmpConverter::BmpTarget target[1] = {{&out, 40, 28}};
+  ProgressiveJpeg::ImageInfo info;
+  const bool fullDecoderTakesIt = ProgressiveJpeg::probe(file, info) == ProgressiveJpeg::Result::Ok;
+  auto session = JpegThumbSession::begin(file, target, 1);
+  EXPECT_EQ(session != nullptr, fullDecoderTakesIt);
+  file.close();
+}
+
+TEST(JpegThumbSession, RejectsBadArguments) {
+  FsFile file;
+  ASSERT_TRUE(file.openForRead(fixture("prog_full_420.jpg")));
+  MemoryPrint out;
+  const JpegToBmpConverter::BmpTarget three[3] = {{&out, 10, 10}, {&out, 10, 10}, {&out, 10, 10}};
+  EXPECT_EQ(JpegThumbSession::begin(file, three, 3), nullptr);
+  EXPECT_EQ(JpegThumbSession::begin(file, nullptr, 1), nullptr);
+  const JpegToBmpConverter::BmpTarget noSink[1] = {{nullptr, 10, 10}};
+  EXPECT_EQ(JpegThumbSession::begin(file, noSink, 1), nullptr);
   file.close();
 }

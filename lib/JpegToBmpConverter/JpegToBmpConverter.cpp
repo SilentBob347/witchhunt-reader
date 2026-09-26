@@ -253,6 +253,10 @@ struct SinkSet {
   // column by column as the output callbacks arrive and shared by every output.
   uint8_t* mcuBuf = nullptr;
   bool error = false;
+  // One-shot conversions give way to button input mid-decode (CooperativeAbort) and are restarted
+  // later. A JpegThumbSession is sliced by its caller instead, which checks for input between
+  // slices; aborting inside one would throw away the work the slicing exists to keep.
+  bool pollAbort = true;
 
   void processRow(const uint8_t* srcRow, const int y) {
     for (int i = 0; i < count; ++i) {
@@ -285,6 +289,12 @@ static bool progressiveFullShouldAbort(void*) {
   return true;
 }
 
+// A JpegThumbSession's decoder: its caller slices the work and checks for input between slices.
+static bool progressiveSessionPoll(void*) {
+  HalSystem::feedWatchdog();
+  return false;
+}
+
 // TJpgDec output callback — receives one MCU-width × MCU-height block at a time,
 // in left-to-right, top-to-bottom order (baseline JPEG). JRECT is inclusive and the
 // grayscale bitmap is packed tightly at the block width. Accumulates columns into
@@ -297,7 +307,7 @@ int tjpgBmpOutput(JDEC* jd, void* bitmap, JRECT* rect) {
   // Yield to pending button input: abort the decode so the main loop can service
   // the press. The partial BMP is discarded by the caller and regenerated later.
   // markAborted() distinguishes this deliberate bail from a plain decode failure.
-  if (CooperativeAbort::shouldAbortLongTask()) {
+  if (sinks->pollAbort && CooperativeAbort::shouldAbortLongTask()) {
     CooperativeAbort::markAborted();
     sinks->error = true;
     return 0;
@@ -557,166 +567,8 @@ static void initOutputGeometry(BmpConvertCtx& ctx, Print& bmpOut, const int effe
   ctx.error = false;
 }
 
-// Everything after the decoder is chosen and the decoded extent (effectiveSrcW x effectiveSrcH)
-// is known, for one or more outputs: each output's geometry, crop window and BMP header, the row
-// pipeline's buffers, then `run(sinks)` drives whichever decoder feeds SinkSet::processRow.
-// needMcuBuf: the TJpgDec path assembles an MCU row before it can process rows; the progressive
-// decoder hands over whole rows.
-template <typename Run>
-static bool convertScaledMulti(const OutputTarget* targets, const int count, const int effectiveSrcW,
-                               const int effectiveSrcH, const bool oneBit, const bool crop, const bool eightBit,
-                               const bool needMcuBuf, BuildArena* scratch, Run&& run) {
-  if (count < 1 || count > kMaxOutputs) return false;
-  // One row per write is one file call per row (see BufferedPrint); coalesce them. With several
-  // outputs each gets half the buffer, so the heap they cost together stays that of one.
-  const size_t bufferBytes = count > 1 ? BufferedPrint::DEFAULT_BUFFER_BYTES / 2 : BufferedPrint::DEFAULT_BUFFER_BYTES;
-  std::optional<BufferedPrint> buffered[kMaxOutputs];
-  BmpConvertCtx ctxs[kMaxOutputs] = {};
-  for (int i = 0; i < count; ++i) {
-    buffered[i].emplace(*targets[i].out, bufferBytes);
-    initOutputGeometry(ctxs[i], *buffered[i], effectiveSrcW, effectiveSrcH, targets[i].targetWidth,
-                       targets[i].targetHeight, oneBit, crop, eightBit);
-  }
-
-  // The row pipeline -- the MCU strip (up to 16 rows of the source width, 16+ KB on a wide
-  // cover, shared by every output), each output's BMP row and scaling accumulators -- comes from
-  // the lent region when there is one, in a block of its own released on every return path; the
-  // heap only when there is not. Home's later visits run this with the reading state's ~35 KB
-  // free, and the 28 KB heap reserve for these buffers refused every remaining cover ("Not enough
-  // heap for JPEG decoder (27528 free, need 28672)", X3 2026-09-26) while 30 KB of the region sat
-  // idle. Each buffer remembers where it came from, so a region that runs out mid-way falls back
-  // to the heap for the rest and the cleanup frees exactly what it owns.
-  const size_t mcuBytes = needMcuBuf ? static_cast<size_t>(MAX_MCU_HEIGHT) * effectiveSrcW : 0;
-  size_t pipelineBytes = mcuBytes + 2 * alignof(std::max_align_t);
-  for (int i = 0; i < count; ++i) {
-    const size_t accumBytes = ctxs[i].needsScaling ? static_cast<size_t>(ctxs[i].outWidth) * sizeof(uint32_t) : 0;
-    pipelineBytes += ctxs[i].bytesPerRow + 2 * accumBytes + 3 * alignof(std::max_align_t);
-  }
-  struct RowScope {
-    BuildArena* arena = nullptr;
-    BuildArena::Block block;
-    ~RowScope() {
-      if (arena != nullptr && block.valid()) arena->release(block);
-    }
-  } rowScope;
-  if (scratch != nullptr && scratch->valid() && scratch->capacity() - scratch->used() >= pipelineBytes) {
-    rowScope.arena = scratch;
-    rowScope.block = scratch->reserveBlock();
-  }
-  SinkSet sinks;
-  sinks.count = count;
-  sinks.srcWidth = effectiveSrcW;
-  sinks.srcHeight = effectiveSrcH;
-  bool mcuOnHeap = false;
-  bool rowOnHeap[kMaxOutputs] = {};
-  bool accumOnHeap[kMaxOutputs] = {};
-  // RAII guard: frees all heap resources on any return path. Declared after the contexts, so it
-  // runs before they (and the BufferedPrints, whose destructors flush) go.
-  struct Cleanup {
-    BmpConvertCtx* ctxs;
-    int count;
-    SinkSet& sinks;
-    const bool& mcuOnHeap;
-    const bool* rowOnHeap;
-    const bool* accumOnHeap;
-    ~Cleanup() {
-      for (int i = 0; i < count; ++i) {
-        BmpConvertCtx& ctx = ctxs[i];
-        if (accumOnHeap[i]) {
-          delete[] ctx.rowAccum;
-          delete[] ctx.rowCount;
-        }
-        delete ctx.atkinsonDitherer;
-        delete ctx.fsDitherer;
-        delete ctx.atkinson1BitDitherer;
-        if (rowOnHeap[i]) free(ctx.bmpRow);
-      }
-      if (mcuOnHeap) free(sinks.mcuBuf);
-    }
-  } cleanup{ctxs, count, sinks, mcuOnHeap, rowOnHeap, accumOnHeap};
-  const auto fromRegion = [&](const size_t bytes) -> uint8_t* {
-    return rowScope.arena != nullptr ? static_cast<uint8_t*>(rowScope.arena->alloc(bytes)) : nullptr;
-  };
-
-  if (needMcuBuf) {
-    sinks.mcuBuf = fromRegion(mcuBytes);
-    if (sinks.mcuBuf == nullptr) {
-      sinks.mcuBuf = static_cast<uint8_t*>(malloc(mcuBytes));
-      mcuOnHeap = sinks.mcuBuf != nullptr;
-    }
-    if (!sinks.mcuBuf) {
-      LOG_ERR("JPG", "Failed to allocate MCU buffer (%d bytes)", MAX_MCU_HEIGHT * effectiveSrcW);
-      return false;
-    }
-    memset(sinks.mcuBuf, 0, mcuBytes);
-  }
-
-  for (int i = 0; i < count; ++i) {
-    BmpConvertCtx& ctx = ctxs[i];
-    ctx.bmpRow = fromRegion(ctx.bytesPerRow);
-    if (ctx.bmpRow == nullptr) {
-      ctx.bmpRow = static_cast<uint8_t*>(malloc(ctx.bytesPerRow));
-      rowOnHeap[i] = ctx.bmpRow != nullptr;
-    }
-    if (!ctx.bmpRow) {
-      LOG_ERR("JPG", "Failed to allocate BMP row buffer");
-      return false;
-    }
-
-    if (ctx.needsScaling) {
-      const size_t accumBytes = static_cast<size_t>(ctx.outWidth) * sizeof(uint32_t);
-      ctx.rowAccum = reinterpret_cast<uint32_t*>(fromRegion(accumBytes));
-      ctx.rowCount = ctx.rowAccum != nullptr ? reinterpret_cast<uint32_t*>(fromRegion(accumBytes)) : nullptr;
-      if (ctx.rowAccum != nullptr && ctx.rowCount != nullptr) {
-        memset(ctx.rowAccum, 0, accumBytes);
-        memset(ctx.rowCount, 0, accumBytes);
-      } else {
-        ctx.rowAccum = new (std::nothrow) uint32_t[ctx.outWidth]();
-        ctx.rowCount = new (std::nothrow) uint32_t[ctx.outWidth]();
-        accumOnHeap[i] = true;
-      }
-      if (!ctx.rowAccum || !ctx.rowCount) {
-        LOG_ERR("JPG", "Failed to allocate scaling buffers");
-        return false;
-      }
-      ctx.nextOutY_srcStart = ctx.scaleY_fp;
-    }
-
-    if (oneBit) {
-      ctx.atkinson1BitDitherer = new (std::nothrow) Atkinson1BitDitherer(ctx.outWidth);
-    } else if (!eightBit) {
-      if (USE_ATKINSON) {
-        ctx.atkinsonDitherer = new (std::nothrow) AtkinsonDitherer(ctx.outWidth);
-      } else if (USE_FLOYD_STEINBERG) {
-        ctx.fsDitherer = new (std::nothrow) FloydSteinbergDitherer(ctx.outWidth);
-      }
-    }
-    sinks.ctx[i] = &ctx;
-  }
-
-  if (!run(sinks)) return false;
-
-  for (int i = 0; i < count; ++i) {
-    const BmpConvertCtx& ctx = ctxs[i];
-    if (ctx.needsScaling && ctx.currentOutY < ctx.outHeight) {
-      LOG_ERR("JPG", "JPEG decode incomplete: %d/%d output rows written", ctx.currentOutY, ctx.outHeight);
-      return false;
-    }
-    if (!buffered[i]->flushBuffer()) {
-      LOG_ERR("JPG", "Failed to flush buffered BMP output");
-      return false;
-    }
-  }
-  return true;
-}
-
-// Heap the progressive path needs beyond its decoder workspace: the row pipeline's buffers
-// (accumulators, BMP row, a ditherer -- a few KB at thumbnail widths) and a floor for the rest.
-constexpr size_t PROGRESSIVE_ROW_PIPELINE_HEAP = 16 * 1024;
-
-// Full progressive decode into the BMP pipeline. Returns false without writing anything when no
-// scale's workspace fits the heap, so the caller can fall back to the DC preview.
-// One scoped block in a lent region, released on every way out of the decode that took it.
+// One scoped block in a lent region, released when the scope goes (LIFO with any block reserved
+// after it: whatever holds a later block must go first).
 struct ArenaBlockScope {
   BuildArena* arena = nullptr;
   BuildArena::Block block;
@@ -735,12 +587,190 @@ struct ArenaBlockScope {
   }
 };
 
-static bool convertFromProgressive(FsFile& jpegFile, const OutputTarget* targets, const int count,
-                                   const ProgressiveJpeg::ImageInfo& info, const bool oneBit, const bool crop,
-                                   const bool eightBit, bool* attempted, BuildArena* scratch, const uint32_t base) {
-  *attempted = false;
-  // The largest DCT pre-scale that keeps both axes >= every target (as the TJpgDec path chooses),
-  // then coarser while the workspace does not fit: a coarser cover beats the 1/8 DC preview.
+// Everything after the decoder is chosen and the decoded extent (srcW x srcH) is known, for one or
+// more outputs: each output's geometry, crop window and BMP header, and the row pipeline's buffers.
+// A one-shot conversion holds one around a single decode; a JpegThumbSession holds one across its
+// slices. needMcuBuf: the TJpgDec path assembles an MCU row before it can process rows; the
+// progressive decoder hands over whole rows.
+class RowPipeline {
+ public:
+  RowPipeline() = default;
+  RowPipeline(const RowPipeline&) = delete;
+  RowPipeline& operator=(const RowPipeline&) = delete;
+  // Frees exactly the heap buffers it took and releases its region block; the BMP streams (whose
+  // destructors flush) go after, as members.
+  ~RowPipeline();
+
+  bool begin(const OutputTarget* targets, int count, int srcW, int srcH, bool oneBit, bool crop, bool eightBit,
+             bool needMcuBuf, BuildArena* scratch);
+  SinkSet& sinks() { return sinks_; }
+  // Every output has all its rows and is flushed to its stream.
+  bool finish();
+
+ private:
+  std::optional<BufferedPrint> buffered_[kMaxOutputs];
+  BmpConvertCtx ctxs_[kMaxOutputs] = {};
+  SinkSet sinks_;
+  int count_ = 0;
+  bool mcuOnHeap_ = false;
+  bool rowOnHeap_[kMaxOutputs] = {};
+  bool accumOnHeap_[kMaxOutputs] = {};
+  BuildArena* arena_ = nullptr;
+  BuildArena::Block block_;
+};
+
+RowPipeline::~RowPipeline() {
+  for (int i = 0; i < count_; ++i) {
+    BmpConvertCtx& ctx = ctxs_[i];
+    if (accumOnHeap_[i]) {
+      delete[] ctx.rowAccum;
+      delete[] ctx.rowCount;
+    }
+    delete ctx.atkinsonDitherer;
+    delete ctx.fsDitherer;
+    delete ctx.atkinson1BitDitherer;
+    if (rowOnHeap_[i]) free(ctx.bmpRow);
+  }
+  if (mcuOnHeap_) free(sinks_.mcuBuf);
+  if (arena_ != nullptr && block_.valid()) arena_->release(block_);
+}
+
+bool RowPipeline::begin(const OutputTarget* targets, const int count, const int effectiveSrcW, const int effectiveSrcH,
+                        const bool oneBit, const bool crop, const bool eightBit, const bool needMcuBuf,
+                        BuildArena* scratch) {
+  if (count < 1 || count > kMaxOutputs || count_ != 0) return false;
+  count_ = count;
+  // One row per write is one file call per row (see BufferedPrint); coalesce them. With several
+  // outputs each gets half the buffer, so the heap they cost together stays that of one.
+  const size_t bufferBytes = count > 1 ? BufferedPrint::DEFAULT_BUFFER_BYTES / 2 : BufferedPrint::DEFAULT_BUFFER_BYTES;
+  for (int i = 0; i < count; ++i) {
+    buffered_[i].emplace(*targets[i].out, bufferBytes);
+    initOutputGeometry(ctxs_[i], *buffered_[i], effectiveSrcW, effectiveSrcH, targets[i].targetWidth,
+                       targets[i].targetHeight, oneBit, crop, eightBit);
+  }
+
+  // The row pipeline -- the MCU strip (up to 16 rows of the source width, 16+ KB on a wide
+  // cover, shared by every output), each output's BMP row and scaling accumulators -- comes from
+  // the lent region when there is one, in a block of its own released on every return path; the
+  // heap only when there is not. Home's later visits run this with the reading state's ~35 KB
+  // free, and the 28 KB heap reserve for these buffers refused every remaining cover ("Not enough
+  // heap for JPEG decoder (27528 free, need 28672)", X3 2026-09-26) while 30 KB of the region sat
+  // idle. Each buffer remembers where it came from, so a region that runs out mid-way falls back
+  // to the heap for the rest and the cleanup frees exactly what it owns.
+  const size_t mcuBytes = needMcuBuf ? static_cast<size_t>(MAX_MCU_HEIGHT) * effectiveSrcW : 0;
+  size_t pipelineBytes = mcuBytes + 2 * alignof(std::max_align_t);
+  for (int i = 0; i < count; ++i) {
+    const size_t accumBytes = ctxs_[i].needsScaling ? static_cast<size_t>(ctxs_[i].outWidth) * sizeof(uint32_t) : 0;
+    pipelineBytes += ctxs_[i].bytesPerRow + 2 * accumBytes + 3 * alignof(std::max_align_t);
+  }
+  if (scratch != nullptr && scratch->valid() && scratch->capacity() - scratch->used() >= pipelineBytes) {
+    arena_ = scratch;
+    block_ = scratch->reserveBlock();
+  }
+  sinks_.count = count;
+  sinks_.srcWidth = effectiveSrcW;
+  sinks_.srcHeight = effectiveSrcH;
+  const auto fromRegion = [&](const size_t bytes) -> uint8_t* {
+    return arena_ != nullptr ? static_cast<uint8_t*>(arena_->alloc(bytes)) : nullptr;
+  };
+
+  if (needMcuBuf) {
+    sinks_.mcuBuf = fromRegion(mcuBytes);
+    if (sinks_.mcuBuf == nullptr) {
+      sinks_.mcuBuf = static_cast<uint8_t*>(malloc(mcuBytes));
+      mcuOnHeap_ = sinks_.mcuBuf != nullptr;
+    }
+    if (!sinks_.mcuBuf) {
+      LOG_ERR("JPG", "Failed to allocate MCU buffer (%d bytes)", MAX_MCU_HEIGHT * effectiveSrcW);
+      return false;
+    }
+    memset(sinks_.mcuBuf, 0, mcuBytes);
+  }
+
+  for (int i = 0; i < count; ++i) {
+    BmpConvertCtx& ctx = ctxs_[i];
+    ctx.bmpRow = fromRegion(ctx.bytesPerRow);
+    if (ctx.bmpRow == nullptr) {
+      ctx.bmpRow = static_cast<uint8_t*>(malloc(ctx.bytesPerRow));
+      rowOnHeap_[i] = ctx.bmpRow != nullptr;
+    }
+    if (!ctx.bmpRow) {
+      LOG_ERR("JPG", "Failed to allocate BMP row buffer");
+      return false;
+    }
+
+    if (ctx.needsScaling) {
+      const size_t accumBytes = static_cast<size_t>(ctx.outWidth) * sizeof(uint32_t);
+      ctx.rowAccum = reinterpret_cast<uint32_t*>(fromRegion(accumBytes));
+      ctx.rowCount = ctx.rowAccum != nullptr ? reinterpret_cast<uint32_t*>(fromRegion(accumBytes)) : nullptr;
+      if (ctx.rowAccum != nullptr && ctx.rowCount != nullptr) {
+        memset(ctx.rowAccum, 0, accumBytes);
+        memset(ctx.rowCount, 0, accumBytes);
+      } else {
+        ctx.rowAccum = new (std::nothrow) uint32_t[ctx.outWidth]();
+        ctx.rowCount = new (std::nothrow) uint32_t[ctx.outWidth]();
+        accumOnHeap_[i] = true;
+      }
+      if (!ctx.rowAccum || !ctx.rowCount) {
+        LOG_ERR("JPG", "Failed to allocate scaling buffers");
+        return false;
+      }
+      ctx.nextOutY_srcStart = ctx.scaleY_fp;
+    }
+
+    if (oneBit) {
+      ctx.atkinson1BitDitherer = new (std::nothrow) Atkinson1BitDitherer(ctx.outWidth);
+    } else if (!eightBit) {
+      if (USE_ATKINSON) {
+        ctx.atkinsonDitherer = new (std::nothrow) AtkinsonDitherer(ctx.outWidth);
+      } else if (USE_FLOYD_STEINBERG) {
+        ctx.fsDitherer = new (std::nothrow) FloydSteinbergDitherer(ctx.outWidth);
+      }
+    }
+    sinks_.ctx[i] = &ctx;
+  }
+
+  return true;
+}
+
+bool RowPipeline::finish() {
+  for (int i = 0; i < count_; ++i) {
+    const BmpConvertCtx& ctx = ctxs_[i];
+    if (ctx.needsScaling && ctx.currentOutY < ctx.outHeight) {
+      LOG_ERR("JPG", "JPEG decode incomplete: %d/%d output rows written", ctx.currentOutY, ctx.outHeight);
+      return false;
+    }
+    if (!buffered_[i]->flushBuffer()) {
+      LOG_ERR("JPG", "Failed to flush buffered BMP output");
+      return false;
+    }
+  }
+  return true;
+}
+
+// A one-shot conversion: the pipeline around `run(sinks)`, which drives whichever decoder feeds
+// SinkSet::processRow to the end.
+template <typename Run>
+static bool convertScaledMulti(const OutputTarget* targets, const int count, const int effectiveSrcW,
+                               const int effectiveSrcH, const bool oneBit, const bool crop, const bool eightBit,
+                               const bool needMcuBuf, BuildArena* scratch, Run&& run) {
+  RowPipeline pipeline;
+  if (!pipeline.begin(targets, count, effectiveSrcW, effectiveSrcH, oneBit, crop, eightBit, needMcuBuf, scratch)) {
+    return false;
+  }
+  if (!run(pipeline.sinks())) return false;
+  return pipeline.finish();
+}
+
+// Heap the progressive path needs beyond its decoder workspace: the row pipeline's buffers
+// (accumulators, BMP row, a ditherer -- a few KB at thumbnail widths) and a floor for the rest.
+constexpr size_t PROGRESSIVE_ROW_PIPELINE_HEAP = 16 * 1024;
+
+// The DCT pre-scale for a full progressive decode: the largest that keeps both axes >= every
+// target (as the TJpgDec path chooses), then coarser while the workspace does not fit -- a coarser
+// cover beats the 1/8 DC preview. False when no scale fits.
+static bool chooseProgressiveShift(const OutputTarget* targets, const int count, const ProgressiveJpeg::ImageInfo& info,
+                                   BuildArena* scratch, uint8_t* shiftOut) {
   uint8_t shift = 0;
   {
     const float scaleMax = finestTargetScale(targets, count, info.width, info.height);
@@ -767,9 +797,21 @@ static bool convertFromProgressive(FsFile& jpegFile, const OutputTarget* targets
             static_cast<unsigned>(ESP.getFreeHeap()));
     return false;
   }
+  if ((info.width >> shift) <= 0 || (info.height >> shift) <= 0) return false;
+  *shiftOut = shift;
+  return true;
+}
+
+// Full progressive decode into the BMP pipeline. Returns false without writing anything when no
+// scale's workspace fits the heap, so the caller can fall back to the DC preview.
+static bool convertFromProgressive(FsFile& jpegFile, const OutputTarget* targets, const int count,
+                                   const ProgressiveJpeg::ImageInfo& info, const bool oneBit, const bool crop,
+                                   const bool eightBit, bool* attempted, BuildArena* scratch, const uint32_t base) {
+  *attempted = false;
+  uint8_t shift = 0;
+  if (!chooseProgressiveShift(targets, count, info, scratch, &shift)) return false;
   const int effectiveSrcW = info.width >> shift;
   const int effectiveSrcH = info.height >> shift;
-  if (effectiveSrcW <= 0 || effectiveSrcH <= 0) return false;
   *attempted = true;
   LOG_DBG("JPG", "Progressive cover %ux%u at 1/%d -> %dx%d (%d output%s)", info.width, info.height, 1 << shift,
           effectiveSrcW, effectiveSrcH, count, count == 1 ? "" : "s");
@@ -794,6 +836,114 @@ static bool convertFromProgressive(FsFile& jpegFile, const OutputTarget* targets
                               }
                               return true;
                             });
+}
+
+// A baseline decode prepared up to its first MCU: the work pool (lent region or heap), the decoder
+// object, its I/O session and the scale the targets need. Holds pointers into itself (jdec.device,
+// the pool), so it stays where it was built.
+struct TjpgJob {
+  ArenaBlockScope poolScope;
+  std::unique_ptr<uint8_t[]> heapPool;
+  BmpTjpgSession io{nullptr, nullptr};
+  JDEC jdec{};
+  uint8_t scale = 0;
+  int effectiveSrcW = 0;
+  int effectiveSrcH = 0;
+
+  TjpgJob() = default;
+  TjpgJob(const TjpgJob&) = delete;
+  TjpgJob& operator=(const TjpgJob&) = delete;
+
+  bool prepare(FsFile& jpegFile, uint32_t base, const OutputTarget* targets, int count, BuildArena* scratch);
+};
+
+bool TjpgJob::prepare(FsFile& jpegFile, const uint32_t base, const OutputTarget* targets, const int count,
+                      BuildArena* scratch) {
+  // The work pool comes from the lent region when there is one (its allocations are max-aligned,
+  // satisfying TJpgDec's word-alignment requirement); the heap then only owes the row pipeline.
+  uint8_t* pool = poolScope.take(scratch, TJPG_WORK_POOL_SIZE);
+  // With the pool in the region, the row pipeline comes from it too when the room is there (MCU
+  // strip 16 KB at most + rows; see RowPipeline), and the heap then owes only the ditherers and
+  // the BMP output buffering -- a few KB. The full reserve applies otherwise.
+  constexpr size_t ROWS_IN_REGION_MIN_FREE_HEAP = 8 * 1024;
+  const bool rowsInRegion =
+      pool != nullptr && scratch->capacity() - scratch->used() >= static_cast<size_t>(MAX_MCU_HEIGHT) * 1200 + 8 * 1024;
+  const size_t heapFloor = rowsInRegion      ? ROWS_IN_REGION_MIN_FREE_HEAP
+                           : pool != nullptr ? MIN_FREE_HEAP - TJPG_WORK_POOL_SIZE
+                                             : MIN_FREE_HEAP;
+  if (ESP.getFreeHeap() < heapFloor) {
+    LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", ESP.getFreeHeap(),
+            static_cast<unsigned>(heapFloor));
+    return false;
+  }
+
+  jpegFile.seek(base);
+
+  if (pool == nullptr) {
+    // new[] is max-aligned, satisfying TJpgDec's word-alignment requirement.
+    heapPool.reset(new (std::nothrow) uint8_t[TJPG_WORK_POOL_SIZE]);
+    if (!heapPool) {
+      LOG_ERR("JPG", "Failed to allocate TJpgDec work pool (%u bytes)", static_cast<unsigned>(TJPG_WORK_POOL_SIZE));
+      return false;
+    }
+    pool = heapPool.get();
+  }
+
+  io.file = &jpegFile;
+  io.sinks = nullptr;  // set once the contexts are built, just before the first MCU
+
+  const JRESULT jr = jd_prepare(&jdec, tjpgBmpInput, pool, TJPG_WORK_POOL_SIZE, &io);
+  if (jr != JDR_OK) {
+    LOG_ERR("JPG", "TJpgDec prepare failed (jr=%d)", jr);
+    return false;
+  }
+
+  const int srcWidth = jdec.width;
+  const int srcHeight = jdec.height;
+  LOG_DBG("JPG", "JPEG dimensions: %dx%d", srcWidth, srcHeight);
+
+  constexpr int MAX_IMAGE_WIDTH = 2048;
+  constexpr int MAX_IMAGE_HEIGHT = 3072;
+
+  if (srcWidth <= 0 || srcHeight <= 0 || srcWidth > MAX_IMAGE_WIDTH || srcHeight > MAX_IMAGE_HEIGHT) {
+    LOG_DBG("JPG", "Image too large or invalid (%dx%d), max supported: %dx%d", srcWidth, srcHeight, MAX_IMAGE_WIDTH,
+            MAX_IMAGE_HEIGHT);
+    return false;
+  }
+
+  // Pick the largest DCT pre-scale that keeps both axes >= every target so the fine scaler
+  // always downscales (never upscales) on either axis. `scale` is the TJpgDec scale exponent
+  // (0=1/1, 1=1/2, 2=1/4, 3=1/8). Using max(scaleX, scaleY) is safe for both crop=true (uses max
+  // scale) and crop=false (uses min scale).
+  int jpegScaleDenom = 1;
+  {
+    const float scaleMax = finestTargetScale(targets, count, srcWidth, srcHeight);
+    if (scaleMax <= 0.125f) {
+      scale = 3;
+      jpegScaleDenom = 8;
+    } else if (scaleMax <= 0.25f) {
+      scale = 2;
+      jpegScaleDenom = 4;
+    } else if (scaleMax <= 0.5f) {
+      scale = 1;
+      jpegScaleDenom = 2;
+    }
+  }
+
+  // TJpgDec's descaled output is floor(dim / 2^scale): every MCU side (8 or 16 px) is a
+  // multiple of the scale denominator, so the per-MCU right/bottom shifts sum to exactly
+  // the floor. These MUST match TJpgDec's actual output extent — the output callback only
+  // flushes an MCU row once a block reaches `srcWidth`, so an over-estimate (e.g. ceil
+  // division on an odd dimension like 333 -> 167 vs TJpgDec's 166) means the last column
+  // never arrives and zero rows are ever written.
+  effectiveSrcW = srcWidth / jpegScaleDenom;
+  effectiveSrcH = srcHeight / jpegScaleDenom;
+
+  if (jpegScaleDenom > 1) {
+    LOG_DBG("JPG", "Using 1/%d DCT scale: %dx%d -> %dx%d", jpegScaleDenom, srcWidth, srcHeight, effectiveSrcW,
+            effectiveSrcH);
+  }
+  return true;
 }
 
 // Internal implementation with configurable target sizes and bit depth: one decode, one BMP per target.
@@ -834,108 +984,22 @@ static bool jpegFileToBmpStreamsInternal(FsFile& jpegFile, const OutputTarget* t
     return true;
   }
 
-  // The work pool comes from the lent region when there is one (its allocations are max-aligned,
-  // satisfying TJpgDec's word-alignment requirement); the heap then only owes the row pipeline.
-  ArenaBlockScope poolScope;
-  uint8_t* pool = poolScope.take(scratch, TJPG_WORK_POOL_SIZE);
-  std::unique_ptr<uint8_t[]> heapPool;
-  // With the pool in the region, convertScaledMulti takes the row pipeline from it too when the
-  // room is there (MCU strip 16 KB at most + rows; see there), and the heap then owes only the
-  // ditherers and the BMP output buffering -- a few KB. The full reserve applies otherwise.
-  constexpr size_t ROWS_IN_REGION_MIN_FREE_HEAP = 8 * 1024;
-  const bool rowsInRegion =
-      pool != nullptr && scratch->capacity() - scratch->used() >= static_cast<size_t>(MAX_MCU_HEIGHT) * 1200 + 8 * 1024;
-  const size_t heapFloor = rowsInRegion      ? ROWS_IN_REGION_MIN_FREE_HEAP
-                           : pool != nullptr ? MIN_FREE_HEAP - TJPG_WORK_POOL_SIZE
-                                             : MIN_FREE_HEAP;
-  if (ESP.getFreeHeap() < heapFloor) {
-    LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", ESP.getFreeHeap(),
-            static_cast<unsigned>(heapFloor));
-    return false;
-  }
-
-  jpegFile.seek(base);
-
-  if (pool == nullptr) {
-    // new[] is max-aligned, satisfying TJpgDec's word-alignment requirement.
-    heapPool.reset(new (std::nothrow) uint8_t[TJPG_WORK_POOL_SIZE]);
-    if (!heapPool) {
-      LOG_ERR("JPG", "Failed to allocate TJpgDec work pool (%u bytes)", static_cast<unsigned>(TJPG_WORK_POOL_SIZE));
-      return false;
-    }
-    pool = heapPool.get();
-  }
-
-  BmpTjpgSession session;
-  session.file = &jpegFile;
-  session.sinks = nullptr;  // set once the contexts are built, just before jd_decomp
-
-  JDEC jdec;
-  JRESULT jr = jd_prepare(&jdec, tjpgBmpInput, pool, TJPG_WORK_POOL_SIZE, &session);
-  if (jr != JDR_OK) {
-    LOG_ERR("JPG", "TJpgDec prepare failed (jr=%d)", jr);
-    return false;
-  }
-
-  const int srcWidth = jdec.width;
-  const int srcHeight = jdec.height;
-  LOG_DBG("JPG", "JPEG dimensions: %dx%d", srcWidth, srcHeight);
-
-  constexpr int MAX_IMAGE_WIDTH = 2048;
-  constexpr int MAX_IMAGE_HEIGHT = 3072;
-
-  if (srcWidth <= 0 || srcHeight <= 0 || srcWidth > MAX_IMAGE_WIDTH || srcHeight > MAX_IMAGE_HEIGHT) {
-    LOG_DBG("JPG", "Image too large or invalid (%dx%d), max supported: %dx%d", srcWidth, srcHeight, MAX_IMAGE_WIDTH,
-            MAX_IMAGE_HEIGHT);
-    return false;
-  }
-
-  // Pick the largest DCT pre-scale that keeps both axes >= every target so the fine scaler
-  // always downscales (never upscales) on either axis. tjpgScale is the TJpgDec scale
-  // exponent (0=1/1, 1=1/2, 2=1/4, 3=1/8). Using max(scaleX, scaleY) is safe for both
-  // crop=true (uses max scale) and crop=false (uses min scale).
-  uint8_t tjpgScale = 0;
-  int jpegScaleDenom = 1;
-  {
-    const float scaleMax = finestTargetScale(targets, count, srcWidth, srcHeight);
-    if (scaleMax <= 0.125f) {
-      tjpgScale = 3;
-      jpegScaleDenom = 8;
-    } else if (scaleMax <= 0.25f) {
-      tjpgScale = 2;
-      jpegScaleDenom = 4;
-    } else if (scaleMax <= 0.5f) {
-      tjpgScale = 1;
-      jpegScaleDenom = 2;
-    }
-  }
-
-  // TJpgDec's descaled output is floor(dim / 2^scale): every MCU side (8 or 16 px) is a
-  // multiple of the scale denominator, so the per-MCU right/bottom shifts sum to exactly
-  // the floor. These MUST match TJpgDec's actual output extent — the output callback only
-  // flushes an MCU row once a block reaches `srcWidth`, so an over-estimate (e.g. ceil
-  // division on an odd dimension like 333 -> 167 vs TJpgDec's 166) means the last column
-  // never arrives and zero rows are ever written.
-  const int effectiveSrcW = srcWidth / jpegScaleDenom;
-  const int effectiveSrcH = srcHeight / jpegScaleDenom;
-
-  if (jpegScaleDenom > 1) {
-    LOG_DBG("JPG", "Using 1/%d DCT scale: %dx%d -> %dx%d", jpegScaleDenom, srcWidth, srcHeight, effectiveSrcW,
-            effectiveSrcH);
-  }
-
+  TjpgJob job;
+  if (!job.prepare(jpegFile, base, targets, count, scratch)) return false;
   const bool ok =
-      convertScaledMulti(targets, count, effectiveSrcW, effectiveSrcH, oneBit, crop, eightBit,
+      convertScaledMulti(targets, count, job.effectiveSrcW, job.effectiveSrcH, oneBit, crop, eightBit,
                          /*needMcuBuf=*/true, scratch, [&](SinkSet& sinks) {
-                           session.sinks = &sinks;
-                           const JRESULT jr = jd_decomp(&jdec, tjpgBmpOutput, tjpgScale);
+                           job.io.sinks = &sinks;
+                           const JRESULT jr = jd_decomp(&job.jdec, tjpgBmpOutput, job.scale);
                            if (jr != JDR_OK || sinks.error) {
                              LOG_ERR("JPG", "TJpgDec decode failed (jr=%d, ctxErr=%d)", jr, sinks.error ? 1 : 0);
                              return false;
                            }
                            return true;
                          });
-  if (ok) LOG_DBG("JPG", "Successfully converted JPEG to BMP");
+  if (ok) {
+    LOG_DBG("JPG", "Successfully converted JPEG to BMP");
+  }
   return ok;
 }
 
@@ -977,4 +1041,124 @@ bool JpegToBmpConverter::jpegFileToBmpStreamWithSize(FsFile& jpegFile, Print& bm
 bool JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(FsFile& jpegFile, Print& bmpOut, int targetMaxWidth,
                                                          int targetMaxHeight, BuildArena* scratch) {
   return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, true, true, false, scratch);
+}
+
+// ---- JpegThumbSession ----------------------------------------------------------------------
+
+struct JpegThumbSession::Impl {
+  // Region blocks are released in reverse order of declaration: the decoder's working memory
+  // (the progressive workspace, or the TJpgDec pool inside `tjpg`) is taken before the row
+  // pipeline's block, so it is declared first and goes last.
+  ArenaBlockScope workspaceScope;
+  TjpgJob tjpg;
+  RowPipeline pipeline;
+  ProgressiveJpeg::Decoder decoder;  // ends (and rewinds the file) before the rest goes
+  JDCURSOR cursor{};
+  // TJpgDec reads the file as a stream; whatever the caller reads between slices must not move it.
+  uint32_t streamPos = 0;
+  bool isProgressive = false;
+  Status status = Status::Running;
+};
+
+JpegThumbSession::JpegThumbSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+JpegThumbSession::~JpegThumbSession() = default;
+
+bool JpegThumbSession::progressive() const { return impl_->isProgressive; }
+
+std::unique_ptr<JpegThumbSession> JpegThumbSession::begin(FsFile& jpegFile,
+                                                          const JpegToBmpConverter::BmpTarget* targets, const int count,
+                                                          BuildArena* scratch) {
+  if (!jpegFile || targets == nullptr || count < 1 || count > kMaxOutputs) return nullptr;
+  OutputTarget converted[kMaxOutputs];
+  for (int i = 0; i < count; ++i) {
+    if (targets[i].out == nullptr) return nullptr;
+    converted[i] = OutputTarget{targets[i].out, targets[i].maxWidth, targets[i].maxHeight};
+  }
+  const uint32_t base = static_cast<uint32_t>(jpegFile.position());
+  std::unique_ptr<Impl> impl(new (std::nothrow) Impl());
+  if (!impl) return nullptr;
+
+  ProgressiveJpeg::ImageInfo full;
+  if (ProgressiveJpeg::probe(jpegFile, full, base) == ProgressiveJpeg::Result::Ok) {
+    uint8_t shift = 0;
+    if (!chooseProgressiveShift(converted, count, full, scratch, &shift)) return nullptr;  // DC preview: one-shot
+    const int effectiveSrcW = full.width >> shift;
+    const int effectiveSrcH = full.height >> shift;
+    const size_t workspaceBytes = ProgressiveJpeg::workspaceBytes(full, shift);
+    uint8_t* workspace = impl->workspaceScope.take(scratch, workspaceBytes);
+    if (!impl->pipeline.begin(converted, count, effectiveSrcW, effectiveSrcH, /*oneBit=*/true, /*crop=*/true,
+                              /*eightBit=*/false, /*needMcuBuf=*/false, scratch)) {
+      return nullptr;
+    }
+    impl->pipeline.sinks().pollAbort = false;
+    ProgressiveJpeg::DecodeOptions options;
+    options.base = base;
+    options.scaleShift = shift;
+    options.shouldAbort = progressiveSessionPoll;
+    options.workspace = workspace;  // null: the decoder takes one heap block for the session
+    options.workspaceSize = workspace != nullptr ? workspaceBytes : 0;
+    const auto result = impl->decoder.begin(jpegFile, options, progressiveBandOutput, &impl->pipeline.sinks());
+    if (result != ProgressiveJpeg::Result::Ok) {
+      LOG_ERR("JPG", "Progressive cover session refused (%s)", ProgressiveJpeg::resultName(result));
+      return nullptr;
+    }
+    impl->isProgressive = true;
+    LOG_DBG("JPG", "Sliced progressive cover %ux%u at 1/%d -> %dx%d (%d output%s)", full.width, full.height, 1 << shift,
+            effectiveSrcW, effectiveSrcH, count, count == 1 ? "" : "s");
+  } else {
+    ProgressiveJpegDc::ImageInfo dc;
+    if (ProgressiveJpegDc::probe(jpegFile, dc, base) == ProgressiveJpegDc::Result::Ok) {
+      jpegFile.seek(base);
+      return nullptr;  // progressive, but only the DC preview takes it: one-shot
+    }
+    if (!impl->tjpg.prepare(jpegFile, base, converted, count, scratch)) return nullptr;
+    if (!impl->pipeline.begin(converted, count, impl->tjpg.effectiveSrcW, impl->tjpg.effectiveSrcH, /*oneBit=*/true,
+                              /*crop=*/true, /*eightBit=*/false, /*needMcuBuf=*/true, scratch)) {
+      return nullptr;
+    }
+    impl->pipeline.sinks().pollAbort = false;
+    impl->tjpg.io.sinks = &impl->pipeline.sinks();
+    impl->streamPos = static_cast<uint32_t>(jpegFile.position());
+    LOG_DBG("JPG", "Sliced baseline cover -> %dx%d (%d output%s)", impl->tjpg.effectiveSrcW, impl->tjpg.effectiveSrcH,
+            count, count == 1 ? "" : "s");
+  }
+  return std::unique_ptr<JpegThumbSession>(new (std::nothrow) JpegThumbSession(std::move(impl)));
+}
+
+JpegThumbSession::Status JpegThumbSession::continueSteps(const uint16_t units) {
+  Impl& s = *impl_;
+  if (s.status != Status::Running) return s.status;
+  SinkSet& sinks = s.pipeline.sinks();
+  bool finished = false;
+  if (s.isProgressive) {
+    const auto result = s.decoder.step(units);
+    if (result == ProgressiveJpeg::Result::Pending && !sinks.error) return Status::Running;
+    if (result != ProgressiveJpeg::Result::Ok || sinks.error) {
+      LOG_ERR("JPG", "Progressive cover decode failed (%s, ctxErr=%d)", ProgressiveJpeg::resultName(result),
+              sinks.error ? 1 : 0);
+      s.decoder.end();
+      s.status = Status::Error;
+      return s.status;
+    }
+    s.decoder.end();
+    finished = true;
+  } else {
+    FsFile& file = *s.tjpg.io.file;
+    if (static_cast<uint32_t>(file.position()) != s.streamPos && !file.seek(s.streamPos)) {
+      LOG_ERR("JPG", "Cover session: cannot seek back to %u", static_cast<unsigned>(s.streamPos));
+      s.status = Status::Error;
+      return s.status;
+    }
+    const JRESULT jr = jd_decomp_rows(&s.tjpg.jdec, tjpgBmpOutput, s.tjpg.scale, &s.cursor, units == 0 ? 1 : units);
+    s.streamPos = static_cast<uint32_t>(file.position());
+    if (jr != JDR_OK || sinks.error) {
+      LOG_ERR("JPG", "TJpgDec decode failed (jr=%d, ctxErr=%d)", jr, sinks.error ? 1 : 0);
+      s.status = Status::Error;
+      return s.status;
+    }
+    finished = s.cursor.done != 0;
+  }
+  if (!finished) return Status::Running;
+  s.status = s.pipeline.finish() ? Status::Done : Status::Error;
+  return s.status;
 }
