@@ -34,6 +34,11 @@ struct SidecarFilesFixture : testing::Test {
     std::ofstream(work / name, std::ios::binary) << "x";
   }
   std::string p(const std::string& name) const { return (work / name).string(); }
+  // A second name for the same file, as a case-insensitive filesystem answers to. A host that is
+  // case-insensitive itself already does, and would refuse the link.
+  void alias(const std::string& name, const std::string& otherCase) {
+    if (!fs::exists(work / otherCase)) fs::create_hard_link(work / name, work / otherCase);
+  }
 };
 
 TEST_F(SidecarFilesFixture, BasePathStripsTheExtension) {
@@ -99,14 +104,19 @@ TEST_F(SidecarFilesFixture, ExistingExtensionsIgnoresUnrelatedNeighbours) {
 // The tables list every extension in both cases, and the SD card is FAT/exFAT,
 // which answers to either. One file must therefore be reported once - a caller
 // that moves them would otherwise rename it twice, the second failing because
-// the first already moved it. (On a case-sensitive host this passes trivially;
-// it is the case-insensitive platforms, including the device, that need it.)
+// the first already moved it. The host filesystem is case-sensitive, so a hard
+// link gives each file its upper-case name the way FAT would; without it this
+// passes whether or not anything is deduplicated.
 TEST_F(SidecarFilesFixture, OneFileIsReportedOncePerExtension) {
   touch("book.epub");
   touch("book.jpg");
+  touch("book.opf");
+  alias("book.jpg", "book.JPG");
+  alias("book.opf", "book.OPF");
   const auto found = SidecarFiles::existingExtensions(p("book.epub"));
-  ASSERT_EQ(found.size(), 1u) << "a single cover reported under both .jpg and .JPG";
+  ASSERT_EQ(found.size(), 2u) << "a single file reported under both cases of its extension";
   EXPECT_STREQ(found[0], ".jpg");
+  EXPECT_STREQ(found[1], ".opf");
 }
 
 TEST_F(SidecarFilesFixture, ExtensionlessBookHasNoSidecars) {
