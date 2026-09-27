@@ -928,6 +928,10 @@ void ReaderActivity::onEnter() {
     size_t lentSize = 0;
     if (firstOpenIndexing && renderer.hasSecondaryBuffer()) {
       RenderLock lock;
+      // The popup's swap left the write buffer holding the pre-popup frame; the return below seeds
+      // the secondary from it. Make that the frame on the panel, so the reader's own overlays
+      // composite onto what is actually displayed.
+      renderer.syncWriteBufferFromDisplayed();
       lentForIndexing = renderer.borrowSecondaryBuffer(&lentSize);
       if (lentForIndexing) {
         renderer.setSingleBufferFastDiff(true);

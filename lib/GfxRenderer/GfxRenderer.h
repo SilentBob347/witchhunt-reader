@@ -426,8 +426,10 @@ class GfxRenderer {
   // Make the write framebuffer match the currently displayed frame. Call before
   // a partial repaint that patches a few regions and re-displays without
   // re-rendering the full frame: displayBuffer() ends with swapBuffers(), so
-  // the write buffer otherwise holds the frame from two refreshes ago. No-op in
-  // single-buffer mode, where the write buffer is already the displayed frame.
+  // the write buffer otherwise holds the frame from two refreshes ago. No-op
+  // while the secondary is released or lent -- and a borrow does not fix the
+  // write buffer up: it is still two refreshes old until the next full render.
+  // Call this BEFORE borrowSecondaryBuffer() when the next draw may be an overlay.
   void syncWriteBufferFromDisplayed() const { display.syncWriteBufferFromActive(); }
 
   // Temporarily free the secondary (previous-frame) buffer (~52 KB) during
