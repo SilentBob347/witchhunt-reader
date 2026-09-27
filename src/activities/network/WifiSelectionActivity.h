@@ -121,6 +121,10 @@ class WifiSelectionActivity final : public Activity {
   void appendHiddenNetworkEntry();
   void buildAutoCycleCandidates();
   void tryNextAutoCycleCandidate();
+  // True while the saved-network flow runs on its own (last-network attempt, the scan feeding the
+  // cycle, the cycle itself) - the phases Back cancels and Confirm interrupts to show the list.
+  bool isAutoConnectInProgress() const;
+  void showNetworkListFromAutoConnect();
   void selectNetwork(int index);
   void promptHiddenSsid();
   void promptPasswordEntry();

@@ -1,5 +1,7 @@
 // Hidden-network entry ported from crosspoint-reader (PR #2360 by Mr.Catfood). Reworked here so the
 // synthetic entry stays out of the saved-network auto-cycle.
+// Interruptible auto-connect ported from crosspoint-reader (PR #2189 by Alexander Hoffer). Reworked
+// here onto the AUTO_CONNECTING -> scan -> AUTO_CYCLING flow this activity already had.
 #include "WifiSelectionActivity.h"
 
 #include <GfxRenderer.h>
@@ -182,6 +184,10 @@ void WifiSelectionActivity::onEnter() {
         return;
       }
     }
+
+    // No usable last network (never set, or since forgotten), but other saved networks may be in
+    // range: let the scan feed the auto-cycle instead of going straight to the list.
+    autoCycleAfterScan = !WIFI_STORE.getCredentials().empty();
   }
 
   // Fallback to scanning
@@ -302,6 +308,47 @@ void WifiSelectionActivity::tryNextAutoCycleCandidate() {
 
   prepareForConnect();
   issueWifiBegin();
+}
+
+bool WifiSelectionActivity::isAutoConnectInProgress() const {
+  switch (state) {
+    case WifiSelectionState::AUTO_CONNECTING:
+    case WifiSelectionState::AUTO_CYCLING:
+      return true;
+    case WifiSelectionState::SCANNING:
+      return autoCycleAfterScan;
+    case WifiSelectionState::NETWORK_LIST:
+    case WifiSelectionState::HIDDEN_SSID_ENTRY:
+    case WifiSelectionState::PASSWORD_ENTRY:
+    case WifiSelectionState::CONNECTING:
+    case WifiSelectionState::CONNECTED:
+    case WifiSelectionState::SAVE_PROMPT:
+    case WifiSelectionState::CONNECTION_FAILED:
+    case WifiSelectionState::FORGET_PROMPT:
+    case WifiSelectionState::CAPTIVE_PORTAL:
+      return false;
+  }
+  return false;
+}
+
+void WifiSelectionActivity::showNetworkListFromAutoConnect() {
+  LOG_DBG("WIFI", "User stopped auto-connect, showing network list");
+  autoConnecting = false;
+  autoCycleAfterScan = false;
+  autoCycleCandidates.clear();
+  autoCycleCandidateIndex = 0;
+
+  // AUTO_CONNECTING runs before any scan, so there is no list to show yet. startWifiScan()
+  // disconnects the attempt in flight before it scans.
+  if (networks.empty()) {
+    startWifiScan();
+    return;
+  }
+
+  WiFi.disconnect();
+  state = WifiSelectionState::NETWORK_LIST;
+  selectedNetworkIndex = 0;
+  requestUpdate();
 }
 
 void WifiSelectionActivity::processWifiScanResults() {
@@ -768,6 +815,17 @@ void WifiSelectionActivity::checkConnectionStatus() {
 void WifiSelectionActivity::loop() {
   // Check scan progress
   if (state == WifiSelectionState::SCANNING) {
+    if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+      WiFi.scanDelete();
+      onComplete(false);
+      return;
+    }
+    if (autoCycleAfterScan && mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+      // Let the scan finish, but land on the list rather than cycling through saved networks
+      LOG_DBG("WIFI", "User stopped auto-connect during scan");
+      autoCycleAfterScan = false;
+      requestUpdate();
+    }
     processWifiScanResults();
     return;
   }
@@ -775,6 +833,17 @@ void WifiSelectionActivity::loop() {
   // Check connection progress
   if (state == WifiSelectionState::CONNECTING || state == WifiSelectionState::AUTO_CONNECTING ||
       state == WifiSelectionState::AUTO_CYCLING) {
+    if (isAutoConnectInProgress()) {
+      if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+        WiFi.disconnect();
+        onComplete(false);
+        return;
+      }
+      if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+        showNetworkListFromAutoConnect();
+        return;
+      }
+    }
     checkConnectionStatus();
     return;
   }
@@ -1085,20 +1154,52 @@ void WifiSelectionActivity::renderNetworkList() const {
 }
 
 void WifiSelectionActivity::renderConnecting() const {
+  // The saved-network strings run long in some languages (German, Catalan, Ukrainian), so the
+  // status wraps onto a second line instead of running off the screen.
+  constexpr int MAX_STATUS_LINES = 2;
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const int statusWidth = renderer.getScreenWidth() - metrics.contentSidePadding * 2;
   const auto pageHeight = renderer.getScreenHeight();
   const auto height = renderer.getLineHeight(UI_10_FONT_ID);
   const auto top = (pageHeight - height) / 2;
+  const bool autoConnect = isAutoConnectInProgress();
 
   if (state == WifiSelectionState::SCANNING) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_SCANNING));
+    const auto lines = renderer.wrappedText(UI_10_FONT_ID, autoConnect ? tr(STR_FINDING_SAVED_WIFI) : tr(STR_SCANNING),
+                                            statusWidth, MAX_STATUS_LINES);
+    int y = top;
+    for (const auto& line : lines) {
+      renderer.drawCenteredText(UI_10_FONT_ID, y, line.c_str());
+      y += height;
+    }
   } else {
-    renderer.drawCenteredText(UI_12_FONT_ID, top - 40, tr(STR_CONNECTING), true, EpdFontFamily::BOLD);
+    // Bottom-aligned on the line the single-line title used to sit on, so a wrapped title grows
+    // upwards and never runs into the SSID below it.
+    const int titleHeight = renderer.getLineHeight(UI_12_FONT_ID);
+    const auto lines =
+        renderer.wrappedText(UI_12_FONT_ID, autoConnect ? tr(STR_CONNECTING_SAVED_WIFI) : tr(STR_CONNECTING),
+                             statusWidth, MAX_STATUS_LINES, EpdFontFamily::BOLD);
+    int y = top - 40 - (static_cast<int>(lines.size()) - 1) * titleHeight;
+    for (const auto& line : lines) {
+      renderer.drawCenteredText(UI_12_FONT_ID, y, line.c_str(), true, EpdFontFamily::BOLD);
+      y += titleHeight;
+    }
 
     std::string ssidInfo = std::string(tr(STR_TO_PREFIX)) + selectedSSID;
     if (ssidInfo.length() > 25) {
       ssidInfo.replace(22, ssidInfo.length() - 22, "...");
     }
     renderer.drawCenteredText(UI_10_FONT_ID, top, ssidInfo.c_str());
+  }
+
+  // Back cancels any scan; while the saved-network flow runs on its own, Confirm stops it and
+  // shows the list. A manual connect takes no input, so it gets no hints.
+  if (autoConnect) {
+    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_SHOW_NETWORKS), "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  } else if (state == WifiSelectionState::SCANNING) {
+    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 }
 
