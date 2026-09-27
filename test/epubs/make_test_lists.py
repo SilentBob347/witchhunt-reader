@@ -21,14 +21,23 @@ The cases below cover each place the indent can come from:
   5. indent on the item          the list zeroed, the item carrying the inset
   6. nested lists                each level adds its own indent
   7. ordered list, start=3       counter and marker; same default indent
-  8. paragraphs inside <li>      every block in the item keeps the list inset
+  8. paragraphs inside <li>      every block in the item keeps the list inset,
+                                 and the marker opens the first paragraph
+                                 instead of sitting on a line of its own
   9. a wrapping item             its continuation lines keep the inset too
- 10. sibling after the lists     back at the text edge
+ 10. anchor before the <p>       an empty inline element does not strand the
+                                 marker either
+ 11. an empty item               still shows its marker, which must not leak
+                                 into the next item
+ 12. an item opening with a list the outer marker keeps a line of its own
+ 13. sibling after the lists     back at the text edge
 
 At the corpus font 1em = 18px, so the goldens read: case 1 at LINE x=45 (and
 18px right inset), case 2 at 27, case 3 at 45, case 4 at 0, case 5 at 36,
-case 6 at 27 then 54, case 7 at 27, case 8 at 27, case 9 at 27 on every line,
-case 10 back at 0.
+case 6 at 27 then 54, case 7 at 27, case 8 at 27 with the marker in front of
+the first paragraph, case 9 at 27 on every line, case 10 like case 8, case 11
+a lone marker then a marked item, case 12 a lone marker at 27 then the inner
+item at 54, case 13 back at 0.
 
 Regenerate with:  python test/epubs/make_test_lists.py
 then refresh goldens: UPDATE_GOLDENS=1 ctest -R EpubPipeline
@@ -187,8 +196,27 @@ CHAPTER = """<?xml version="1.0" encoding="UTF-8"?>
     line of it has to start at the same list inset as the first.</li>
   </ul>
 
-  <!-- 10. After the lists ─────────────────────────────────────────────────── -->
-  <p>10. SIBLING: back at the text edge.</p>
+  <!-- 10. Anchor before the paragraph ───────────────────────────────────── -->
+  <p>10. ANCHORED:</p>
+  <ul>
+    <li><a id="juliet"/><p>Juliet anchored paragraph</p></li>
+  </ul>
+
+  <!-- 11. An empty item ─────────────────────────────────────────────────── -->
+  <p>11. EMPTY ITEM:</p>
+  <ul>
+    <li></li>
+    <li>Kilo two</li>
+  </ul>
+
+  <!-- 12. An item opening with a list ───────────────────────────────────── -->
+  <p>12. OPENS WITH A LIST:</p>
+  <ul>
+    <li><ul><li>Lima inner</li></ul></li>
+  </ul>
+
+  <!-- 13. After the lists ─────────────────────────────────────────────────── -->
+  <p>13. SIBLING: back at the text edge.</p>
 
 </body>
 </html>

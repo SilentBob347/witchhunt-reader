@@ -297,6 +297,11 @@ class ChapterHtmlSlimParser final : public Print {
     bool suppressMarker = false;  // true when list-style-type: none
   };
   std::vector<ListEntry> listStack;
+  // The open <li>'s marker ("•", "3."), held back until the item has content: the item's block
+  // stays empty, so a <p> opening the item merges into it and the marker leads that paragraph's
+  // first line instead of a line of its own. Empty when no marker is waiting.
+  char pendingListMarker_[16] = {};
+  void emitPendingListMarker();
 
   // Ancestor block widths set via an explicit CSS `width` (e.g. a
   // <div style="width:100px"> wrapper). A percentage image width resolves against the

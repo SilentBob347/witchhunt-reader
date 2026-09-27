@@ -878,6 +878,9 @@ bool ChapterHtmlSlimParser::flushPartWordBuffer() {
     fontStyle = static_cast<EpdFontFamily::Style>(fontStyle | EpdFontFamily::SMALL_CAPS);
   }
 
+  // The item's first word: its marker goes in front of it.
+  emitPendingListMarker();
+
   // flush the buffer — route to table cell text when inside a <td>/<th>
   partWordBuffer[partWordBufferIndex] = '\0';
   if (currentTableCell && currentTableCell->text) {
@@ -1322,6 +1325,12 @@ void ChapterHtmlSlimParser::finalizePendingDropCap() {
           capWidth + kDropCapGapPx, zoneHeight);
 }
 
+void ChapterHtmlSlimParser::emitPendingListMarker() {
+  if (pendingListMarker_[0] == '\0') return;
+  if (currentTextBlock) currentTextBlock->addWord(pendingListMarker_, EpdFontFamily::REGULAR);
+  pendingListMarker_[0] = '\0';
+}
+
 void ChapterHtmlSlimParser::addAncestorInsets(BlockStyle& style, const float emSize) const {
   if (blockInsetStack_.empty()) return;
   int left = style.leftInset();
@@ -1453,6 +1462,15 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
   if (self->svgDepth > 0 && !matches(name, IMAGE_TAGS, NUM_IMAGE_TAGS)) {
     self->depth += 1;
     return;
+  }
+
+  // A held-back list marker waits only through the empty-block merge of a <p>/<div> opening the
+  // item. Content that is not text -- a nested item, an image, a table, a rule, a line break --
+  // takes it at once, so the marker stays in the item's own block, ahead of that content.
+  if (self->pendingListMarker_[0] != '\0' &&
+      (strcmp(name, "li") == 0 || matches(name, IMAGE_TAGS, NUM_IMAGE_TAGS) || strcmp(name, "table") == 0 ||
+       strcmp(name, "hr") == 0 || strcmp(name, "br") == 0)) {
+    self->emitPendingListMarker();
   }
 
   // Extract class, style, id, hidden, and pagebreak metadata attributes
@@ -2500,13 +2518,12 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
             self->listStack.back().counter += 1;
           }
           if (!self->listStack.back().suppressMarker) {
-            char marker[16];
+            char* marker = self->pendingListMarker_;
             if (self->listStack.back().isOrdered) {
-              snprintf(marker, sizeof(marker), "%d.", self->listStack.back().counter);
+              snprintf(marker, sizeof(self->pendingListMarker_), "%d.", self->listStack.back().counter);
             } else {
               strcpy(marker, "\xe2\x80\xa2");
             }
-            self->currentTextBlock->addWord(marker, EpdFontFamily::REGULAR);
           }
         }
       } else if (strcmp(name, "pre") == 0) {
@@ -3077,6 +3094,12 @@ void ChapterHtmlSlimParser::endElement(void* userData, const char* name) {
         self->nextWordContinues = true;
       }
     }
+  }
+
+  // An item that closes without text (<li></li>, or one holding only hidden content) still shows
+  // its marker, and a marker never outlives its item into the text after the list.
+  if (strcmp(name, "li") == 0 || strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0) {
+    self->emitPendingListMarker();
   }
 
   self->depth -= 1;
