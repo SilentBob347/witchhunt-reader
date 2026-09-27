@@ -238,6 +238,13 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     // "Indexing" popup, the cold-font popup, anything drawn with drawPopup) lands on it. Copy the
     // displayed frame in while the secondary still holds it.
     renderer.syncWriteBufferFromDisplayed();
+    // Seed RED RAM with the displayed frame too, which the SDK requires before single-buffer fast
+    // diff. A two-buffer FAST loads RED from the previous frame when it STARTS and leaves it
+    // there, so RED now holds whatever preceded Home. Unseeded, the first refresh after the lend
+    // -- a carousel move, or Settings' entry frame when Home exits without redrawing -- skips
+    // every pixel the new frame shares with that older screen, and Home's ink stays on the glass
+    // there. Runs before the borrow, while the secondary still holds the displayed frame.
+    if (!renderer.isX3()) renderer.syncRedRamFromFrameBuffer();
     size_t lentSize = 0;
     if (uint8_t* lent = renderer.borrowSecondaryBuffer(&lentSize)) {
       coverScratch_ = makeUniqueNoThrow<BuildArena>(lent, lentSize);
@@ -245,9 +252,9 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
         secondaryBufferLent = true;
         lentRegion_ = lent;
         lentRegionBytes_ = lentSize;
-        // Keep X4 fast-differential refresh alive while the secondary buffer is lent: the
-        // controller still holds the last home frame in RED RAM and displayBuffer() re-seeds it
-        // after every refresh (syncRedRamFromFrameBuffer), so carousel/menu navigation diffs
+        // Keep X4 fast-differential refresh alive while the secondary buffer is lent: RED RAM
+        // was seeded with the home frame above and the driver re-seeds it after every
+        // single-buffer refresh, so carousel/menu navigation diffs
         // against that baseline instead of downgrading to a full/half waveform on every press.
         // Precondition holds: we lend right after the first home render (gate requires
         // firstRenderDone) and only issue plain BW redraws until the return. No-op on X3.
@@ -783,7 +790,7 @@ void HomeActivity::restoreSecondaryBuffer(bool callerHoldsRenderLock) {
     // Two-buffer differential is available again — turn off the single-buffer RED-RAM-baseline
     // mode so normal fast refresh resumes against the secondary. No syncRedRamFromFrameBuffer()
     // here: the return re-seeds the baseline exactly as a realloc does, and RED already holds the
-    // home frame.
+    // home frame -- seeded at the lend, and re-seeded by every single-buffer refresh since.
     renderer.setSingleBufferFastDiff(false);
     LOG_DBG("HOME", "Returned secondary framebuffer after cover loading (free=%lu contig=%lu)",
             static_cast<unsigned long>(esp_get_free_heap_size()),
