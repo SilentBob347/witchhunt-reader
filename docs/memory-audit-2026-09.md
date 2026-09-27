@@ -1255,6 +1255,32 @@ costs tens of milliseconds against a 1.5–4.5 s re-decode. A baseline
 checkpoint is ~50 bytes plus a file offset (the tables come back from the
 header).
 
+**R10 — the image lane parks instead of restarting.** *Done 2026-09-27 on
+branch `reader/resumable-image-lane` (stacked on R9's branch); device-validated
+on the X3 in run 23.* The lane must return the lent region on every page turn,
+so a decode it cannot finish used to be thrown away: runs 18–21 discarded 73 s
+of preempted decodes against 54 s completed. A JPEG decode stopped for input
+between two rows of blocks now parks. Its caches keep their finished rows in
+`.part` files, and a checkpoint next to the image holds the decoder's state
+(11 720 B progressive, ~30 B baseline) and the pipeline's (area carry, Atkinson
+error rows): 17.8–18.0 KB in all. The next warm, or the page turn onto the
+image, resumes it. The lane now warms at the page's real offsets, so its caches
+match rendered ones and a page turn can pick up its checkpoints.
+
+*Run 23 (X3, Strange Pictures chapters 3–4, cache wiped, pages turned during
+decodes):* 29 parks at 27–54 ms (median 35), 30 resumes at 16–24 ms (median 21),
+no refused or discarded checkpoint, no error. Eleven images parked; every one
+that the run reached finished without redoing a band — one 131-band image
+parked at band 111 after 4.4 s and finished in 0.7 s on resume, where the old
+lane would have started it over. Page renders median 518 ms, as before.
+
+Open: (a) the first warm of an image extracts it from the EPUB first — 1.6 s
+for a 514 KB JPEG, not interruptible, so a page turn pressed then waits; this
+book's 78 JPEGs are all deflated, so decoding in place is no way out here, and
+parking the inflate (a 32 KB window) is the candidate; (b) a resume that meets
+input at once parks again with no progress (three times, 118–265 ms each);
+(c) PNG images and the DC-only progressive preview still restart.
+
 *R3 residual, the `KOSyncWorker` stack (F6):* re-examined 2026-09-26. The
 worker task is created by `post()` before its job releases the framebuffer
 for the network session, so the 10 KB stack is allocated while the buffer
