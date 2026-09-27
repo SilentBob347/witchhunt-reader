@@ -2706,9 +2706,13 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
     // <small>/<big> carry UA-default sizes (80%/120%) even without any CSS rule.
     const bool isSmallTag = strcmp(name, "small") == 0;
     const bool isBigTag = strcmp(name, "big") == 0;
+    // Block containers that are not BLOCK_TAGS (<ul>, <blockquote>, <section>, ...) land here too,
+    // for their font properties. Their margin-left is an inset (blockInsetStack_), not a per-line
+    // indent: taken as one it overwrote the text-indent of the paragraph still open before them.
+    const bool spanIndent = cssStyle.hasMarginLeft() && !matches(name, INSET_CONTAINER_TAGS, NUM_INSET_CONTAINER_TAGS);
     if (cssStyle.hasFontWeight() || cssStyle.hasFontStyle() || cssStyle.hasTextDecoration() ||
-        cssStyle.hasVerticalAlign() || cssStyle.hasSmallCaps() || cssStyle.hasMarginLeft() ||
-        cssStyle.hasFontSizeMultiplier() || isSmallTag || isBigTag) {
+        cssStyle.hasVerticalAlign() || cssStyle.hasSmallCaps() || spanIndent || cssStyle.hasFontSizeMultiplier() ||
+        isSmallTag || isBigTag) {
       // Flush buffer before style change so preceding text gets current style
       if (self->partWordBufferIndex > 0) {
         const bool endsAtDashBreak = bufferEndsWithBreakableDash(self->partWordBuffer, self->partWordBufferIndex);
@@ -2750,7 +2754,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
         entry.hasSmallCaps = true;
         entry.smallCaps = cssStyle.smallCaps;
       }
-      if (cssStyle.hasMarginLeft()) {
+      if (spanIndent) {
         // margin-left on an inline span acts as a per-line indent (poem stanza pattern).
         // Applied immediately to the current block because the span closes before the
         // trailing <br>, so the indent must be on the block that receives the text.
