@@ -369,8 +369,8 @@ TEST(CssParserCache, CompileLoadAndLowHeapLookup) {
   EXPECT_TRUE(std::filesystem::exists(cacheFilePath));
 
   // Load into a fresh parser, as a later open of the book does. endCacheCompile() already
-  // loaded the index into the compiling parser, and clear() keeps that vector's capacity, so
-  // reloading there allocates nothing and the footprint bounds below would pass on 0 bytes.
+  // loaded the index into the compiling parser, so loading there again short-circuits,
+  // allocates nothing, and the footprint bounds below would pass on 0 bytes.
   CssParser parser(cacheFileRoot);
 #if CSS_TEST_HEAP_HOOKS
   const size_t loadedCacheLiveBytes = measureLiveBytes([&] { ASSERT_TRUE(parser.loadFromCache()); });
@@ -415,6 +415,59 @@ TEST(CssParserCache, CompileLoadAndLowHeapLookup) {
   std::error_code rmEc;
   std::filesystem::remove(cssPath, rmEc);  // best-effort; see removePath()
 }
+
+#if CSS_TEST_HEAP_HOOKS
+// clear() and clearCaches()' over-10 KB eviction exist to hand the index's heap back. Both used
+// vector::clear(), which keeps the capacity: the 8 B/rule index a first open loads stayed
+// allocated for the whole reading session, even under builds that resolve from the borrowed
+// arena and never touch the heap vector again.
+TEST(CssParserCache, ClearAfterCompileReleasesTheIndex) {
+  const std::string cacheDir = makeTempDir();
+  const std::vector<uint8_t> cssData = readZipEntry(FIXTURE_EPUB, "OEBPS/styles/large.css");
+  ASSERT_FALSE(cssData.empty());
+  std::string cssPath;
+  ASSERT_TRUE(writeTempCssFile(cssData, cssPath));
+
+  // Epub::parseCssFiles' sequence: compile (which ends by loading the index), then clear().
+  CssParser parser(cacheDir);
+  const size_t retained = measureLiveBytes([&] {
+    ASSERT_TRUE(compileCache(parser, cssPath));
+    ASSERT_EQ(parser.ruleCount(), kFixtureRuleCount);
+    parser.clear();
+  });
+  EXPECT_LT(retained, kFixtureRuleCount * 8 / 4) << "clear() kept the index allocated";
+
+  removePath(cacheDir);
+  std::error_code rmEc;
+  std::filesystem::remove(cssPath, rmEc);
+}
+
+TEST(CssParserCache, OversizedIndexEvictionReleasesIt) {
+  const std::string cacheDir = makeTempDir();
+  const std::vector<uint8_t> cssData = readZipEntry(FIXTURE_EPUB, "OEBPS/styles/large.css");
+  ASSERT_FALSE(cssData.empty());
+  std::string cssPath;
+  ASSERT_TRUE(writeTempCssFile(cssData, cssPath));
+  {
+    CssParser compiler(cacheDir);
+    ASSERT_TRUE(compileCache(compiler, cssPath));
+  }
+
+  // 1500 rules x 8 B is over clearCaches()' 10 KB retain limit, so a section build's end evicts it.
+  CssParser parser(cacheDir);
+  const size_t retained = measureLiveBytes([&] {
+    ASSERT_TRUE(parser.loadFromCache());
+    parser.clearCaches();
+  });
+  EXPECT_LT(retained, kFixtureRuleCount * 8 / 4) << "the over-10 KB eviction kept the index allocated";
+  EXPECT_TRUE(parser.loadFromCache()) << "an evicted index must reload from disk";
+  EXPECT_EQ(parser.ruleCount(), kFixtureRuleCount);
+
+  removePath(cacheDir);
+  std::error_code rmEc;
+  std::filesystem::remove(cssPath, rmEc);
+}
+#endif  // CSS_TEST_HEAP_HOOKS
 
 // ---------------------------------------------------------------------------
 // Phase-2 arena CSS (docs/compiled-book-pipeline-plan.md): a build running in the
