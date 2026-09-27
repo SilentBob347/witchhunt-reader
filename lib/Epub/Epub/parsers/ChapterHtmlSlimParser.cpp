@@ -1331,19 +1331,38 @@ void ChapterHtmlSlimParser::emitPendingListMarker() {
   pendingListMarker_[0] = '\0';
 }
 
-void ChapterHtmlSlimParser::applyListBottomSpacing(const ListEntry& list) {
-  if ((list.marginBottom <= 0 && list.paddingBottom <= 0) || !currentTextBlock) return;
+void ChapterHtmlSlimParser::holdBottomSpacing(BlockStyle& style, const bool floated) {
+  // A block inside a table cell is not the cell's text (see flushPartWordBuffer); leave it as is.
+  if (currentTableCell) return;
+  if (floated) {
+    // A float is out of flow: its bottom margin never moves the blocks after it. Left on the
+    // style it would, through the empty-block merge, land under the paragraph beside the float.
+    style.marginBottom = 0;
+    style.paddingBottom = 0;
+    return;
+  }
+  const int16_t marginBottom = std::max<int16_t>(style.marginBottom, 0);
+  const int16_t paddingBottom = std::max<int16_t>(style.paddingBottom, 0);
+  if (marginBottom == 0 && paddingBottom == 0) return;
+  if (heldBottomSpacing_.size() >= kMaxHeldBottomSpacingDepth) return;
+  heldBottomSpacing_.push_back({depth, marginBottom, paddingBottom});
+  style.marginBottom = 0;
+  style.paddingBottom = 0;
+}
+
+void ChapterHtmlSlimParser::applyHeldBottomSpacing(const HeldBottomSpacing& held) {
+  if (!currentTextBlock) return;
   if (partWordBufferIndex > 0) flushPartWordBuffer();
   BlockStyle style = currentTextBlock->getBlockStyle();
   if (currentTextBlock->isEmpty()) {
-    // Nothing of the list is left to lay out (its last item was empty, or an image or a table):
+    // Nothing of the element is left to lay out (it was empty, or ended in an image or a table):
     // the spacing goes before whatever follows, which this empty block merges into.
-    style.marginTop = std::max(style.marginTop, list.marginBottom);
-    style.paddingTop = static_cast<int16_t>(style.paddingTop + list.paddingBottom);
+    style.marginTop = std::max(style.marginTop, held.marginBottom);
+    style.paddingTop = static_cast<int16_t>(style.paddingTop + held.paddingBottom);
   } else {
-    // The last item's own margin-bottom and the list's collapse into the larger of the two.
-    style.marginBottom = std::max(style.marginBottom, list.marginBottom);
-    style.paddingBottom = static_cast<int16_t>(style.paddingBottom + list.paddingBottom);
+    // The last block's own margin-bottom and the element's collapse into the larger of the two.
+    style.marginBottom = std::max(style.marginBottom, held.marginBottom);
+    style.paddingBottom = static_cast<int16_t>(style.paddingBottom + held.paddingBottom);
   }
   currentTextBlock->setBlockStyle(style);
 }
@@ -2394,8 +2413,8 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
 
   // Track CSS float depth — used to detect inline images beside paragraph text.
   // Fixed-size array, cap at kMaxFloatDepth — deeper nesting is pathological.
-  if (cssStyle.hasCssFloat() && cssStyle.cssFloat != CssFloat::None &&
-      self->floatDepth_ < ChapterHtmlSlimParser::kMaxFloatDepth) {
+  const bool isFloated = cssStyle.hasCssFloat() && cssStyle.cssFloat != CssFloat::None;
+  if (isFloated && self->floatDepth_ < ChapterHtmlSlimParser::kMaxFloatDepth) {
     self->floatOpenDepths_[self->floatDepth_] = self->depth;
     self->floatOpenSides_[self->floatDepth_] = (cssStyle.cssFloat == CssFloat::Right);
     self->floatDepth_++;
@@ -2430,10 +2449,9 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
 
   // A list is a block with vertical spacing of its own. It starts an empty block holding its top
   // spacing, which the first item merges into (collapsing with the item's margin-top, as under a
-  // wrapper <div>); its bottom spacing waits for </ul>, since that merge would put it under the
-  // first item. The block's horizontal inset is the enclosing one, not the list's (pushed below,
-  // for the items): a marker still waiting from an enclosing <li> lands in it. Table cells lay
-  // their text out apart from the page's blocks, so a list inside one is left alone.
+  // wrapper <div>); its bottom spacing is held for </ul> like any block element's. The block's horizontal inset is the
+  // enclosing one, not the list's (pushed below, for the items): a marker still waiting from an enclosing <li> lands in
+  // it. Table cells lay their text out apart from the page's blocks, so a list inside one is left alone.
   if (isList && !self->currentTableCell) {
     if (self->partWordBufferIndex > 0 && !self->flushPartWordBuffer()) return;
     BlockStyle listTop = BlockStyle::fromCssStyle(
@@ -2442,8 +2460,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
     listTop.paddingTop = userAlignmentBlockStyle.paddingTop;
     self->addAncestorInsets(listTop, emSize);
     self->startNewTextBlock(listTop);
-    self->listStack.back().marginBottom = userAlignmentBlockStyle.marginBottom;
-    self->listStack.back().paddingBottom = userAlignmentBlockStyle.paddingBottom;
+    self->holdBottomSpacing(userAlignmentBlockStyle, isFloated);
   }
 
   if ((ownInsetLeft > 0 || ownInsetRight > 0) &&
@@ -2486,6 +2503,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
         headerBlockStyle.fontSizeMultiplier = kHeadingMultiplier[level - 1];
       }
     }
+    self->holdBottomSpacing(headerBlockStyle, isFloated);
     self->startNewTextBlock(headerBlockStyle);
     self->boldUntilDepth = std::min(self->boldUntilDepth, self->depth);
     self->updateEffectiveInlineStyle();
@@ -2499,6 +2517,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
         blockStyle.alignment = cssStyle.textAlign;
         blockStyle.textAlignDefined = true;
       }
+      self->holdBottomSpacing(blockStyle, isFloated);
       self->startNewTextBlock(blockStyle);
       self->updateEffectiveInlineStyle();
 
@@ -2540,6 +2559,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
         blockStyle.alignment = cssStyle.textAlign;
         blockStyle.textAlignDefined = true;
       }
+      self->holdBottomSpacing(blockStyle, isFloated);
       self->startNewTextBlock(blockStyle);
       self->updateEffectiveInlineStyle();
 
@@ -3160,8 +3180,13 @@ void ChapterHtmlSlimParser::endElement(void* userData, const char* name) {
 
   // Pop list entries whose ul/ol is now out of scope
   while (!self->listStack.empty() && self->listStack.back().depth >= self->depth) {
-    self->applyListBottomSpacing(self->listStack.back());
     self->listStack.pop_back();
+  }
+
+  // Apply held bottom spacing whose block-level element is now out of scope
+  while (!self->heldBottomSpacing_.empty() && self->heldBottomSpacing_.back().depth >= self->depth) {
+    self->applyHeldBottomSpacing(self->heldBottomSpacing_.back());
+    self->heldBottomSpacing_.pop_back();
   }
 
   // Pop explicit-width container entries whose block is now out of scope

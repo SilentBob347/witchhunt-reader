@@ -295,12 +295,8 @@ class ChapterHtmlSlimParser final : public Print {
     bool isOrdered;
     int counter;
     bool suppressMarker = false;  // true when list-style-type: none
-    // The list's bottom spacing, held until </ul>/</ol> so it lands after the last item.
-    int16_t marginBottom = 0;
-    int16_t paddingBottom = 0;
   };
   std::vector<ListEntry> listStack;
-  void applyListBottomSpacing(const ListEntry& list);
   // The open <li>'s marker ("•", "3."), held back until the item has content: the item's block
   // stays empty, so a <p> opening the item merges into it and the marker leads that paragraph's
   // first line instead of a line of its own. Empty when no marker is waiting.
@@ -342,6 +338,24 @@ class ChapterHtmlSlimParser final : public Print {
   // Fold the insets of every enclosing block-level element into `style`, capping each side at
   // MAX_HORIZONTAL_INSET_EM so deep nesting cannot squeeze the text column away.
   void addAncestorInsets(BlockStyle& style, float emSize) const;
+
+  // Bottom spacing (margin-bottom, padding-bottom) of the block-level elements currently open. A
+  // block element's style starts only its FIRST text block -- child blocks and <br> lines follow
+  // it, and through startNewTextBlock's empty-block merge a wrapper's style becomes its first
+  // child's -- so spacing left on that style landed under the first child instead of after the
+  // element. It is held here instead and applied at the end tag to whichever block is current.
+  // depth = parser depth at push (pre-increment); popped in endElement when that scope closes.
+  struct HeldBottomSpacing {
+    int depth;
+    int16_t marginBottom;
+    int16_t paddingBottom;
+  };
+  // Deeper nesting keeps its spacing on the style, as before: only elements with spacing are
+  // pushed, so eight levels of them open at once is already pathological.
+  static constexpr size_t kMaxHeldBottomSpacingDepth = 8;
+  std::vector<HeldBottomSpacing> heldBottomSpacing_;
+  void holdBottomSpacing(BlockStyle& style, bool floated);
+  void applyHeldBottomSpacing(const HeldBottomSpacing& held);
 
   // Anchor-to-page mapping: tracks which page each HTML id attribute lands on
   int completedPageCount = 0;
