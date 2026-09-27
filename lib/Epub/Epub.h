@@ -169,6 +169,16 @@ class Epub {
   bool clearCache(bool preserveThumbs = false) const;
   void setupCacheDir() const;
   const std::string& getCachePath() const;
+  // Per-spine caches (section layouts, inflated XHTML, anchor spills) live in buckets of
+  // SPINE_CACHE_BUCKET_SIZE spine items: <cache>/spines/<spineIndex / 32>/. A FAT open scans its
+  // directory linearly, and the one flat sections/ directory older firmware used held two files
+  // per spine item (more with layout variants): 3400+ entries on a book with 1700 spine items,
+  // hundreds of directory sectors read for every section open. A bucket holds a few dozen.
+  static constexpr int SPINE_CACHE_BUCKET_SIZE = 32;
+  static std::string spineCacheRoot(const std::string& cachePath);
+  static std::string spineCacheDir(const std::string& cachePath, int spineIndex);
+  // Removes every per-spine cache, including the flat sections/ directory of older firmware.
+  void removeSpineCaches() const;
   const std::string& getPath() const;
   const std::string& getTitle() const;
   const std::string& getAuthor() const;

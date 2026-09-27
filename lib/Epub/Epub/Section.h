@@ -347,12 +347,12 @@ class Section {
   // printed-page anchor exists on this or any earlier page in the section.
   std::optional<std::string> getNearestPrintedPageLabelAtOrBefore(uint16_t page) const;
 
-  // Standalone lookup that doesn't require a loaded Section. Walks the book's sections cache
-  // directory, finds any cache variant for `spineIndex`, reads its printed-page label map,
+  // Standalone lookup that doesn't require a loaded Section. Walks the spine's cache bucket
+  // (Epub::spineCacheDir), finds any cache variant for `spineIndex`, reads its printed-page label map,
   // and returns the parenthesised label for `page` if one is recorded. Returns nullopt when
   // no cache exists or the page carries no printed-page anchor. Used by SleepActivity to
   // augment the overlay without instantiating a full Section + render parameters.
-  static std::optional<std::string> getPrintedPageLabelFromCache(const std::string& sectionsDir, int spineIndex,
+  static std::optional<std::string> getPrintedPageLabelFromCache(const std::string& bookCachePath, int spineIndex,
                                                                  uint16_t page);
 
   // Look up the page number for a paragraph index (1-based, from XPath p[N]).
