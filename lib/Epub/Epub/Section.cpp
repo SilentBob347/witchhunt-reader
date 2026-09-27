@@ -328,6 +328,22 @@ std::string Section::getSectionFilePath(uint32_t propertyHash) const {
   return epub->getCachePath() + "/sections/" + buf + ".bin";
 }
 
+void Section::recordPageCount(const uint32_t requestedHash) const {
+  if (truncatedCache || pageCount == 0) return;
+  // Inflated size, from the same cumulative table the reader sums a chapter's bytes from.
+  const size_t end = epub->getCumulativeSpineItemSize(spineIndex);
+  const size_t start = spineIndex > 0 ? epub->getCumulativeSpineItemSize(spineIndex - 1) : 0;
+  SpinePageIndex::record(epub->getCachePath(), {requestedHash, SECTION_FILE_VERSION}, epub->getSpineItemsCount(),
+                         spineIndex, pageCount, static_cast<uint32_t>(end - start));
+}
+
+SpinePageIndex::Totals Section::indexedPageTotals(const std::string& bookCachePath, const BuildParams& p,
+                                                  const int spineCount, const int first, const int last,
+                                                  const int current) {
+  return SpinePageIndex::sumRange(bookCachePath, {calculatePropertyHash(p), SECTION_FILE_VERSION}, spineCount, first,
+                                  last, current);
+}
+
 std::string Section::sectionHtmlCachePath(const std::string& bookCachePath, const int spineIndex) {
   char buf[32];
   snprintf(buf, sizeof(buf), "html_%d", spineIndex);
@@ -665,6 +681,10 @@ bool Section::loadSectionFile(const BuildParams& p) {
   // matching only the TOC anchors we need (avoids loading all anchors into memory).
   buildTocBoundariesFromFile(file);
   buildPageBreakLabelsFromFile(file);
+
+  // Under the hash the reader asked for, even when the no-CSS fallback answered: these are the
+  // pages it will show for this spine.
+  recordPageCount(propertyHash);
 
   // File is intentionally left open; subsequent loadPageFromSectionFile() calls
   // seek within this handle instead of re-opening the file each time.
@@ -1933,7 +1953,14 @@ Section::BuildStep Section::stepSectionBuild(const BuildParams& params, const ui
     }
 
     buildState_.reset();
-    return fin == BuildPhaseResult::Done ? BuildStep::Done : BuildStep::Failed;
+    if (fin != BuildPhaseResult::Done) return BuildStep::Failed;
+    // Recorded under the variant the reader asked for (requestedHash), also when the no-CSS
+    // restart above produced it. A degraded build is left out: Background-B discards those for a
+    // clean rebuild, and one the reader keeps is recorded when it is next loaded.
+    if (!imageHeaderDegraded_ && !tableRowDegraded_ && !cssLowHeapDegraded_ && !footnotePreviewsUnresolved_) {
+      recordPageCount(requestedHash);
+    }
+    return BuildStep::Done;
   }
 }
 

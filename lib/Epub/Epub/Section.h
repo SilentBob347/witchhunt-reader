@@ -7,6 +7,7 @@
 
 #include "Epub.h"
 #include "FontSizeLadder.h"
+#include "SpinePageIndex.h"
 
 class Page;
 class GfxRenderer;
@@ -56,6 +57,9 @@ class Section {
   // the missing image would otherwise be permanent — background callers discard instead.
   bool imageHeaderDegraded_ = false;
 
+  // Records this spine's page count in the book's SpinePageIndex under `requestedHash`. No-op for
+  // a truncated or empty section.
+  void recordPageCount(uint32_t requestedHash) const;
   void writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, uint8_t paragraphAlignment,
                               uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled,
                               bool embeddedStyle, bool bionicReadingEnabled, uint8_t imageRendering);
@@ -158,6 +162,11 @@ class Section {
   // re-inflating the ZIP entry. Says nothing about whether the file exists or is complete;
   // callers must validate its size against the spine's inflated size, as the builder does.
   static std::string sectionHtmlCachePath(const std::string& bookCachePath, int spineIndex);
+
+  // The page counts recorded for spines [first, last] under `p` (see SpinePageIndex), so the
+  // reader can count a chapter split over several spine items without opening their caches.
+  static SpinePageIndex::Totals indexedPageTotals(const std::string& bookCachePath, const BuildParams& p,
+                                                  int spineCount, int first, int last, int current);
 
   uint16_t pageCount = 0;
   int currentPage = 0;

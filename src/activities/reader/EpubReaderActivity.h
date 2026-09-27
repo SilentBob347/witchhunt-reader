@@ -17,6 +17,7 @@
 #include <atomic>
 
 #include "BookmarkStore.h"
+#include "ChapterPageSpan.h"
 #include "CrossPointState.h"
 #include "EpubReaderMenuActivity.h"
 #include "KOReaderAutoSync.h"
@@ -859,6 +860,31 @@ class EpubReaderActivity final : public Activity {
   // SleepActivity's OVERLAY mode — rely on when transitioning out of the reader.
   void restoreCurrentPageToBufferIfPreRendered();
   void renderStatusBar() const;
+  // The status bar's chapter page counter: the current file's page and total, widened to the
+  // whole TOC chapter when that spans several spine items (#325; see ChapterPageSpan).
+  ChapterPageSpan::Display chapterPageDisplay() const;
+  // Re-reads the recorded page counts of the current chapter's other spine items from the book's
+  // SpinePageIndex on SD. Runs when chapterSpanSpine_ is not the current spine: -1 after a section
+  // is created (spine change, settings change, cache clear) or a Background-B build completes,
+  // i.e. whenever a sibling's count may have been recorded. Page turns within a spine cost nothing.
+  void refreshChapterSpan() const;
+  // The run of spine items making up TOC entry `toc`'s chapter. first == last means the counter
+  // stays per spine. A function of the book alone, so it is resolved once per chapter entered.
+  struct ChapterBounds {
+    int toc = -2;  // -2: nothing resolved yet (-1 is a real answer: no TOC entry)
+    int first = -1;
+    int last = -1;
+  };
+  ChapterBounds resolveChapterBounds(int toc) const;
+  // Longer runs are a coarse TOC (parts, not chapters): the counter stays per spine rather than
+  // walk the spine table that far.
+  static constexpr int MAX_CHAPTER_SPAN_FILES = 256;
+  mutable ChapterBounds chapterBounds_;
+  mutable ChapterPageSpan chapterSpan_;
+  mutable int chapterSpanSpine_ = -1;
+  // What the counter last showed, so a completed look-ahead build can tell whether it changed it.
+  mutable int lastStatusBarChapterTotal_ = -1;
+  mutable bool lastStatusBarChapterApprox_ = false;
   // Debug overlay: draws the background-work indicators (A: '.'/'x', B: section build %)
   // in a status-bar corner. Compiled to a no-op unless DEBUG_BACKGROUND_WORK is set.
   void renderBackgroundDebugOverlay() const;
