@@ -288,6 +288,8 @@ The Settings screen allows you to configure the device's behavior.
 
 **Network**:
 - **WiFi Networks**: Add, remove, and connect to WiFi networks.
+  - Whenever the reader needs WiFi, it first tries the network it last connected to, then any other saved network in range, strongest first. While it does, **Back** cancels and **Confirm** stops it and shows the network list.
+  - To join a network that does not broadcast its name, choose **Add hidden network...** at the end of the list and type its name (SSID). A password saved for that name is reused; otherwise you are asked for one (leave it empty for an open network). While it connects, **Back** abandons the attempt and returns to the list.
 - **KOReader Sync**: Configure and authenticate KOReader progress sync. See [KOReader Sync Quick Setup](#377-koreader-sync-quick-setup).
 - **OPDS Servers**: Manage OPDS libraries. See [OPDS Servers (Multiple Libraries)](#375-opds-servers-multiple-libraries).
 
@@ -350,7 +352,7 @@ Behavior notes:
 
 - Passwords are never shown back in the web UI after saving.
 - Leaving Password blank while editing keeps the existing saved password unchanged.
-- The web UI can save hidden-network SSIDs, but connecting to hidden networks still depends on device-side WiFi connection flow.
+- The web UI can save hidden-network SSIDs. On the device, join one through **Add hidden network...** in the network list; its saved password is reused.
 
 #### 3.7.7 KOReader Sync Quick Setup
 
