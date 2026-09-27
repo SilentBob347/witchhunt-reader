@@ -159,6 +159,13 @@ class Section {
   // callers must validate its size against the spine's inflated size, as the builder does.
   static std::string sectionHtmlCachePath(const std::string& bookCachePath, int spineIndex);
 
+  // Page count of another spine's finished cache under `p`, read from its header alone (one open,
+  // one ~40-byte read) so the reader can count the pages of a chapter split across several spine
+  // items without loading them. nullopt when there is no complete cache for these settings: never
+  // built, a different variant, a stale version, or a build that is still running or truncated.
+  static std::optional<uint16_t> cachedPageCount(const std::string& bookCachePath, int spineIndex,
+                                                 const BuildParams& p);
+
   uint16_t pageCount = 0;
   int currentPage = 0;
 

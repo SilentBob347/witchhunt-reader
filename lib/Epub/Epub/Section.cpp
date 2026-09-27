@@ -322,10 +322,45 @@ uint32_t Section::calculatePropertyHash(const BuildParams& p) {
   return fnv1a(buffer, offset);
 }
 
-std::string Section::getSectionFilePath(uint32_t propertyHash) const {
+namespace {
+std::string sectionFilePath(const std::string& bookCachePath, const int spineIndex, const uint32_t propertyHash) {
   char buf[32];
   snprintf(buf, sizeof(buf), "%d_%08x", spineIndex, propertyHash);
-  return epub->getCachePath() + "/sections/" + buf + ".bin";
+  return bookCachePath + "/sections/" + buf + ".bin";
+}
+}  // namespace
+
+std::string Section::getSectionFilePath(uint32_t propertyHash) const {
+  return sectionFilePath(epub->getCachePath(), spineIndex, propertyHash);
+}
+
+std::optional<uint16_t> Section::cachedPageCount(const std::string& bookCachePath, const int spineIndex,
+                                                 const BuildParams& p) {
+  // Storage.open, not openFileForRead: a sibling with no cache yet is the normal case here, and
+  // openFileForRead logs every miss as a failure.
+  FsFile f = Storage.open(sectionFilePath(bookCachePath, spineIndex, calculatePropertyHash(p)).c_str());
+  if (!f && p.embeddedStyle) {
+    // The same no-CSS fallback variant loadSectionFile accepts.
+    BuildParams noCss = p;
+    noCss.embeddedStyle = false;
+    f = Storage.open(sectionFilePath(bookCachePath, spineIndex, calculatePropertyHash(noCss)).c_str());
+  }
+  if (!f) return std::nullopt;
+
+  // The property hash in the file name already pins every render parameter, so the version, the
+  // completion bit and the count are all that need checking. A build in flight has neither the
+  // bit nor a count yet: its header is patched only when it finishes.
+  uint8_t head[header::kSize];
+  const bool read = f.read(head, sizeof(head)) == static_cast<int>(sizeof(head));
+  f.close();
+  if (!read || head[header::kVersion] != SECTION_FILE_VERSION ||
+      (head[header::kParseComplete] & kStatusParseComplete) == 0) {
+    return std::nullopt;
+  }
+  uint16_t pages = 0;
+  memcpy(&pages, head + header::kPageCount, sizeof(pages));
+  if (pages == 0) return std::nullopt;
+  return pages;
 }
 
 std::string Section::sectionHtmlCachePath(const std::string& bookCachePath, const int spineIndex) {
