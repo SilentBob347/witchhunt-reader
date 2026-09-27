@@ -238,6 +238,7 @@ void RecentBooksActivity::onEnter() {
   if (RECENT_BOOKS.pruneMissing()) {
     RECENT_BOOKS.saveToFile();
   }
+  RECENT_BOOKS.refreshSidecarMetadata(static_cast<size_t>(RECENT_BOOKS.getCount()));
 
   loadRecentBooks();
 
