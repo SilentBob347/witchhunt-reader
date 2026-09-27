@@ -1717,6 +1717,7 @@ void EpubReaderActivity::stepBackgroundSectionBuild() {
 #endif
           backgroundWindowPagesBuilt_ += backgroundSection_->pageCount;  // count this section toward the page budget
           LOG_INF("ERS", "Background build spine=%d complete: %u pages", targetSpine, backgroundSection_->pageCount);
+          chapterSpanSpine_ = -1;  // the status bar can count this sibling exactly now
           // The image lane's window may reach into this section: a window marked clean before
           // its cache existed has to be looked at again.
           imageWarmCleanSpine_ = -1;
@@ -4089,6 +4090,7 @@ bool EpubReaderActivity::buildSection(const RenderLayout& layout) {
   } else {
     section = std::make_unique<Section>(epub, currentSpineIndex, renderer);
   }
+  chapterSpanSpine_ = -1;  // new spine or new settings: the siblings' caches must be looked up again
   resetBackgroundBuild();
   const unsigned long sectionStart = millis();
 
@@ -5722,6 +5724,12 @@ void EpubReaderActivity::renderStatusBar() const {
   const float pageCount = static_cast<float>(displayPageCount);
   const float sectionChapterProg = (pageCount > 0) ? (static_cast<float>(currentPage) / pageCount) : 0;
   const float bookProgress = epub->calculateProgress(currentSpineIndex, sectionChapterProg) * 100;
+  // The page counter and the chapter progress bar count the whole TOC chapter, which can span
+  // several spine items (#325). The book percentage above stays per spine.
+  if (chapterSpanSpine_ != currentSpineIndex) {
+    refreshChapterSpan();
+  }
+  const ChapterPageSpan::Display chapter = chapterSpan_.apply(currentPage, displayPageCount);
 
   std::string title;
 
@@ -5759,8 +5767,8 @@ void EpubReaderActivity::renderStatusBar() const {
 #else
   const SyncIndicator syncIndicator = SyncIndicator::None;
 #endif
-  GUI.drawStatusBar(renderer, bookProgress, currentPage, displayPageCount, title, 0, isStarred, printedPageLabel,
-                    /*fillMargin=*/true, /*pageCountApproximate=*/building, syncIndicator);
+  GUI.drawStatusBar(renderer, bookProgress, chapter.page, chapter.total, title, 0, isStarred, printedPageLabel,
+                    /*fillMargin=*/true, /*pageCountApproximate=*/building || chapter.approximate, syncIndicator);
 
 #if DEBUG_BACKGROUND_WORK
   renderBackgroundDebugOverlay();
@@ -5774,6 +5782,60 @@ void EpubReaderActivity::renderStatusBar() const {
   } else {
     lastStatusBarClockMinute = -1;
   }
+}
+
+void EpubReaderActivity::refreshChapterSpan() const {
+  chapterSpanSpine_ = currentSpineIndex;
+  chapterSpan_ = {};
+  // Without a TOC that names at least a quarter of the files there is no chapter list to group
+  // them by (and getTocIndexForSpineIndex may already be answering one chapter per file).
+  if (!epub->hasReliableToc()) return;
+  const int toc = epub->getTocIndexForSpineIndex(currentSpineIndex);
+  if (toc < 0) return;
+  const auto entry = epub->getTocItem(toc);
+  const int first = entry.spineIndex;
+  // An anchored entry starts mid-file, and a file holding several entries shares its pages between
+  // them. Both are the per-page TOC lookup's business (Section::getTocIndexForPage), not a run of
+  // whole files, so the counter stays per spine there.
+  if (first < 0 || first > currentSpineIndex || !entry.anchor.empty()) return;
+  if (toc + 1 < epub->getTocItemsCount() && epub->getTocItem(toc + 1).spineIndex == first) return;
+
+  // A file with no TOC entry of its own inherits the one before it (BookMetadataCache), so the
+  // chapter is the file the entry points at plus the run of inheritors after it. Walking forward by
+  // spine rather than to the next TOC entry's spine also survives a TOC out of reading order.
+  const int spineCount = epub->getSpineItemsCount();
+  int last = currentSpineIndex;
+  while (last + 1 < spineCount && epub->getTocIndexForSpineIndex(last + 1) == toc) {
+    ++last;
+    if (last - first + 1 > MAX_CHAPTER_SPAN_FILES) return;
+  }
+  const int files = last - first + 1;
+  if (files < 2 || files > MAX_CHAPTER_SPAN_FILES) return;
+
+  // The variant key Background-B builds with, so its finished look-ahead sections are found.
+  const Section::BuildParams params = makeSectionBuildParams();
+  ChapterPageSpan span;
+  size_t previousEnd = first > 0 ? epub->getCumulativeSpineItemSize(first - 1) : 0;
+  for (int i = first; i <= last; ++i) {
+    const size_t end = epub->getCumulativeSpineItemSize(i);
+    const auto bytes = static_cast<uint32_t>(end - previousEnd);
+    previousEnd = end;
+    if (i == currentSpineIndex) {
+      span.currentBytes = bytes;
+      continue;
+    }
+    const bool before = i < currentSpineIndex;
+    if (const auto pages = Section::cachedPageCount(epub->getCachePath(), i, params)) {
+      (before ? span.pagesBefore : span.pagesAfter) += *pages;
+      span.knownBytes += bytes;
+    } else {
+      (before ? span.unknownBefore : span.unknownAfter)++;
+      (before ? span.unknownBytesBefore : span.unknownBytesAfter) += bytes;
+    }
+  }
+  chapterSpan_ = span;
+  LOG_DBG("ERS", "Chapter span: toc=%d spines %d-%d, exact %u+%u pages, %u+%u files estimated", toc, first, last,
+          span.pagesBefore, span.pagesAfter, span.unknownBefore, span.unknownAfter);
 }
 
 void EpubReaderActivity::renderBackgroundDebugOverlay() const {

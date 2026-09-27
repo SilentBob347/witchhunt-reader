@@ -17,6 +17,7 @@
 #include <atomic>
 
 #include "BookmarkStore.h"
+#include "ChapterPageSpan.h"
 #include "CrossPointState.h"
 #include "EpubReaderMenuActivity.h"
 #include "KOReaderAutoSync.h"
@@ -859,6 +860,17 @@ class EpubReaderActivity final : public Activity {
   // SleepActivity's OVERLAY mode — rely on when transitioning out of the reader.
   void restoreCurrentPageToBufferIfPreRendered();
   void renderStatusBar() const;
+  // The other spine items of the current TOC chapter, for the status bar's page counter (see
+  // ChapterPageSpan). Recomputed by renderStatusBar() when chapterSpanSpine_ is not the current
+  // spine: -1 after a section is created (spine change, settings change, cache clear) or a
+  // Background-B build completes, i.e. whenever a sibling's cache may have appeared or gone.
+  // One header read per sibling, so page turns within a spine cost nothing.
+  void refreshChapterSpan() const;
+  // Longer runs are a coarse TOC (parts, not chapters): the counter stays per spine rather than
+  // read a header for every file of the part.
+  static constexpr int MAX_CHAPTER_SPAN_FILES = 16;
+  mutable ChapterPageSpan chapterSpan_;
+  mutable int chapterSpanSpine_ = -1;
   // Debug overlay: draws the background-work indicators (A: '.'/'x', B: section build %)
   // in a status-bar corner. Compiled to a no-op unless DEBUG_BACKGROUND_WORK is set.
   void renderBackgroundDebugOverlay() const;
