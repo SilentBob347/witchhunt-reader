@@ -29,9 +29,10 @@ struct SidecarFilesFixture : testing::Test {
   }
   void TearDown() override { fs::remove_all(work); }
 
-  void touch(const std::string& name) {
+  void touch(const std::string& name) { write(name, "x"); }
+  void write(const std::string& name, const std::string& contents) {
     fs::create_directories(fs::path(work / name).parent_path());
-    std::ofstream(work / name, std::ios::binary) << "x";
+    std::ofstream(work / name, std::ios::binary | std::ios::trunc) << contents;
   }
   std::string p(const std::string& name) const { return (work / name).string(); }
   // A second name for the same file, as a case-insensitive filesystem answers to. A host that is
@@ -124,6 +125,48 @@ TEST_F(SidecarFilesFixture, ExtensionlessBookHasNoSidecars) {
   touch("untitled.opf");
   EXPECT_EQ(SidecarFiles::metadataPath(p("untitled")), "");
   EXPECT_TRUE(SidecarFiles::existingExtensions(p("untitled")).empty());
+}
+
+// metadataStamp() is how the recent-books list notices a sidecar written after
+// the book was opened. It must tell "none" from "present", and see any edit.
+TEST_F(SidecarFilesFixture, MetadataStampIsZeroWithoutASidecar) {
+  touch("book.epub");
+  EXPECT_EQ(SidecarFiles::metadataStamp(p("book.epub")), 0u);
+}
+
+TEST_F(SidecarFilesFixture, MetadataStampIsNonZeroEvenForAnEmptySidecar) {
+  touch("book.epub");
+  write("book.opf", "");
+  EXPECT_NE(SidecarFiles::metadataStamp(p("book.epub")), 0u);
+}
+
+TEST_F(SidecarFilesFixture, MetadataStampIsStableForUnchangedContent) {
+  touch("book.epub");
+  write("book.opf", "<dc:title>Alpha</dc:title>");
+  const uint32_t first = SidecarFiles::metadataStamp(p("book.epub"));
+  write("book.opf", "<dc:title>Alpha</dc:title>");
+  EXPECT_EQ(SidecarFiles::metadataStamp(p("book.epub")), first);
+}
+
+// The case a size or clock-based stamp misses: a device without a set clock
+// dates every write 1980-01-01, and this edit keeps the length.
+TEST_F(SidecarFilesFixture, MetadataStampSeesASameLengthEdit) {
+  touch("book.epub");
+  write("book.opf", "<dc:title>Alpha</dc:title>");
+  const uint32_t before = SidecarFiles::metadataStamp(p("book.epub"));
+  write("book.opf", "<dc:title>Omega</dc:title>");
+  EXPECT_NE(SidecarFiles::metadataStamp(p("book.epub")), before);
+}
+
+// The last byte a reader of the sidecar can take in is still hashed.
+TEST_F(SidecarFilesFixture, MetadataStampCoversTheWholeReadableSidecar) {
+  touch("book.epub");
+  std::string contents(SidecarFiles::kMetadataStampBytes, ' ');
+  write("book.opf", contents);
+  const uint32_t before = SidecarFiles::metadataStamp(p("book.epub"));
+  contents.back() = 'x';
+  write("book.opf", contents);
+  EXPECT_NE(SidecarFiles::metadataStamp(p("book.epub")), before);
 }
 
 }  // namespace

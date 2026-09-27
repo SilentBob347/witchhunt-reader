@@ -815,6 +815,9 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss, BuildArena
 
 std::string Epub::metadataSidecarPath(const std::string& bookPath) { return SidecarFiles::metadataPath(bookPath); }
 
+static_assert(SidecarFiles::kMetadataStampBytes >= Epub::MAX_METADATA_SIDECAR_BYTES,
+              "the recent-books staleness stamp must hash every sidecar byte applyMetadataSidecar() reads");
+
 // Calibre writes an OPF beside each exported book. Where one sits next to the
 // EPUB it is authoritative for that book's descriptive metadata, so a user can
 // correct a title, author or series without rewriting the book - the same rule

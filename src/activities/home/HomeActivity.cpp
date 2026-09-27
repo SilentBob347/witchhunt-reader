@@ -131,6 +131,7 @@ void HomeActivity::rebuildMenuEntries() {
 
 void HomeActivity::loadRecentBooks(int maxBooks) {
   recentBooks.clear();
+  RECENT_BOOKS.refreshSidecarMetadata(static_cast<size_t>(std::max(0, maxBooks)));
   const auto& books = RECENT_BOOKS.getBooks();
   recentBooks.reserve(std::min(static_cast<int>(books.size()), maxBooks));
 

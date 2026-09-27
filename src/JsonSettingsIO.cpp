@@ -623,6 +623,7 @@ bool JsonSettingsIO::saveRecentBooks(const RecentBooksStore& store, const char* 
     obj["author"] = book.author;
     obj["series"] = book.series;
     obj["coverBmpPath"] = book.coverBmpPath;
+    obj["metadataStamp"] = book.metadataStamp;
     obj["embeddedStyleOverride"] = book.embeddedStyleOverride;
     obj["imageRenderingOverride"] = book.imageRenderingOverride;
     obj["fontFamilyOverride"] = book.fontFamilyOverride;
@@ -672,6 +673,9 @@ bool JsonSettingsIO::loadRecentBooks(RecentBooksStore& store, const char* json) 
     book.author = obj["author"] | std::string("");
     book.series = obj["series"] | std::string("");
     book.coverBmpPath = obj["coverBmpPath"] | std::string("");
+    // Absent in files written before it existed: 0, so an entry whose book has
+    // a sidecar is refreshed once.
+    book.metadataStamp = obj["metadataStamp"] | 0u;
     book.embeddedStyleOverride = clampInt8(obj["embeddedStyleOverride"] | -1, -1, 1, -1);
     book.imageRenderingOverride = clampInt8(obj["imageRenderingOverride"] | -1, -1, 2, -1);
     book.fontFamilyOverride =
