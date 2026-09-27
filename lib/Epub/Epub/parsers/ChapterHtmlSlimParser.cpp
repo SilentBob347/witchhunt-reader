@@ -2447,19 +2447,22 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
   const int16_t ownInsetRight = userAlignmentBlockStyle.rightInset();
   self->addAncestorInsets(userAlignmentBlockStyle, emSize);
 
-  // A list is a block with vertical spacing of its own. It starts an empty block holding its top
-  // spacing, which the first item merges into (collapsing with the item's margin-top, as under a
-  // wrapper <div>); its bottom spacing is held for </ul> like any block element's. The block's horizontal inset is the
-  // enclosing one, not the list's (pushed below, for the items): a marker still waiting from an enclosing <li> lands in
-  // it. Table cells lay their text out apart from the page's blocks, so a list inside one is left alone.
-  if (isList && !self->currentTableCell) {
+  // Containers that are not BLOCK_TAGS (<ul>, <ol>, <section>, <article>, <aside>, <main>) are still
+  // blocks with vertical spacing of their own. Each starts an empty block holding its top spacing,
+  // which its first child merges into (collapsing with the child's margin-top, as under a wrapper
+  // <div>); its bottom spacing is held for the end tag like any block element's. The block's
+  // horizontal inset is the enclosing one, not the container's (pushed below, for the children):
+  // a list marker still waiting from an enclosing <li> lands in it. Table cells lay their text out
+  // apart from the page's blocks, so a container inside one is left alone.
+  const bool isBlockContainer = matches(name, INSET_CONTAINER_TAGS, NUM_INSET_CONTAINER_TAGS) && !isHeaderOrBlock(name);
+  if (isBlockContainer && !self->currentTableCell) {
     if (self->partWordBufferIndex > 0 && !self->flushPartWordBuffer()) return;
-    BlockStyle listTop = BlockStyle::fromCssStyle(
+    BlockStyle containerTop = BlockStyle::fromCssStyle(
         CssStyle{}, emSize, static_cast<CssTextAlign>(self->paragraphAlignment), self->viewportWidth);
-    listTop.marginTop = userAlignmentBlockStyle.marginTop;
-    listTop.paddingTop = userAlignmentBlockStyle.paddingTop;
-    self->addAncestorInsets(listTop, emSize);
-    self->startNewTextBlock(listTop);
+    containerTop.marginTop = userAlignmentBlockStyle.marginTop;
+    containerTop.paddingTop = userAlignmentBlockStyle.paddingTop;
+    self->addAncestorInsets(containerTop, emSize);
+    self->startNewTextBlock(containerTop);
     self->holdBottomSpacing(userAlignmentBlockStyle, isFloated);
   }
 
@@ -2505,6 +2508,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
     }
     self->holdBottomSpacing(headerBlockStyle, isFloated);
     self->startNewTextBlock(headerBlockStyle);
+    self->currentBlockOwnerDepth_ = self->depth;
     self->boldUntilDepth = std::min(self->boldUntilDepth, self->depth);
     self->updateEffectiveInlineStyle();
   } else if (matches(name, BLOCK_TAGS, NUM_BLOCK_TAGS)) {
@@ -2519,6 +2523,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
       }
       self->holdBottomSpacing(blockStyle, isFloated);
       self->startNewTextBlock(blockStyle);
+      self->currentBlockOwnerDepth_ = self->depth;
       self->updateEffectiveInlineStyle();
 
       // `<`, not `=`: inside a transparent-text ancestor the slot already holds a shallower
@@ -2549,6 +2554,14 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
       self->addAncestorInsets(brStyle, emSize);
       // text-indent is not inherited across <br>: it applies to the first line of a block only.
       // Span-based indents (poem stanza pattern) are applied directly to each block at span-open time.
+      // The font size is: the next line belongs to the same heading or paragraph. All three fields
+      // travel together -- the block may already be resolved (a long block is laid out in parts),
+      // and resolveBlockFont leaves a resolved style alone.
+      if (self->currentBlockOwnerDepth_ >= 0) {
+        brStyle.fontSizeMultiplier = currentStyle.fontSizeMultiplier;
+        brStyle.headingFontId = currentStyle.headingFontId;
+        brStyle.fontResolved = currentStyle.fontResolved;
+      }
       brStyle.fromBrElement = true;
       self->startNewTextBlock(brStyle);
     } else {
@@ -2561,6 +2574,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
       }
       self->holdBottomSpacing(blockStyle, isFloated);
       self->startNewTextBlock(blockStyle);
+      self->currentBlockOwnerDepth_ = self->depth;
       self->updateEffectiveInlineStyle();
 
       if (strcmp(name, "li") == 0) {
@@ -3181,6 +3195,13 @@ void ChapterHtmlSlimParser::endElement(void* userData, const char* name) {
   // Pop list entries whose ul/ol is now out of scope
   while (!self->listStack.empty() && self->listStack.back().depth >= self->depth) {
     self->listStack.pop_back();
+  }
+
+  // The element that set up the current block has closed. If nothing reached that block (an empty
+  // heading, a trailing <br>), it will merge into the next sibling, which must not inherit the size.
+  if (self->depth == self->currentBlockOwnerDepth_) {
+    self->currentBlockOwnerDepth_ = -1;
+    self->clearSpentBlockHeadingStyle();
   }
 
   // Apply held bottom spacing whose block-level element is now out of scope

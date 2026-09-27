@@ -569,6 +569,10 @@ class ChapterHtmlSlimParser final : public Print {
   bool recoverHeapForImageHeader();
   void startNewTextBlock(const BlockStyle& blockStyle);
   void clearSpentBlockHeadingStyle();
+  // Depth of the header/block element whose start tag set up the current text block, or -1 once
+  // that element has closed. A <br> inside it splits the element into more blocks, which keep its
+  // font size; after it has closed, what it leaves behind must not lend that size to a sibling.
+  int currentBlockOwnerDepth_ = -1;
   bool heapAllowsTableRowLayout() const;
   bool flushPartWordBuffer();
   void makePages();
