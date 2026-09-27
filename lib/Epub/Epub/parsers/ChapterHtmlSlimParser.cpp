@@ -232,10 +232,15 @@ constexpr int NUM_BLOCK_TAGS = sizeof(BLOCK_TAGS) / sizeof(BLOCK_TAGS[0]);
 // Elements whose own horizontal inset also applies to the blocks nested inside them
 // (blockInsetStack_). Everything that can hold another block belongs here, plus <p>/<li>/<pre>,
 // whose <br>-separated lines each become a block of their own and must keep the inset of the
-// paragraph they belong to. <ul>/<ol> deliberately stay out: list indentation is synthesised
-// per <li> from the list depth, so counting the list's own margin as well would double it.
-const char* INSET_CONTAINER_TAGS[] = {"div", "blockquote", "section", "article", "aside", "main", "p", "li", "pre"};
+// paragraph they belong to. <ul>/<ol> are how a list's items get their indent: in CSS an item
+// starts at the list's content edge, and its own margin-left only adds to that.
+const char* INSET_CONTAINER_TAGS[] = {"div", "blockquote", "section", "article", "aside", "main",
+                                      "p",   "li",         "pre",     "ul",      "ol"};
 constexpr int NUM_INSET_CONTAINER_TAGS = sizeof(INSET_CONTAINER_TAGS) / sizeof(INSET_CONTAINER_TAGS[0]);
+
+// A list's padding-left when the book states none -- the stand-in for the browser default
+// `padding-inline-start: 40px`, which is what indents an unstyled list. Nested lists each add it.
+constexpr float LIST_DEFAULT_PADDING_EM = 1.5f;
 
 const char* BOLD_TAGS[] = {"b", "strong"};
 constexpr int NUM_BOLD_TAGS = sizeof(BOLD_TAGS) / sizeof(BOLD_TAGS[0]);
@@ -2361,7 +2366,8 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
     self->floatDepth_++;
   }
 
-  if (strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0) {
+  const bool isList = strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0;
+  if (isList) {
     int startCounter = 0;
     if (name[0] == 'o') {
       const char* startAttr = getAttribute(atts, "start");
@@ -2376,6 +2382,10 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
   const float emSize = static_cast<float>(self->renderer.getFontAscenderSize(self->fontId));
   auto userAlignmentBlockStyle = BlockStyle::fromCssStyle(
       cssStyle, emSize, static_cast<CssTextAlign>(self->paragraphAlignment), self->viewportWidth);
+  // As in CSS, a list's own padding-left replaces the default and its margin-left adds to it.
+  if (isList && !cssStyle.hasPaddingLeft()) {
+    userAlignmentBlockStyle.paddingLeft = static_cast<int16_t>(emSize * LIST_DEFAULT_PADDING_EM);
+  }
 
   // This element's own inset is what its children inherit; capture it before the ancestors are
   // folded in, or each level would count itself once per descendant.
@@ -2475,12 +2485,6 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
           self->paragraphAlignment == static_cast<uint8_t>(CssTextAlign::None)) {
         blockStyle.alignment = cssStyle.textAlign;
         blockStyle.textAlignDefined = true;
-      }
-      // For <li> with no CSS margin, apply depth-based indent so nested lists are visually
-      // distinguishable. listStack.size() == 1 for top-level, 2 for first nested, etc.
-      if (strcmp(name, "li") == 0 && !cssStyle.hasMarginLeft() && !self->listStack.empty()) {
-        const int depth = static_cast<int>(std::min(self->listStack.size(), size_t(3)));
-        blockStyle.marginLeft = static_cast<int16_t>(blockStyle.marginLeft + emSize * 1.5f * depth);
       }
       self->startNewTextBlock(blockStyle);
       self->updateEffectiveInlineStyle();
