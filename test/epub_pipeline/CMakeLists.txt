@@ -92,6 +92,7 @@ add_executable(EpubPipelineTest
   MetadataSidecarTest.cpp
   SidecarFilesTest.cpp
   SectionAbortTest.cpp
+  SpineCacheLayoutTest.cpp
   FootnotePreviewStoreTest.cpp
   FootnoteResolveSliceTest.cpp
   ParagraphAnchorTest.cpp

@@ -680,8 +680,8 @@ BookOverlayInfo SleepActivity::getBookOverlayInfo(const std::string& bookPath) c
             // cache so the sleep overlay can show e.g. "(42)" without instantiating
             // a Section + render parameters.
             std::string printedPagePrefix;
-            if (const auto label = Section::getPrintedPageLabelFromCache(
-                    epub.getCachePath() + "/sections", currentSpineIndex, static_cast<uint16_t>(currentPage))) {
+            if (const auto label = Section::getPrintedPageLabelFromCache(epub.getCachePath(), currentSpineIndex,
+                                                                         static_cast<uint16_t>(currentPage))) {
               printedPagePrefix = *label + " ";
             }
 
