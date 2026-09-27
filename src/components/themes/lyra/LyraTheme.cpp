@@ -490,9 +490,10 @@ void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
 
 void LyraTheme::drawSideButtonHints(GfxRenderer& renderer, const char* upBtn, const char* downBtn) const {
   // Panel coordinates and the inverted mirroring, for the reasons spelled out in
-  // BaseTheme::drawSideButtonHints.
+  // BaseTheme::drawSideButtonHints — including why LandscapeCounterClockwise draws inverted too.
   const GfxRenderer::Orientation orig_orientation = renderer.getOrientation();
-  const bool inverted = orig_orientation == GfxRenderer::Orientation::PortraitInverted;
+  const bool inverted = orig_orientation == GfxRenderer::Orientation::PortraitInverted ||
+                        orig_orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
   renderer.setDrawOrientation(inverted ? GfxRenderer::Orientation::PortraitInverted
                                        : GfxRenderer::Orientation::Portrait);
 
