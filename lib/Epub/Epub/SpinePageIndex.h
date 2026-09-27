@@ -6,9 +6,9 @@
 // How many pages each spine item lays out to under one set of render settings, kept on SD at
 // `<book cache>/pages.bin` so the reader can count a chapter split over several spine items
 // (#325) without holding a per-spine table in RAM (books with 1700+ spine items exist) and
-// without opening each sibling's section cache: those live in a sections/ directory with two
-// files per spine item, and every FAT open scans it linearly. Summing a chapter here is one open
-// in the book cache root plus one sequential read of 6 bytes per spine item.
+// without opening each sibling's section cache: every FAT open scans its directory linearly, so a
+// chapter of N files would cost N directory walks. Summing a chapter here is one open in the book
+// cache root plus one sequential read of 6 bytes per spine item.
 //
 // One render variant at a time: recording under another (font, margins, a section layout
 // version bump) starts the table over, since the old counts describe nothing the reader shows.
