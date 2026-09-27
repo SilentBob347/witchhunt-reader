@@ -5805,9 +5805,9 @@ ChapterPageSpan::Display EpubReaderActivity::chapterPageDisplay() const {
   if (chapterSpanSpine_ != currentSpineIndex) {
     refreshChapterSpan();
   }
-  ChapterPageSpan::Display display = chapterSpan_.apply(section->currentPage + 1, pageCount);
-  display.approximate = display.approximate || building;
-  return display;
+  ChapterPageSpan::Display chapter = chapterSpan_.apply(section->currentPage + 1, pageCount);
+  chapter.approximate = chapter.approximate || building;
+  return chapter;
 }
 
 EpubReaderActivity::ChapterBounds EpubReaderActivity::resolveChapterBounds(const int toc) const {

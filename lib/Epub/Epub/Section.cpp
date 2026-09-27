@@ -1952,13 +1952,11 @@ Section::BuildStep Section::stepSectionBuild(const BuildParams& params, const ui
       continue;
     }
 
-    // requestedHash survives the no-CSS restart above, so a downgraded build is recorded under
-    // the variant the reader asked for.
-    const uint32_t requestedHash = buildState_->requestedHash;
     buildState_.reset();
     if (fin != BuildPhaseResult::Done) return BuildStep::Failed;
-    // A degraded build is left out: Background-B discards those for a clean rebuild, and one the
-    // reader keeps is recorded when it is next loaded.
+    // Recorded under the variant the reader asked for (requestedHash), also when the no-CSS
+    // restart above produced it. A degraded build is left out: Background-B discards those for a
+    // clean rebuild, and one the reader keeps is recorded when it is next loaded.
     if (!imageHeaderDegraded_ && !tableRowDegraded_ && !cssLowHeapDegraded_ && !footnotePreviewsUnresolved_) {
       recordPageCount(requestedHash);
     }
