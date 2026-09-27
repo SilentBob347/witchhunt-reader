@@ -9,14 +9,14 @@
 // the OTHER files of the current chapter and turns the current file's page/total into the
 // chapter's.
 //
-// A sibling with a finished cache contributes its exact page count. The rest are estimated from
-// their byte size at the pages-per-byte of everything counted exactly (the current file
-// included), at least one page each, and make the result approximate. A default-constructed span
-// (a chapter of one file) passes the file's numbers through unchanged.
+// A sibling whose page count has been recorded (SpinePageIndex) contributes it exactly. The rest
+// are estimated from their byte size at the pages-per-byte of everything counted exactly (the
+// current file included), at least one page each, and make the result approximate. A
+// default-constructed span (a chapter of one file) passes the file's numbers through unchanged.
 struct ChapterPageSpan {
-  uint16_t pagesBefore = 0;    // exact pages of the cached siblings before the current file
-  uint16_t pagesAfter = 0;     // ... and after it
-  uint16_t unknownBefore = 0;  // siblings with no cache yet, before / after the current file
+  uint32_t pagesBefore = 0;    // exact pages of the counted siblings before the current file
+  uint32_t pagesAfter = 0;     // ... and after it
+  uint16_t unknownBefore = 0;  // siblings not counted yet, before / after the current file
   uint16_t unknownAfter = 0;
   uint32_t unknownBytesBefore = 0;
   uint32_t unknownBytesAfter = 0;
@@ -40,8 +40,8 @@ struct ChapterPageSpan {
       const uint64_t est = bytes > 0 ? (unknownBytes * pages + bytes / 2) / bytes : 0;
       return static_cast<int>(std::max<uint64_t>(est, files));
     };
-    const int before = pagesBefore + estimate(unknownBytesBefore, unknownBefore);
-    const int after = pagesAfter + estimate(unknownBytesAfter, unknownAfter);
+    const int before = static_cast<int>(pagesBefore) + estimate(unknownBytesBefore, unknownBefore);
+    const int after = static_cast<int>(pagesAfter) + estimate(unknownBytesAfter, unknownAfter);
     return {before + page, before + pageCount + after, unknownBefore > 0 || unknownAfter > 0};
   }
 };
