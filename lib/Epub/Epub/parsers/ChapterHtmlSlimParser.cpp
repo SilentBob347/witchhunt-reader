@@ -1331,6 +1331,23 @@ void ChapterHtmlSlimParser::emitPendingListMarker() {
   pendingListMarker_[0] = '\0';
 }
 
+void ChapterHtmlSlimParser::applyListBottomSpacing(const ListEntry& list) {
+  if ((list.marginBottom <= 0 && list.paddingBottom <= 0) || !currentTextBlock) return;
+  if (partWordBufferIndex > 0) flushPartWordBuffer();
+  BlockStyle style = currentTextBlock->getBlockStyle();
+  if (currentTextBlock->isEmpty()) {
+    // Nothing of the list is left to lay out (its last item was empty, or an image or a table):
+    // the spacing goes before whatever follows, which this empty block merges into.
+    style.marginTop = std::max(style.marginTop, list.marginBottom);
+    style.paddingTop = static_cast<int16_t>(style.paddingTop + list.paddingBottom);
+  } else {
+    // The last item's own margin-bottom and the list's collapse into the larger of the two.
+    style.marginBottom = std::max(style.marginBottom, list.marginBottom);
+    style.paddingBottom = static_cast<int16_t>(style.paddingBottom + list.paddingBottom);
+  }
+  currentTextBlock->setBlockStyle(style);
+}
+
 void ChapterHtmlSlimParser::addAncestorInsets(BlockStyle& style, const float emSize) const {
   if (blockInsetStack_.empty()) return;
   int left = style.leftInset();
@@ -2410,6 +2427,25 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
   const int16_t ownInsetLeft = userAlignmentBlockStyle.leftInset();
   const int16_t ownInsetRight = userAlignmentBlockStyle.rightInset();
   self->addAncestorInsets(userAlignmentBlockStyle, emSize);
+
+  // A list is a block with vertical spacing of its own. It starts an empty block holding its top
+  // spacing, which the first item merges into (collapsing with the item's margin-top, as under a
+  // wrapper <div>); its bottom spacing waits for </ul>, since that merge would put it under the
+  // first item. The block's horizontal inset is the enclosing one, not the list's (pushed below,
+  // for the items): a marker still waiting from an enclosing <li> lands in it. Table cells lay
+  // their text out apart from the page's blocks, so a list inside one is left alone.
+  if (isList && !self->currentTableCell) {
+    if (self->partWordBufferIndex > 0 && !self->flushPartWordBuffer()) return;
+    BlockStyle listTop = BlockStyle::fromCssStyle(
+        CssStyle{}, emSize, static_cast<CssTextAlign>(self->paragraphAlignment), self->viewportWidth);
+    listTop.marginTop = userAlignmentBlockStyle.marginTop;
+    listTop.paddingTop = userAlignmentBlockStyle.paddingTop;
+    self->addAncestorInsets(listTop, emSize);
+    self->startNewTextBlock(listTop);
+    self->listStack.back().marginBottom = userAlignmentBlockStyle.marginBottom;
+    self->listStack.back().paddingBottom = userAlignmentBlockStyle.paddingBottom;
+  }
+
   if ((ownInsetLeft > 0 || ownInsetRight > 0) &&
       self->blockInsetStack_.size() < ChapterHtmlSlimParser::kMaxBlockInsetDepth &&
       matches(name, INSET_CONTAINER_TAGS, NUM_INSET_CONTAINER_TAGS)) {
@@ -3124,6 +3160,7 @@ void ChapterHtmlSlimParser::endElement(void* userData, const char* name) {
 
   // Pop list entries whose ul/ol is now out of scope
   while (!self->listStack.empty() && self->listStack.back().depth >= self->depth) {
+    self->applyListBottomSpacing(self->listStack.back());
     self->listStack.pop_back();
   }
 

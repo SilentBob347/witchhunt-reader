@@ -14,7 +14,9 @@ the item:
 The cases below cover each place the indent can come from:
 
   1. indent on the list          the reported shape: the list's margin must
-                                 reach every item even though the item says 0
+                                 reach every item even though the item says 0,
+                                 and its 0.8em top and bottom margins must open
+                                 a gap before the first item and after the last
   2. no CSS at all               the default list indent
   3. list margin, no padding     the margin adds to the default padding
   4. list reset to zero          margin:0 + padding:0 puts items at the edge
@@ -30,14 +32,20 @@ The cases below cover each place the indent can come from:
  11. an empty item               still shows its marker, which must not leak
                                  into the next item
  12. an item opening with a list the outer marker keeps a line of its own
- 13. sibling after the lists     back at the text edge
+ 13. list and item margins       the list's margin collapses with the first
+                                 item's margin-top and the last item's
+                                 margin-bottom; between items only the items'
+ 14. list ends in an empty item  nothing is left to carry the list's
+                                 margin-bottom, so it opens the next paragraph
+ 15. sibling after the lists     back at the text edge
 
 At the corpus font 1em = 18px, so the goldens read: case 1 at LINE x=45 (and
 18px right inset), case 2 at 27, case 3 at 45, case 4 at 0, case 5 at 36,
 case 6 at 27 then 54, case 7 at 27, case 8 at 27 with the marker in front of
 the first paragraph, case 9 at 27 on every line, case 10 like case 8, case 11
 a lone marker then a marked item, case 12 a lone marker at 27 then the inner
-item at 54, case 13 back at 0.
+item at 54, case 13 gaps of 18 / 9 / 18 around and between its items (not
+27), case 14 a gap of 18 before the next paragraph, case 15 back at 0.
 
 Regenerate with:  python test/epubs/make_test_lists.py
 then refresh goldens: UPDATE_GOLDENS=1 ctest -R EpubPipeline
@@ -107,7 +115,7 @@ body { margin: 0; padding: 0 }
 p { margin: 0 }
 
 /* 1. Strange Pictures: the indent on the list, the item explicitly zeroed. */
-ul.bullet { list-style-type: disc; margin-left: 2.5em; margin-right: 1em; padding-left: 0 }
+ul.bullet { list-style-type: disc; margin: 0.8em 1em 0.8em 2.5em; padding-left: 0 }
 li.bull { margin-left: 0; text-indent: 0 }
 
 /* 3. A list margin with no padding stated: the default padding still applies. */
@@ -119,6 +127,13 @@ ul.flat { margin: 0; padding: 0; list-style: none }
 /* 5. The list zeroed, the inset on the item. */
 ul.zero { margin-left: 0; padding-left: 0 }
 li.ind { margin-left: 2em }
+
+/* 13. List margins and item margins: adjacent vertical margins collapse. */
+ul.gap { margin: 1em 0 }
+li.gap { margin: 0.5em 0 }
+
+/* 14. The same list, unmarked, ending in an empty item. */
+ul.gapflat { margin: 1em 0; list-style: none }
 """
 
 CHAPTER = """<?xml version="1.0" encoding="UTF-8"?>
@@ -215,8 +230,22 @@ CHAPTER = """<?xml version="1.0" encoding="UTF-8"?>
     <li><ul><li>Lima inner</li></ul></li>
   </ul>
 
-  <!-- 13. After the lists ─────────────────────────────────────────────────── -->
-  <p>13. SIBLING: back at the text edge.</p>
+  <!-- 13. List and item margins ──────────────────────────────────────────── -->
+  <p>13. MARGINS:</p>
+  <ul class="gap">
+    <li class="gap">Mike one</li>
+    <li class="gap">Mike two</li>
+  </ul>
+
+  <!-- 14. A list ending in an empty item ────────────────────────────────── -->
+  <p>14. EMPTY LAST ITEM:</p>
+  <ul class="gapflat">
+    <li>November one</li>
+    <li></li>
+  </ul>
+
+  <!-- 15. After the lists ─────────────────────────────────────────────────── -->
+  <p>15. SIBLING: back at the text edge.</p>
 
 </body>
 </html>
