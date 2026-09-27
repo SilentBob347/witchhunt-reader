@@ -921,9 +921,8 @@ void ReaderActivity::onEnter() {
     // buffer is LENT: the rings bump-allocate inside the region through Epub::load's scratch,
     // the region never enters the heap, and the return below cannot fail. The tables keep the
     // heap, which without the ring has room for them. Same pattern as Background-C's borrow.
-    // The popup above is drawn BEFORE the borrow: drawPopup needs the active buffer, load()
-    // performs no rendering, and the popup's displayBuffer seeded RED RAM for the X4's
-    // single-buffer fast diff below (no-op on X3).
+    // The popup above is drawn BEFORE the borrow: drawPopup needs the active buffer, and load()
+    // performs no rendering.
     uint8_t* lentForIndexing = nullptr;
     size_t lentSize = 0;
     if (firstOpenIndexing && renderer.hasSecondaryBuffer()) {
@@ -932,6 +931,10 @@ void ReaderActivity::onEnter() {
       // the secondary from it. Make that the frame on the panel, so the reader's own overlays
       // composite onto what is actually displayed.
       renderer.syncWriteBufferFromDisplayed();
+      // The popup's FAST loaded RED RAM with the pre-popup frame, not the popup, and the first
+      // FAST after the return below diffs against RED. Seed it with the displayed frame while the
+      // secondary still holds it, as the X4's single-buffer fast diff requires (no-op on X3).
+      if (!renderer.isX3()) renderer.syncRedRamFromFrameBuffer();
       lentForIndexing = renderer.borrowSecondaryBuffer(&lentSize);
       if (lentForIndexing) {
         renderer.setSingleBufferFastDiff(true);
