@@ -36,6 +36,21 @@
 // current window).
 // ---------------------------------------------------------------------------
 
+// ASan interposes malloc itself and calls it while initialising, before thread_local storage
+// exists, so a second interposer here segfaults the binary before main() — and ctest's test
+// discovery with it. Under ASan the hooks are compiled out and only the footprint bounds skip.
+#if defined(__SANITIZE_ADDRESS__)
+#define CSS_TEST_HEAP_HOOKS 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define CSS_TEST_HEAP_HOOKS 0
+#endif
+#endif
+#ifndef CSS_TEST_HEAP_HOOKS
+#define CSS_TEST_HEAP_HOOKS 1
+#endif
+
+#if CSS_TEST_HEAP_HOOKS
 static std::atomic<size_t> g_liveBytes{0};
 static std::atomic<uint32_t> g_epoch{0};  // current measurement window; 0 = not measuring
 static std::atomic<bool> g_tracking{false};
@@ -183,6 +198,7 @@ static size_t measureLiveBytes(const std::function<void()>& fn) {
   endMeasurement();
   return g_liveBytes.load();
 }
+#endif  // CSS_TEST_HEAP_HOOKS
 
 static std::vector<uint8_t> readZipEntry(const std::string& epubPath, const char* entryName) {
   ZipFile zip(epubPath);
@@ -356,6 +372,7 @@ TEST(CssParserCache, CompileLoadAndLowHeapLookup) {
   // loaded the index into the compiling parser, and clear() keeps that vector's capacity, so
   // reloading there allocates nothing and the footprint bounds below would pass on 0 bytes.
   CssParser parser(cacheFileRoot);
+#if CSS_TEST_HEAP_HOOKS
   const size_t loadedCacheLiveBytes = measureLiveBytes([&] { ASSERT_TRUE(parser.loadFromCache()); });
   EXPECT_EQ(parser.ruleCount(), kFixtureRuleCount);
   printf("CACHE_LOAD_LIVE_BYTES=%zu\n", loadedCacheLiveBytes);
@@ -365,6 +382,10 @@ TEST(CssParserCache, CompileLoadAndLowHeapLookup) {
   // and the floor so a load that measured nothing cannot pass.
   EXPECT_GE(loadedCacheLiveBytes, kFixtureRuleCount * 8);
   EXPECT_LE(loadedCacheLiveBytes, kFixtureRuleCount * 16);
+#else
+  ASSERT_TRUE(parser.loadFromCache());
+  EXPECT_EQ(parser.ruleCount(), kFixtureRuleCount);
+#endif
 
   {
     CssStyle style = parser.resolveStyle("p", "rule0_0");
