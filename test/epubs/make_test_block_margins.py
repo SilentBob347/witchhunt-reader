@@ -25,7 +25,12 @@ opened the gap between a and b. The cases below cover each shape:
   8. figure without a caption       the margin still separates the image from
                                     the next paragraph
   9. item holding a nested list     the item's margin follows the nested list
- 10. sibling after the cases        no spacing left over
+ 10. <section> around paragraphs    a container that is not a BLOCK_TAG still
+                                    opens a gap before its first child and
+                                    after its last, not between them
+ 11. <aside> holding bare text      its text gets a block of its own, spaced
+                                    like any other
+ 12. sibling after the cases        no spacing left over
 
 Label paragraphs ("1. WRAPPER:") carry no margins, so every gap in the golden
 is the case's own. At the corpus font 1em = 18px and a body line is 24px, so
@@ -113,6 +118,8 @@ h2 { margin: 0 }
 /* 7. */ div.fig { margin-bottom: 1em }
 /* 8. */ div.figonly { margin: 1em 0 }
 /* 9. */ li.item { margin-bottom: 1em }
+/* 10. */ section.sec { margin: 1em 0 }
+/* 11. */ aside.note { margin: 0.5em 0 }
 """
 
 CHAPTER = """<?xml version="1.0" encoding="UTF-8"?>
@@ -167,7 +174,16 @@ CHAPTER = """<?xml version="1.0" encoding="UTF-8"?>
     <li>Hotel next</li>
   </ul>
 
-  <p>10. SIBLING: no spacing left over.</p>
+  <p>10. SECTION:</p>
+  <section class="sec">
+    <p>India first</p>
+    <p>India second</p>
+  </section>
+
+  <p>11. ASIDE:</p>
+  <aside class="note">Juliet bare text</aside>
+
+  <p>12. SIBLING: no spacing left over.</p>
 
 </body>
 </html>

@@ -67,7 +67,7 @@ SPINE 0 href=OEBPS/chapter1.xhtml pages=2 truncated=0 cssFallback=0
   LINE y=718 x=0 align=0 mult=1.000 hfid=0 words=2
    W x=0 s=0 z=100 t=9.
    W x=23 s=0 z=100 t=ITEM:
- PAGE 1 elements=4 footnotes=0
+ PAGE 1 elements=9 footnotes=0
   LINE y=0 x=27 align=0 mult=1.000 hfid=0 words=3
    W x=18 s=0 z=100 t=•
    W x=31 s=0 z=100 t=Hotel
@@ -80,10 +80,26 @@ SPINE 0 href=OEBPS/chapter1.xhtml pages=2 truncated=0 cssFallback=0
    W x=18 s=0 z=100 t=•
    W x=31 s=0 z=100 t=Hotel
    W x=85 s=0 z=100 t=next
-  LINE y=90 x=0 align=0 mult=1.000 hfid=0 words=6
+  LINE y=90 x=0 align=0 mult=1.000 hfid=0 words=2
    W x=0 s=0 z=100 t=10.
-   W x=34 s=0 z=100 t=SIBLING:
-   W x=113 s=0 z=100 t=no
-   W x=142 s=0 z=100 t=spacing
-   W x=210 s=0 z=100 t=left
-   W x=254 s=0 z=100 t=over.
+   W x=34 s=0 z=100 t=SECTION:
+  LINE y=132 x=0 align=0 mult=1.000 hfid=0 words=2
+   W x=0 s=0 z=100 t=India
+   W x=52 s=0 z=100 t=first
+  LINE y=156 x=0 align=0 mult=1.000 hfid=0 words=2
+   W x=0 s=0 z=100 t=India
+   W x=52 s=0 z=100 t=second
+  LINE y=198 x=0 align=0 mult=1.000 hfid=0 words=2
+   W x=0 s=0 z=100 t=11.
+   W x=28 s=0 z=100 t=ASIDE:
+  LINE y=231 x=0 align=0 mult=1.000 hfid=0 words=3
+   W x=18 s=0 z=100 t=Juliet
+   W x=79 s=0 z=100 t=bare
+   W x=120 s=0 z=100 t=text
+  LINE y=264 x=0 align=0 mult=1.000 hfid=0 words=6
+   W x=0 s=0 z=100 t=12.
+   W x=29 s=0 z=100 t=SIBLING:
+   W x=108 s=0 z=100 t=no
+   W x=137 s=0 z=100 t=spacing
+   W x=205 s=0 z=100 t=left
+   W x=249 s=0 z=100 t=over.
