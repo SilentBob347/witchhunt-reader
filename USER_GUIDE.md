@@ -124,7 +124,7 @@ The Browse Files screen is a full-featured file and folder browser.
 * **Navigate List:** Use **Left** (or **Volume Up**), or **Right** (or **Volume Down**) to move the selection cursor up and down through folders and books. Long-pressing these buttons scrolls a full page at a time.
 * **Open Selection:** Press **Confirm** to open a folder or read a selected book.
 * **Options menu:** Hold **Right** (the page-forward button) to open the menu for the selected item. In a folder short enough to fit on one screen, a short press of Right opens it too. On a device without a Confirm key, such as the X4 Pro, **Confirm** opens the menu instead, and a tap on a row opens the item. The button hints always show which button does what.
-  * For a book or file: **Open**, **Mark as read**, **Info**, **Delete Book Cache**, **Remove**, **Set as sleep screen** (images), **Flash firmware** (`.bin` files), **Move to folder**, **New Folder**, **Search** and **Search all folders**.
+  * For a book or file: **Open**, **Mark as read**, **Info**, **Delete Book Cache**, **Remove**, **Set as sleep screen** (images), **Move to folder**, **New Folder**, **Search** and **Search all folders**.
   * For a folder: **Open**, the sort and visibility options, **Search**, **Search all folders**, **New Folder** and **Remove**, which deletes the folder and everything in it.
 
 #### Sorting
@@ -337,7 +337,7 @@ The Settings screen allows you to configure the device's behavior.
 **Firmware Update**:
 - **Check for Updates**: Check for and download Witch Reader firmware updates over WiFi.
 - **Include Beta Updates**: Whether to include release-candidate builds in update checks. "ON" / "OFF"
-- **SD Firmware Update**: Flash a firmware `.bin` file from the SD card.
+- **SD Firmware Update**: Flash a firmware `.bin` file from the SD card. Press **Confirm** on a file to flash it. The **Options** button hint in the file picker opens a smaller menu than the Browse Files one: the sort and visibility options, **Search**, **Search all folders**, and **Remove** to delete a `.bin` you no longer need.
 - **Switch to USB Drive**: Reboot the device into USB mass-storage mode to access the SD card directly from a computer.
 
 #### 3.7.5 OPDS Servers (Multiple Libraries)
