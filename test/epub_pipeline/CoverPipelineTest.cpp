@@ -25,14 +25,15 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Minimal EPUB whose OPF declares `coverName` as the cover image.
+// Minimal EPUB whose OPF declares `coverName` as the cover image. Without `declareCover` the image
+// is still in the manifest but nothing names it the cover, and the file comes out the same size.
 std::string makeEpub(const fs::path& path, const std::string& coverName, const std::string& coverBytes,
-                     const std::string& title) {
+                     const std::string& title, const bool declareCover = true) {
   const std::string opf =
       "<?xml version=\"1.0\"?><package version=\"2.0\" xmlns=\"http://www.idpf.org/2007/opf\">"
       "<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>" +
-      title +
-      "</dc:title><meta name=\"cover\" content=\"cov\"/></metadata>"
+      title + "</dc:title><meta name=\"" + (declareCover ? "cover" : "other") +
+      "\" content=\"cov\"/></metadata>"
       "<manifest><item id=\"cov\" href=\"" +
       coverName +
       "\" media-type=\"image/png\"/>"
@@ -103,14 +104,31 @@ TEST_F(CoverPipelineFixture, MemoDoesNotAnswerForADifferentBook) {
   EXPECT_EQ(epubA2.getCoverItemHref(), "coverA.png");
 }
 
-// Repeat queries for the same book are what the memo exists for.
-TEST_F(CoverPipelineFixture, RepeatedLoadForCoverAgrees) {
-  const std::string a = makeEpub(work / "a.epub", "coverA.png", pngString(), "A");
-  for (int i = 0; i < 5; i++) {
-    Epub epub(a, (work / "ca").string());
-    ASSERT_TRUE(epub.loadForCover()) << "attempt " << i;
-    EXPECT_EQ(epub.getCoverItemHref(), "coverA.png") << "attempt " << i;
+// Repeat queries for the same book are what the memo exists for. The one outside sign that a repeat
+// was answered from it, rather than by parsing the OPF again, is a change the key cannot see: same
+// path, same size, a different cover name.
+TEST_F(CoverPipelineFixture, RepeatedLoadForCoverIsServedFromTheMemo) {
+  const fs::path path = work / "a.epub";
+  makeEpub(path, "coverA.png", pngString(), "A");
+  const auto size = fs::file_size(path);
+  {
+    Epub epub(path.string(), (work / "ca").string());
+    ASSERT_TRUE(epub.loadForCover());
+    ASSERT_EQ(epub.getCoverItemHref(), "coverA.png");
   }
+  makeEpub(path, "coverZ.png", pngString(), "A");
+  ASSERT_EQ(fs::file_size(path), size) << "the rewrite must keep the memo key";
+  for (int i = 0; i < 4; i++) {
+    Epub epub(path.string(), (work / "ca").string());
+    ASSERT_TRUE(epub.loadForCover()) << "attempt " << i;
+    EXPECT_EQ(epub.getCoverItemHref(), "coverA.png") << "attempt " << i << " parsed the OPF again";
+  }
+
+  // The memo is what held the old answer: without it the same call sees the rewrite.
+  Epub::clearCoverMetadataMemo();
+  Epub epub(path.string(), (work / "ca").string());
+  ASSERT_TRUE(epub.loadForCover());
+  EXPECT_EQ(epub.getCoverItemHref(), "coverZ.png");
 }
 
 // Same path, different content: the size key must force a re-parse rather than serve the old cover.
@@ -132,27 +150,27 @@ TEST_F(CoverPipelineFixture, ReplacedBookAtTheSamePathIsNotServedStale) {
 }
 
 // A book with no cover is memoized too — the "no cover" answer is exactly what the next three
-// calls would otherwise re-parse the OPF to rediscover.
+// calls would otherwise re-parse the OPF to rediscover. Observed the same way: a same-size rewrite
+// that does declare a cover goes unseen until the memo is cleared.
 TEST_F(CoverPipelineFixture, BookWithoutACoverStaysWithoutOne) {
-  test_zip::StoredZipWriter zip;
-  zip.add("mimetype", "application/epub+zip");
-  zip.add("META-INF/container.xml",
-          "<?xml version=\"1.0\"?><container version=\"1.0\" "
-          "xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile "
-          "full-path=\"content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>");
-  zip.add("content.opf",
-          "<?xml version=\"1.0\"?><package version=\"2.0\" xmlns=\"http://www.idpf.org/2007/opf\">"
-          "<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>NoCover</dc:title></metadata>"
-          "<manifest><item id=\"c1\" href=\"c1.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>"
-          "<spine><itemref idref=\"c1\"/></spine></package>");
-  zip.add("c1.xhtml", "<html><body><p>x</p></body></html>");
-  const std::string path = (work / "nocover.epub").string();
-  zip.write(path);
-
-  for (int i = 0; i < 3; i++) {
-    Epub epub(path, (work / "cn").string());
-    EXPECT_FALSE(epub.loadForCover()) << "attempt " << i;
+  const fs::path path = work / "nocover.epub";
+  makeEpub(path, "pic.png", pngString(), "N", /*declareCover=*/false);
+  const auto size = fs::file_size(path);
+  {
+    Epub epub(path.string(), (work / "cn").string());
+    ASSERT_FALSE(epub.loadForCover());
   }
+  makeEpub(path, "pic.png", pngString(), "N", /*declareCover=*/true);
+  ASSERT_EQ(fs::file_size(path), size) << "the rewrite must keep the memo key";
+  for (int i = 0; i < 3; i++) {
+    Epub epub(path.string(), (work / "cn").string());
+    EXPECT_FALSE(epub.loadForCover()) << "attempt " << i << " parsed the OPF again";
+  }
+
+  Epub::clearCoverMetadataMemo();
+  Epub epub(path.string(), (work / "cn").string());
+  ASSERT_TRUE(epub.loadForCover());
+  EXPECT_EQ(epub.getCoverItemHref(), "pic.png");
 }
 
 // The in-place decode must produce exactly the thumbnail the extract-then-decode path does.

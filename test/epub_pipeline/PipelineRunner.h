@@ -4,8 +4,7 @@
 // text dump of the resulting layout: per page, every element's position, every
 // word's text/x-position/style. Two runs over the same book with the same
 // profile must produce byte-identical dumps (determinism), and any layout
-// refactor must keep the dump unchanged (golden equivalence). See
-// docs/compiled-book-pipeline-plan.md Phase 0.
+// refactor must keep the dump unchanged (golden equivalence).
 #include <cstdint>
 #include <functional>
 #include <ostream>
@@ -51,8 +50,9 @@ using SpineStatFn = std::function<void(int spineIndex, uint16_t pages, int64_t e
 
 // Compile `epubPath` into `cacheDir` under `profile` and stream the canonical
 // dump to `out`. Returns false on any pipeline failure (already-logged).
-// `cacheDir` should be empty/fresh for a cold run; a second call over the same
-// cacheDir exercises the warm (cache-hit) path and must dump identically.
+// `cacheDir` should be empty/fresh for a cold run. A second call over the same
+// cacheDir still rebuilds every section, but from the book-level caches the first
+// left behind (book.bin, CSS index, image manifest, banked XHTML, footnote store).
 bool runAndDump(const std::string& epubPath, const std::string& cacheDir, const Profile& profile, std::ostream& out,
                 const SpineStatFn& spineStat = {}, const ArenaStatFn& arenaStat = {});
 

@@ -6,7 +6,8 @@ everything on the heap) and --arena=52272 (a borrowed build: the X3 framebuffer 
 build arena) -- and compares the heap-side peak against the committed baseline. The arena
 mode's figure has the arena's own allocation subtracted, so both columns are "what the build
 put on the heap". Fails when a fixture rises by more than MARGIN bytes: the regression test the
-pending-image queue never had.
+pending-image queue never had. Prints a WARNING, without failing, when one falls by more than
+MARGIN, because that baseline has gone stale and no longer guards the fixture.
 
 Re-baseline deliberately, not to make the test pass: UPDATE_HEAP_BASELINE=1 rewrites the file.
 """
@@ -63,13 +64,25 @@ def main():
         print(f"baseline rewritten: {baseline_path}")
         return 0
     failed = False
+    stale = []
     for key in sorted(measured):
         base, now = baseline[key], measured[key]
         delta = now - base
-        flag = "REGRESSION" if delta > MARGIN else ("lower" if delta < -MARGIN else "ok")
+        flag = "REGRESSION" if delta > MARGIN else ("STALE" if delta < -MARGIN else "ok")
         print(f"{key[0]:<28} {key[1]:<9} baseline={base:>7} now={now:>7} delta={delta:+7}  {flag}")
         if delta > MARGIN:
             failed = True
+        elif delta < -MARGIN:
+            stale.append(key)
+    # Deliberately not a failure: a peak that dropped is good news, and the figures shift by a few
+    # hundred bytes with the checkout path and the toolchain (CI builds with its own GCC/libstdc++).
+    # But the gate only trips on a rise past baseline + MARGIN, so a stale baseline lets a fixture
+    # grow by the whole drop before anything notices.
+    for key in stale:
+        drop = baseline[key] - measured[key]
+        print(f"WARNING: baseline stale for {key[0]} ({key[1]}): peak is {drop} B below it, so it could "
+              f"regrow {drop + MARGIN} B before this gate fails. Re-run with UPDATE_HEAP_BASELINE=1 and "
+              f"commit heap_peak_baseline.txt.")
     if failed:
         print(f"heap-side peak rose by more than {MARGIN} B on at least one fixture; "
               "find the allocation (epub_pipeline_dump --bench prints the sites) or re-baseline on purpose "

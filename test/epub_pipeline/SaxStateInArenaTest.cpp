@@ -40,7 +40,7 @@ struct SaxStateInArenaFixture : testing::Test {
 
   // Builds the long chapter with `arena` lent as the build scratch; returns the most arena in
   // use at any progress tick during the parse.
-  size_t arenaUsedDuringParse(BuildArena* arena) {
+  size_t arenaUsedDuringParse(BuildArena& arena) {
     auto epub = std::make_shared<Epub>(kBook, cacheDir);
     EXPECT_TRUE(epub->load(true));
     int spine = -1;
@@ -55,14 +55,14 @@ struct SaxStateInArenaFixture : testing::Test {
     GfxRenderer renderer;
     Section section(epub, spine, renderer);
     section.clearCache();
-    if (arena) section.setExternalBuildScratch(arena);
+    section.setExternalBuildScratch(&arena);
     size_t maxUsed = 0;
     int ticks = 0;
     EXPECT_TRUE(section.createSectionFile(
         params,
         [&](int) {
           ++ticks;
-          if (arena) maxUsed = std::max(maxUsed, arena->used());
+          maxUsed = std::max(maxUsed, arena.used());
         },
         /*skipEviction=*/true));
     EXPECT_GT(section.pageCount, 10);
@@ -74,7 +74,7 @@ struct SaxStateInArenaFixture : testing::Test {
 TEST_F(SaxStateInArenaFixture, ALentArenaHoldsTheSaxParserStateDuringTheParse) {
   BuildArena arena(52 * 1024);  // the borrowed secondary framebuffer's size
   ASSERT_TRUE(arena.valid());
-  const size_t used = arenaUsedDuringParse(&arena);
+  const size_t used = arenaUsedDuringParse(arena);
   EXPECT_GE(used, SaxParser::stateBytes()) << "the parser state must come out of the lent arena, not the heap";
   // A page's lines (their TextBlock bytes, ~28 x ~180 B) live in the page's block of the region
   // too, above the parser state and the feed chunk (memory audit 2026-09, R2 step 2).
@@ -86,7 +86,5 @@ TEST_F(SaxStateInArenaFixture, ALentArenaHoldsTheSaxParserStateDuringTheParse) {
   EXPECT_EQ(arena.used(), 0u) << "the build rewinds everything it took";
   EXPECT_EQ(arena.releaseFailures(), 0u) << "every block release was in order";
 }
-
-TEST_F(SaxStateInArenaFixture, NoArenaStillBuilds) { EXPECT_EQ(arenaUsedDuringParse(nullptr), 0u); }
 
 }  // namespace
