@@ -1178,7 +1178,9 @@ bool CssParser::endCacheCompile() {
   outFile.close();
   Storage.remove(compileTempPath_.c_str());
 
-  compileSelectorOffsets_.clear();
+  // swap, not clear(): clear() frees the nodes but keeps the bucket array, which would sit
+  // under the index ensureCacheIndexLoaded() is about to allocate.
+  std::unordered_map<std::string, uint32_t>().swap(compileSelectorOffsets_);
 
   rulesBySelector_.clear();
   hotRuleCache_.clear();
@@ -1229,9 +1231,7 @@ void CssParser::clearCaches(const bool evictEverything) {
   // Retain the sorted disk index if it fits in 10 KB — avoids a cold SD re-read
   // (~240 ms) at the start of each section build. Evict if larger to protect heap.
   if (cacheRuleOffsets_.size() * CSS_INDEX_BYTES_PER_RULE > 10 * 1024) {
-    cacheRuleOffsets_.clear();
-    cacheIndexLoaded_ = false;
-    cachedRuleCount_ = 0;
+    dropIndex();
   }
 }
 
@@ -1253,7 +1253,7 @@ void CssParser::clear() {
   compileModeActive_ = false;
   compileModeFailed_ = false;
   rulesTruncated_ = false;
-  compileSelectorOffsets_.clear();
+  std::unordered_map<std::string, uint32_t>().swap(compileSelectorOffsets_);
   totalSelectorCandidates_ = 0;
   unsupportedSelectorSkips_ = 0;
   // Cleared to FALSE, unlike its conservative default: what follows is either a parse, which
@@ -1707,7 +1707,7 @@ bool CssParser::ensureCacheIndexLoaded() const {
     const size_t indexBytes = static_cast<size_t>(ruleCount) * sizeof(SelectorEntry);
     if (file.read(reinterpret_cast<uint8_t*>(cacheRuleOffsets_.data()), indexBytes) != static_cast<int>(indexBytes)) {
       file.close();
-      cacheRuleOffsets_.clear();
+      dropIndex();
       return false;
     }
   }
@@ -1987,7 +1987,8 @@ bool CssParser::loadArenaResident(FsFile& file, const uint16_t ruleCount, const 
 // loaded flag so ensureCacheIndexLoaded() reloads. Arena memory is owned by the arena
 // (reset per build), so we only drop the non-owning pointers here.
 void CssParser::dropIndex() const {
-  cacheRuleOffsets_.clear();
+  // swap, not clear(): clear() keeps the capacity, and the index is up to MAX_RULES x 8 B.
+  std::vector<SelectorEntry>().swap(cacheRuleOffsets_);
   arenaResident_ = nullptr;
   arenaStylePool_ = nullptr;
   arenaStyleCount_ = 0;
