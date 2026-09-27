@@ -1289,6 +1289,23 @@ void EpubReaderActivity::startActivityForResult(std::unique_ptr<Activity>&& acti
     const uint8_t preemptionsBeforeOverlay = backgroundPreemptCount_;
     endBackgroundBorrow();
     backgroundPreemptCount_ = preemptionsBeforeOverlay;
+    // The child draws over the page, so nothing staged for this screen survives it: the owed
+    // deferred AA of the page on it, and a queued or finished pre-render of the next page (it lives
+    // in the write framebuffer, which the child draws into). Left armed, the render that follows
+    // the child's return was classified as that pre-render and drew nothing -- the menu stayed on
+    // screen until the next page turn (X3 run 23: a lane redraw finished 11 ms before the menu
+    // press, arming the pre-render, which the heap floor then skipped). Dropped, that render is a
+    // Normal pass that redraws the page and stages its AA afresh.
+    if (pendingGrayscale_.active || pendingPreRender || usePreRenderedBuffer || preRenderedPage.ready) {
+      LOG_DBG("ERS", "Overlay '%s' opening; dropping the%s%s%s staged for the page under it",
+              activity ? activity->getName().c_str() : "<null>", pendingGrayscale_.active ? " deferred AA" : "",
+              pendingPreRender ? " pre-render request" : "", preRenderedPage.ready ? " pre-rendered page" : "");
+    }
+    pendingGrayscale_ = {};
+    pendingPreRender = false;
+    usePreRenderedBuffer = false;
+    preRenderedPage = {};
+    preRenderedPlanesStaged_ = false;
   }
   Activity::startActivityForResult(std::move(activity), std::move(resultHandler));
 }
@@ -1811,6 +1828,14 @@ bool EpubReaderActivity::warmPageForImageLane(const Page& page, const int spine,
   // workspace), exactly as the page-turn warm borrows it; the framebuffer is not written at
   // all (ScopedCacheOnlyImageWrites), so the page on screen -- or a pre-rendered next page --
   // is untouched and no clearScreen follows. One page per tick.
+  // At the offsets the page render draws the images at, not (0, 0): the ordered dither baked into a
+  // .pxc follows screen position, so a lane-warmed cache used to differ in phase from the one a
+  // page render writes -- and a decode the lane parks (see RenderConfig::checkpointPath) resumes
+  // only for the very same configuration, so a page turn onto the image could never pick it up.
+  const RenderLayout layout = computeRenderLayout();
+  const int viewportHeight = std::max(0, renderer.getScreenHeight() - layout.marginTop - layout.marginBottom);
+  const int contentTop = layout.marginTop + getImageOnlyPageYOffset(page, viewportHeight);
+
   size_t borrowedSize = 0;
   uint8_t* borrowed = renderer.borrowSecondaryBuffer(&borrowedSize);
   if (!borrowed) return false;
@@ -1821,7 +1846,8 @@ bool EpubReaderActivity::warmPageForImageLane(const Page& page, const int spine,
   {
     image_scratch::ScopedArena scratchScope(scratch && scratch->valid() ? scratch.get() : nullptr);
     GfxRenderer::ScopedCacheOnlyImageWrites cacheOnly(renderer);
-    page.warmImageCaches(renderer, 0, 0, /*forceLoad=*/true, /*monochromeOutput=*/true, warmGrayscale);
+    page.warmImageCaches(renderer, layout.marginLeft, contentTop, /*forceLoad=*/true, /*monochromeOutput=*/true,
+                         warmGrayscale);
   }
   // Preempted by input: not a failure, the next quiet moment retries.
   const bool preempted = CooperativeAbort::consumeAborted();

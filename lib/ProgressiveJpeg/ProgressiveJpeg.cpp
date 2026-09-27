@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <new>
+#include <type_traits>
 
 namespace ProgressiveJpeg {
 namespace {
@@ -242,6 +243,9 @@ struct Session {
   Phase phase = Phase::Index;
   Result outcome = Result::Ok;  // once Done: what every further step() reports
 };
+// A checkpoint is the session's bytes (Decoder::writeCheckpoint), so nothing in it may need a
+// constructor or destructor to be valid.
+static_assert(std::is_trivially_copyable<Session>::value, "a checkpoint is the session's raw bytes");
 
 namespace {
 
@@ -967,6 +971,13 @@ size_t workspaceBytes(const ImageInfo& info, const uint8_t scaleShift) {
 }
 
 Result Decoder::begin(FsFile& file, const DecodeOptions& options, const BandCallback callback, void* user) {
+  const Result claimed = claim(file, options, callback, user);
+  if (claimed != Result::Ok) return claimed;
+  buildBasis(session_->st, session_->g.n);
+  return Result::Ok;
+}
+
+Result Decoder::claim(FsFile& file, const DecodeOptions& options, const BandCallback callback, void* user) {
   end();
   if (!file || callback == nullptr || options.scaleShift > 3) return Result::InvalidData;
   ImageInfo info;
@@ -1002,7 +1013,6 @@ Result Decoder::begin(FsFile& file, const DecodeOptions& options, const BandCall
   session_->user = user;
   session_->st.source.file = &file;
   session_->st.source.base = options.base;
-  buildBasis(session_->st, g.n);
   file_ = &file;
   options_ = options;
   if (options_.stats) *options_.stats = DecodeStats{};
@@ -1054,12 +1064,89 @@ Result Decoder::step(const uint16_t units) {
     options_.stats->reads = ss.st.source.reads;
     options_.stats->bytesRead = ss.st.source.bytesRead;
   }
-  if (result != Result::Pending) {
+  // An abort stops between index chunks or before a band, where the session is exactly the state
+  // the next step would start from: it stays resumable (and checkpointable). Anything else is final.
+  if (result != Result::Pending && result != Result::Aborted) {
     ss.phase = Session::Phase::Done;
     ss.outcome = result;
   }
   return result;
 }
+
+namespace {
+constexpr uint32_t CHECKPOINT_MAGIC = 0x31434A50;  // "PJC1"
+struct CheckpointHeader {
+  uint32_t magic;
+  uint32_t sessionBytes;   // sizeof(Session): another firmware's layout is refused, not misread
+  uint64_t lookaheadBase;  // where State::lookaheads sat: each table's lookahead pointer rebases from it
+  uint32_t base;
+  uint8_t scaleShift;
+  uint8_t reserved[3];
+};
+}  // namespace
+
+size_t Decoder::checkpointSize() const { return sizeof(CheckpointHeader) + sizeof(Session); }
+
+bool Decoder::writeCheckpoint(FsFile& out) const {
+  if (session_ == nullptr || session_->phase == Session::Phase::Done) return false;
+  CheckpointHeader header{};
+  header.magic = CHECKPOINT_MAGIC;
+  header.sessionBytes = sizeof(Session);
+  header.lookaheadBase = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&session_->st.lookaheads[0]));
+  header.base = options_.base;
+  header.scaleShift = options_.scaleShift;
+  return out.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) == sizeof(header) &&
+         out.write(reinterpret_cast<const uint8_t*>(session_), sizeof(Session)) == sizeof(Session);
+}
+
+Result Decoder::resume(FsFile& file, const DecodeOptions& options, const BandCallback callback, void* user,
+                       FsFile& checkpoint) {
+  const Result claimed = claim(file, options, callback, user);
+  if (claimed != Result::Ok) return claimed;
+  const auto refuse = [this]() {
+    end();
+    return Result::InvalidData;
+  };
+  CheckpointHeader header{};
+  if (checkpoint.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != static_cast<int>(sizeof(header)) ||
+      header.magic != CHECKPOINT_MAGIC || header.sessionBytes != sizeof(Session) || header.base != options.base ||
+      header.scaleShift != options.scaleShift) {
+    return refuse();
+  }
+  // The fresh session knows the image as it is now; the checkpoint must describe the same one.
+  Session& ss = *session_;
+  const ImageInfo info = ss.info;
+  const Geometry g = ss.g;
+  const Layout layout = ss.layout;
+  uint8_t* const workspace = ss.workspace;
+  if (checkpoint.read(reinterpret_cast<uint8_t*>(&ss), sizeof(Session)) != static_cast<int>(sizeof(Session))) {
+    return refuse();
+  }
+  if (ss.info.width != info.width || ss.info.height != info.height || ss.info.componentCount != info.componentCount ||
+      ss.g.bandCount != g.bandCount || ss.g.n != g.n || ss.g.paddedCols != g.paddedCols ||
+      ss.layout.total != layout.total || ss.phase == Session::Phase::Done || ss.nextBand > g.bandCount) {
+    return refuse();
+  }
+  // Re-bind what the checkpoint cannot carry: this workspace, this file, this caller.
+  ss.workspace = workspace;
+  ss.callback = callback;
+  ss.user = user;
+  ss.st.source.file = &file;
+  ss.st.source.base = options.base;
+  ss.st.source.start = 0;
+  ss.st.source.length = 0;  // the buffered window refills on the first read
+  ss.st.source.ioError = false;
+  for (HuffmanTable& table : ss.st.pool) {
+    if (table.lookahead == nullptr) continue;
+    const uint64_t offset = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(table.lookahead)) - header.lookaheadBase;
+    if (offset % sizeof(Lookahead) != 0 || offset / sizeof(Lookahead) >= State::kMaxLookaheads) return refuse();
+    table.lookahead = &ss.st.lookaheads[offset / sizeof(Lookahead)];
+  }
+  return Result::Ok;
+}
+
+uint16_t Decoder::bandsDone() const { return session_ ? session_->nextBand : 0; }
+uint16_t Decoder::bandCount() const { return session_ ? session_->g.bandCount : 0; }
 
 void Decoder::end() {
   if (session_ == nullptr) return;

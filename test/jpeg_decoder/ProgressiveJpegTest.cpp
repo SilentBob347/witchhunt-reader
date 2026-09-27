@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -346,9 +347,128 @@ TEST(ProgressiveJpeg, StepPollsTheAbortHook) {
   } while (r == ProgressiveJpeg::Result::Pending);
   EXPECT_EQ(r, ProgressiveJpeg::Result::Aborted);
   EXPECT_EQ(capture.bands, 2);
-  EXPECT_EQ(decoder.step(1), ProgressiveJpeg::Result::Aborted) << "a finished decode keeps its outcome";
+  EXPECT_TRUE(decoder.active()) << "an abort leaves the session resumable";
+  hook.abortAt = 1000;
+  do {
+    r = decoder.step(1);
+  } while (r == ProgressiveJpeg::Result::Pending);
+  EXPECT_EQ(r, ProgressiveJpeg::Result::Ok) << "stepping on after an abort finishes the decode";
   decoder.end();
   file.close();
+}
+
+// The reader's image lane has to give its workspace back on every page turn. A checkpoint taken
+// at any step -- mid index pass or between bands -- and resumed by a fresh decoder in a fresh
+// workspace must continue with exactly the rows the uninterrupted decode would have emitted.
+std::string tempPath(const std::string& name) {
+  return (std::filesystem::temp_directory_path() / ("pjpeg_" + name)).string();
+}
+
+class ProgressiveJpegCheckpoint : public testing::TestWithParam<std::tuple<const char*, int>> {};
+
+TEST_P(ProgressiveJpegCheckpoint, ResumesWithIdenticalRowsFromEveryStep) {
+  const auto& [jpg, shift] = GetParam();
+  Capture oneShot;
+  ASSERT_EQ(decode(jpg, shift, oneShot), ProgressiveJpeg::Result::Ok);
+  const std::string ckpt = tempPath(std::string(jpg) + "_" + std::to_string(shift) + ".ckpt");
+
+  // How many 1-unit steps the whole decode takes.
+  const int totalSteps = [&] {
+    SteppedRun run = decodeStepped(jpg, shift, 1);
+    return run.indexSteps + run.bandSteps;
+  }();
+  ASSERT_GT(totalSteps, 3);
+
+  for (int stop = 1; stop < totalSteps; ++stop) {
+    SCOPED_TRACE("checkpoint after step " + std::to_string(stop));
+    Capture capture;
+    ProgressiveJpeg::DecodeOptions options;
+    options.scaleShift = static_cast<uint8_t>(shift);
+    {
+      FsFile file;
+      ASSERT_TRUE(file.openForRead(fixture(jpg)));
+      ProgressiveJpeg::Decoder first;
+      ASSERT_EQ(first.begin(file, options, Capture::accept, &capture), ProgressiveJpeg::Result::Ok);
+      for (int i = 0; i < stop; ++i) ASSERT_EQ(first.step(1), ProgressiveJpeg::Result::Pending);
+      FsFile out;
+      ASSERT_TRUE(out.openForWrite(ckpt));
+      ASSERT_TRUE(first.writeCheckpoint(out));
+      EXPECT_EQ(out.position(), first.checkpointSize());
+      out.close();
+      first.end();
+      file.close();
+    }
+    // A different workspace address: the checkpoint must not depend on where the first one sat.
+    std::vector<uint8_t> elsewhere;
+    {
+      FsFile file;
+      ASSERT_TRUE(file.openForRead(fixture(jpg)));
+      ProgressiveJpeg::ImageInfo info;
+      ASSERT_EQ(ProgressiveJpeg::probe(file, info), ProgressiveJpeg::Result::Ok);
+      elsewhere.resize(ProgressiveJpeg::workspaceBytes(info, static_cast<uint8_t>(shift)) + 3);
+      options.workspace = elsewhere.data() + 3;
+      options.workspaceSize = elsewhere.size() - 3;
+      FsFile in;
+      ASSERT_TRUE(in.openForRead(ckpt));
+      ProgressiveJpeg::Decoder second;
+      ASSERT_EQ(second.resume(file, options, Capture::accept, &capture, in), ProgressiveJpeg::Result::Ok);
+      in.close();
+      ProgressiveJpeg::Result r;
+      do {
+        r = second.step(1);
+      } while (r == ProgressiveJpeg::Result::Pending);
+      ASSERT_EQ(r, ProgressiveJpeg::Result::Ok);
+      second.end();
+      file.close();
+    }
+    EXPECT_TRUE(capture.orderOk);
+    EXPECT_EQ(capture.image.h, oneShot.image.h);
+    EXPECT_TRUE(capture.image.px == oneShot.image.px);
+  }
+  std::remove(ckpt.c_str());
+}
+
+INSTANTIATE_TEST_SUITE_P(Fixtures, ProgressiveJpegCheckpoint,
+                         testing::Combine(testing::Values("prog_full_420.jpg", "prog_full_gray.jpg",
+                                                          "prog_full_444_rst.jpg"),
+                                          testing::Values(0, 1)));
+
+// A checkpoint only resumes the decode it was taken of.
+TEST(ProgressiveJpeg, ResumeRefusesAForeignCheckpoint) {
+  const std::string ckpt = tempPath("foreign.ckpt");
+  Capture capture;
+  {
+    FsFile file;
+    ASSERT_TRUE(file.openForRead(fixture("prog_full_420.jpg")));
+    ProgressiveJpeg::DecodeOptions options;
+    options.scaleShift = 1;
+    ProgressiveJpeg::Decoder d;
+    ASSERT_EQ(d.begin(file, options, Capture::accept, &capture), ProgressiveJpeg::Result::Ok);
+    ASSERT_EQ(d.step(1), ProgressiveJpeg::Result::Pending);
+    FsFile out;
+    ASSERT_TRUE(out.openForWrite(ckpt));
+    ASSERT_TRUE(d.writeCheckpoint(out));
+    out.close();
+  }
+  const auto resumeWith = [&](const char* jpg, const int shift, const size_t truncateTo = 0) {
+    if (truncateTo) std::filesystem::resize_file(ckpt, truncateTo);
+    FsFile file;
+    EXPECT_TRUE(file.openForRead(fixture(jpg)));
+    ProgressiveJpeg::DecodeOptions options;
+    options.scaleShift = static_cast<uint8_t>(shift);
+    FsFile in;
+    EXPECT_TRUE(in.openForRead(ckpt));
+    ProgressiveJpeg::Decoder d;
+    Capture c;
+    const auto r = d.resume(file, options, Capture::accept, &c, in);
+    EXPECT_FALSE(d.active() && r != ProgressiveJpeg::Result::Ok) << "a refused resume holds nothing";
+    return r;
+  };
+  EXPECT_EQ(resumeWith("prog_full_420.jpg", 2), ProgressiveJpeg::Result::InvalidData) << "another scale";
+  EXPECT_EQ(resumeWith("prog_full_gray.jpg", 1), ProgressiveJpeg::Result::InvalidData) << "another image";
+  EXPECT_EQ(resumeWith("prog_full_420.jpg", 1), ProgressiveJpeg::Result::Ok) << "the image it was taken of";
+  EXPECT_EQ(resumeWith("prog_full_420.jpg", 1, 100), ProgressiveJpeg::Result::InvalidData) << "a truncated file";
+  std::remove(ckpt.c_str());
 }
 
 // Smaller output keeps fewer coefficients per block: the working set has to shrink with it.

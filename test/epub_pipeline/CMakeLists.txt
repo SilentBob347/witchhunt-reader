@@ -103,6 +103,7 @@ add_executable(EpubPipelineTest
   SaxStateInArenaTest.cpp
   JpegDownscaleTest.cpp
   CompanionCacheTest.cpp
+  ImageParkTest.cpp
   StoredEntryDecodeTest.cpp
   PixelCacheWriteTest.cpp
   BufferedPrintTest.cpp
