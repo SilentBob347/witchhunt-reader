@@ -295,8 +295,17 @@ class ChapterHtmlSlimParser final : public Print {
     bool isOrdered;
     int counter;
     bool suppressMarker = false;  // true when list-style-type: none
+    // The list's bottom spacing, held until </ul>/</ol> so it lands after the last item.
+    int16_t marginBottom = 0;
+    int16_t paddingBottom = 0;
   };
   std::vector<ListEntry> listStack;
+  void applyListBottomSpacing(const ListEntry& list);
+  // The open <li>'s marker ("•", "3."), held back until the item has content: the item's block
+  // stays empty, so a <p> opening the item merges into it and the marker leads that paragraph's
+  // first line instead of a line of its own. Empty when no marker is waiting.
+  char pendingListMarker_[16] = {};
+  void emitPendingListMarker();
 
   // Ancestor block widths set via an explicit CSS `width` (e.g. a
   // <div style="width:100px"> wrapper). A percentage image width resolves against the

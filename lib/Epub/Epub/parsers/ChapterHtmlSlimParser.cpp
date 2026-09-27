@@ -232,10 +232,15 @@ constexpr int NUM_BLOCK_TAGS = sizeof(BLOCK_TAGS) / sizeof(BLOCK_TAGS[0]);
 // Elements whose own horizontal inset also applies to the blocks nested inside them
 // (blockInsetStack_). Everything that can hold another block belongs here, plus <p>/<li>/<pre>,
 // whose <br>-separated lines each become a block of their own and must keep the inset of the
-// paragraph they belong to. <ul>/<ol> deliberately stay out: list indentation is synthesised
-// per <li> from the list depth, so counting the list's own margin as well would double it.
-const char* INSET_CONTAINER_TAGS[] = {"div", "blockquote", "section", "article", "aside", "main", "p", "li", "pre"};
+// paragraph they belong to. <ul>/<ol> are how a list's items get their indent: in CSS an item
+// starts at the list's content edge, and its own margin-left only adds to that.
+const char* INSET_CONTAINER_TAGS[] = {"div", "blockquote", "section", "article", "aside", "main",
+                                      "p",   "li",         "pre",     "ul",      "ol"};
 constexpr int NUM_INSET_CONTAINER_TAGS = sizeof(INSET_CONTAINER_TAGS) / sizeof(INSET_CONTAINER_TAGS[0]);
+
+// A list's padding-left when the book states none -- the stand-in for the browser default
+// `padding-inline-start: 40px`, which is what indents an unstyled list. Nested lists each add it.
+constexpr float LIST_DEFAULT_PADDING_EM = 1.5f;
 
 const char* BOLD_TAGS[] = {"b", "strong"};
 constexpr int NUM_BOLD_TAGS = sizeof(BOLD_TAGS) / sizeof(BOLD_TAGS[0]);
@@ -873,6 +878,9 @@ bool ChapterHtmlSlimParser::flushPartWordBuffer() {
     fontStyle = static_cast<EpdFontFamily::Style>(fontStyle | EpdFontFamily::SMALL_CAPS);
   }
 
+  // The item's first word: its marker goes in front of it.
+  emitPendingListMarker();
+
   // flush the buffer — route to table cell text when inside a <td>/<th>
   partWordBuffer[partWordBufferIndex] = '\0';
   if (currentTableCell && currentTableCell->text) {
@@ -1317,6 +1325,29 @@ void ChapterHtmlSlimParser::finalizePendingDropCap() {
           capWidth + kDropCapGapPx, zoneHeight);
 }
 
+void ChapterHtmlSlimParser::emitPendingListMarker() {
+  if (pendingListMarker_[0] == '\0') return;
+  if (currentTextBlock) currentTextBlock->addWord(pendingListMarker_, EpdFontFamily::REGULAR);
+  pendingListMarker_[0] = '\0';
+}
+
+void ChapterHtmlSlimParser::applyListBottomSpacing(const ListEntry& list) {
+  if ((list.marginBottom <= 0 && list.paddingBottom <= 0) || !currentTextBlock) return;
+  if (partWordBufferIndex > 0) flushPartWordBuffer();
+  BlockStyle style = currentTextBlock->getBlockStyle();
+  if (currentTextBlock->isEmpty()) {
+    // Nothing of the list is left to lay out (its last item was empty, or an image or a table):
+    // the spacing goes before whatever follows, which this empty block merges into.
+    style.marginTop = std::max(style.marginTop, list.marginBottom);
+    style.paddingTop = static_cast<int16_t>(style.paddingTop + list.paddingBottom);
+  } else {
+    // The last item's own margin-bottom and the list's collapse into the larger of the two.
+    style.marginBottom = std::max(style.marginBottom, list.marginBottom);
+    style.paddingBottom = static_cast<int16_t>(style.paddingBottom + list.paddingBottom);
+  }
+  currentTextBlock->setBlockStyle(style);
+}
+
 void ChapterHtmlSlimParser::addAncestorInsets(BlockStyle& style, const float emSize) const {
   if (blockInsetStack_.empty()) return;
   int left = style.leftInset();
@@ -1448,6 +1479,15 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
   if (self->svgDepth > 0 && !matches(name, IMAGE_TAGS, NUM_IMAGE_TAGS)) {
     self->depth += 1;
     return;
+  }
+
+  // A held-back list marker waits only through the empty-block merge of a <p>/<div> opening the
+  // item. Content that is not text -- a nested item, an image, a table, a rule, a line break --
+  // takes it at once, so the marker stays in the item's own block, ahead of that content.
+  if (self->pendingListMarker_[0] != '\0' &&
+      (strcmp(name, "li") == 0 || matches(name, IMAGE_TAGS, NUM_IMAGE_TAGS) || strcmp(name, "table") == 0 ||
+       strcmp(name, "hr") == 0 || strcmp(name, "br") == 0)) {
+    self->emitPendingListMarker();
   }
 
   // Extract class, style, id, hidden, and pagebreak metadata attributes
@@ -2361,7 +2401,8 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
     self->floatDepth_++;
   }
 
-  if (strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0) {
+  const bool isList = strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0;
+  if (isList) {
     int startCounter = 0;
     if (name[0] == 'o') {
       const char* startAttr = getAttribute(atts, "start");
@@ -2376,12 +2417,35 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
   const float emSize = static_cast<float>(self->renderer.getFontAscenderSize(self->fontId));
   auto userAlignmentBlockStyle = BlockStyle::fromCssStyle(
       cssStyle, emSize, static_cast<CssTextAlign>(self->paragraphAlignment), self->viewportWidth);
+  // As in CSS, a list's own padding-left replaces the default and its margin-left adds to it.
+  if (isList && !cssStyle.hasPaddingLeft()) {
+    userAlignmentBlockStyle.paddingLeft = static_cast<int16_t>(emSize * LIST_DEFAULT_PADDING_EM);
+  }
 
   // This element's own inset is what its children inherit; capture it before the ancestors are
   // folded in, or each level would count itself once per descendant.
   const int16_t ownInsetLeft = userAlignmentBlockStyle.leftInset();
   const int16_t ownInsetRight = userAlignmentBlockStyle.rightInset();
   self->addAncestorInsets(userAlignmentBlockStyle, emSize);
+
+  // A list is a block with vertical spacing of its own. It starts an empty block holding its top
+  // spacing, which the first item merges into (collapsing with the item's margin-top, as under a
+  // wrapper <div>); its bottom spacing waits for </ul>, since that merge would put it under the
+  // first item. The block's horizontal inset is the enclosing one, not the list's (pushed below,
+  // for the items): a marker still waiting from an enclosing <li> lands in it. Table cells lay
+  // their text out apart from the page's blocks, so a list inside one is left alone.
+  if (isList && !self->currentTableCell) {
+    if (self->partWordBufferIndex > 0 && !self->flushPartWordBuffer()) return;
+    BlockStyle listTop = BlockStyle::fromCssStyle(
+        CssStyle{}, emSize, static_cast<CssTextAlign>(self->paragraphAlignment), self->viewportWidth);
+    listTop.marginTop = userAlignmentBlockStyle.marginTop;
+    listTop.paddingTop = userAlignmentBlockStyle.paddingTop;
+    self->addAncestorInsets(listTop, emSize);
+    self->startNewTextBlock(listTop);
+    self->listStack.back().marginBottom = userAlignmentBlockStyle.marginBottom;
+    self->listStack.back().paddingBottom = userAlignmentBlockStyle.paddingBottom;
+  }
+
   if ((ownInsetLeft > 0 || ownInsetRight > 0) &&
       self->blockInsetStack_.size() < ChapterHtmlSlimParser::kMaxBlockInsetDepth &&
       matches(name, INSET_CONTAINER_TAGS, NUM_INSET_CONTAINER_TAGS)) {
@@ -2476,12 +2540,6 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
         blockStyle.alignment = cssStyle.textAlign;
         blockStyle.textAlignDefined = true;
       }
-      // For <li> with no CSS margin, apply depth-based indent so nested lists are visually
-      // distinguishable. listStack.size() == 1 for top-level, 2 for first nested, etc.
-      if (strcmp(name, "li") == 0 && !cssStyle.hasMarginLeft() && !self->listStack.empty()) {
-        const int depth = static_cast<int>(std::min(self->listStack.size(), size_t(3)));
-        blockStyle.marginLeft = static_cast<int16_t>(blockStyle.marginLeft + emSize * 1.5f * depth);
-      }
       self->startNewTextBlock(blockStyle);
       self->updateEffectiveInlineStyle();
 
@@ -2496,13 +2554,12 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
             self->listStack.back().counter += 1;
           }
           if (!self->listStack.back().suppressMarker) {
-            char marker[16];
+            char* marker = self->pendingListMarker_;
             if (self->listStack.back().isOrdered) {
-              snprintf(marker, sizeof(marker), "%d.", self->listStack.back().counter);
+              snprintf(marker, sizeof(self->pendingListMarker_), "%d.", self->listStack.back().counter);
             } else {
               strcpy(marker, "\xe2\x80\xa2");
             }
-            self->currentTextBlock->addWord(marker, EpdFontFamily::REGULAR);
           }
         }
       } else if (strcmp(name, "pre") == 0) {
@@ -2685,9 +2742,13 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
     // <small>/<big> carry UA-default sizes (80%/120%) even without any CSS rule.
     const bool isSmallTag = strcmp(name, "small") == 0;
     const bool isBigTag = strcmp(name, "big") == 0;
+    // Block containers that are not BLOCK_TAGS (<ul>, <blockquote>, <section>, ...) land here too,
+    // for their font properties. Their margin-left is an inset (blockInsetStack_), not a per-line
+    // indent: taken as one it overwrote the text-indent of the paragraph still open before them.
+    const bool spanIndent = cssStyle.hasMarginLeft() && !matches(name, INSET_CONTAINER_TAGS, NUM_INSET_CONTAINER_TAGS);
     if (cssStyle.hasFontWeight() || cssStyle.hasFontStyle() || cssStyle.hasTextDecoration() ||
-        cssStyle.hasVerticalAlign() || cssStyle.hasSmallCaps() || cssStyle.hasMarginLeft() ||
-        cssStyle.hasFontSizeMultiplier() || isSmallTag || isBigTag) {
+        cssStyle.hasVerticalAlign() || cssStyle.hasSmallCaps() || spanIndent || cssStyle.hasFontSizeMultiplier() ||
+        isSmallTag || isBigTag) {
       // Flush buffer before style change so preceding text gets current style
       if (self->partWordBufferIndex > 0) {
         const bool endsAtDashBreak = bufferEndsWithBreakableDash(self->partWordBuffer, self->partWordBufferIndex);
@@ -2729,7 +2790,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
         entry.hasSmallCaps = true;
         entry.smallCaps = cssStyle.smallCaps;
       }
-      if (cssStyle.hasMarginLeft()) {
+      if (spanIndent) {
         // margin-left on an inline span acts as a per-line indent (poem stanza pattern).
         // Applied immediately to the current block because the span closes before the
         // trailing <br>, so the indent must be on the block that receives the text.
@@ -3075,6 +3136,12 @@ void ChapterHtmlSlimParser::endElement(void* userData, const char* name) {
     }
   }
 
+  // An item that closes without text (<li></li>, or one holding only hidden content) still shows
+  // its marker, and a marker never outlives its item into the text after the list.
+  if (strcmp(name, "li") == 0 || strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0) {
+    self->emitPendingListMarker();
+  }
+
   self->depth -= 1;
 
   // Decrement float depth when the floated element's scope closes.
@@ -3093,6 +3160,7 @@ void ChapterHtmlSlimParser::endElement(void* userData, const char* name) {
 
   // Pop list entries whose ul/ol is now out of scope
   while (!self->listStack.empty() && self->listStack.back().depth >= self->depth) {
+    self->applyListBottomSpacing(self->listStack.back());
     self->listStack.pop_back();
   }
 
