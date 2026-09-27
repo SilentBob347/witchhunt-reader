@@ -2505,6 +2505,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
     }
     self->holdBottomSpacing(headerBlockStyle, isFloated);
     self->startNewTextBlock(headerBlockStyle);
+    self->currentBlockOwnerDepth_ = self->depth;
     self->boldUntilDepth = std::min(self->boldUntilDepth, self->depth);
     self->updateEffectiveInlineStyle();
   } else if (matches(name, BLOCK_TAGS, NUM_BLOCK_TAGS)) {
@@ -2519,6 +2520,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
       }
       self->holdBottomSpacing(blockStyle, isFloated);
       self->startNewTextBlock(blockStyle);
+      self->currentBlockOwnerDepth_ = self->depth;
       self->updateEffectiveInlineStyle();
 
       // `<`, not `=`: inside a transparent-text ancestor the slot already holds a shallower
@@ -2549,6 +2551,14 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
       self->addAncestorInsets(brStyle, emSize);
       // text-indent is not inherited across <br>: it applies to the first line of a block only.
       // Span-based indents (poem stanza pattern) are applied directly to each block at span-open time.
+      // The font size is: the next line belongs to the same heading or paragraph. All three fields
+      // travel together -- the block may already be resolved (a long block is laid out in parts),
+      // and resolveBlockFont leaves a resolved style alone.
+      if (self->currentBlockOwnerDepth_ >= 0) {
+        brStyle.fontSizeMultiplier = currentStyle.fontSizeMultiplier;
+        brStyle.headingFontId = currentStyle.headingFontId;
+        brStyle.fontResolved = currentStyle.fontResolved;
+      }
       brStyle.fromBrElement = true;
       self->startNewTextBlock(brStyle);
     } else {
@@ -2561,6 +2571,7 @@ void ChapterHtmlSlimParser::startElement(void* userData, const char* name, const
       }
       self->holdBottomSpacing(blockStyle, isFloated);
       self->startNewTextBlock(blockStyle);
+      self->currentBlockOwnerDepth_ = self->depth;
       self->updateEffectiveInlineStyle();
 
       if (strcmp(name, "li") == 0) {
@@ -3181,6 +3192,13 @@ void ChapterHtmlSlimParser::endElement(void* userData, const char* name) {
   // Pop list entries whose ul/ol is now out of scope
   while (!self->listStack.empty() && self->listStack.back().depth >= self->depth) {
     self->listStack.pop_back();
+  }
+
+  // The element that set up the current block has closed. If nothing reached that block (an empty
+  // heading, a trailing <br>), it will merge into the next sibling, which must not inherit the size.
+  if (self->depth == self->currentBlockOwnerDepth_) {
+    self->currentBlockOwnerDepth_ = -1;
+    self->clearSpentBlockHeadingStyle();
   }
 
   // Apply held bottom spacing whose block-level element is now out of scope
