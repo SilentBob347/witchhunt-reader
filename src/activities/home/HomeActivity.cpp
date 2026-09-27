@@ -230,6 +230,13 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     if (!coverScratch_ || !coverScratch_->valid()) coverScratch_.reset();
   } else if (!secondaryBufferLent && renderer.hasSecondaryBuffer()) {
     RenderLock lock;
+    // The lend hands out the DISPLAYED frame and leaves the write buffer as the only one, and
+    // after the home render's swap that buffer holds the frame from two refreshes ago -- the
+    // boot screen, or whatever screen preceded Home. Unless Home repaints before it exits, the
+    // return below seeds the secondary from that stale frame, and the next overlay (the reader's
+    // "Indexing" popup, the cold-font popup, anything drawn with drawPopup) lands on it. Copy the
+    // displayed frame in while the secondary still holds it.
+    renderer.syncWriteBufferFromDisplayed();
     size_t lentSize = 0;
     if (uint8_t* lent = renderer.borrowSecondaryBuffer(&lentSize)) {
       coverScratch_ = makeUniqueNoThrow<BuildArena>(lent, lentSize);
