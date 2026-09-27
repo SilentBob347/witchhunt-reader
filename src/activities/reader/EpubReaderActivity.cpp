@@ -682,17 +682,19 @@ void EpubReaderActivity::onEnter() {
   FsFile f;
   bool hadSavedProgress = false;
   if (Storage.openFileForRead("ERS", epub->getCachePath() + "/progress.bin", f)) {
-    uint8_t data[6];
-    int dataSize = f.read(data, 6);
-    if (dataSize == 4 || dataSize == 6) {
-      currentSpineIndex = data[0] + (data[1] << 8);
-      navTarget = NavigationTarget::makePage(data[2] + (data[3] << 8));
+    uint8_t data[EpubProgressRecord::kMaxSize];
+    const int dataSize = f.read(data, sizeof(data));
+    if (const auto record = EpubProgressRecord::decode(data, dataSize > 0 ? static_cast<size_t>(dataSize) : 0)) {
+      currentSpineIndex = record->spineIndex;
+      // A Page target even when the paragraph is known: a Page target is shown the moment its
+      // page is built (Background-C), and the paragraph only matters after a relayout.
+      navTarget = NavigationTarget::makePage(record->page);
+      navTarget.restoreParagraph = record->paragraph.value_or(0);
       navTarget.cachedSpineIdx = currentSpineIndex;
+      navTarget.cachedPageCount = record->pageCount;
       hadSavedProgress = true;
-      LOG_DBG("ERS", "Loaded cache: %d, %d", currentSpineIndex, navTarget.page);
-    }
-    if (dataSize == 6) {
-      navTarget.cachedPageCount = data[4] + (data[5] << 8);
+      LOG_DBG("ERS", "Loaded cache: %d, %d (paragraph %d)", currentSpineIndex, record->page,
+              record->paragraph ? *record->paragraph : -1);
     }
     f.close();
   }
@@ -818,6 +820,17 @@ void EpubReaderActivity::onExit() {
   // next activity (notably SleepActivity's OVERLAY mode) sees what the user was looking at.
   // Must run before section.reset() and the orientation reset below.
   restoreCurrentPageToBufferIfPreRendered();
+
+  // Record the paragraph under the saved page, so a reopen under a different layout lands on it
+  // (EpubProgressRecord). Here, not per page turn: the lookup opens the section cache, and the
+  // per-page saves only need to survive a reboot, which comes back to the same layout. Past the
+  // last spine the finished-book flow has written its own 100% record; leave that alone.
+  if (section && readerPhase_ == ReaderPhase::READING && !section->hasActiveBuild() && section->pageCount > 0 && epub &&
+      currentSpineIndex < epub->getSpineItemsCount()) {
+    if (const auto paragraph = section->getParagraphIndexForPage(static_cast<uint16_t>(section->currentPage))) {
+      saveProgress(currentSpineIndex, section->currentPage, section->pageCount, paragraph);
+    }
+  }
 
   // Save bookmarks before exit
   bookmarkStore.save();
@@ -2102,6 +2115,13 @@ void EpubReaderActivity::stepCurrentSectionBuild() {
   // original page). Clamp it; if they ran past the end while building, cross into the next spine.
   const int spineCount = epub->getSpineItemsCount();
   if (navTarget.kind == NavigationTarget::Kind::Page) {
+    // A restored position whose chapter this build laid out anew lands on its paragraph, unless the
+    // reader has already turned away from the page shown while it built.
+    if (section->currentPage == navTarget.page) {
+      if (const auto p = navTarget.relaidOutRestorePage(*section, currentSpineIndex)) {
+        section->currentPage = *p;
+      }
+    }
     if (section->currentPage >= section->pageCount) {
       if (currentSpineIndex + 1 < spineCount) {
         navTarget = NavigationTarget::makePage(0);
@@ -2920,6 +2940,19 @@ static FontSizeLadder buildReaderFontSizeLadder(const int bodyFontId) {
   return ladder;  // SD font or unknown id: empty ladder = scale-only fallback
 }
 
+std::optional<int> EpubReaderActivity::NavigationTarget::relaidOutRestorePage(const Section& sec,
+                                                                              const int spineIndex) const {
+  if (restoreParagraph == 0 || cachedSpineIdx != spineIndex || cachedPageCount <= 0 ||
+      sec.pageCount == cachedPageCount) {
+    return std::nullopt;
+  }
+  const auto p = sec.getPageForParagraphIndex(restoreParagraph);
+  if (!p) return std::nullopt;
+  LOG_DBG("ERS", "Chapter relaid out (%d -> %d pages): restoring p[%u] -> page %u", cachedPageCount, sec.pageCount,
+          restoreParagraph, *p);
+  return *p;
+}
+
 void EpubReaderActivity::NavigationTarget::resolveInto(Section& sec, int spineIndex) const {
   // Resolve to a baseline page first. Each branch records whether it produced a
   // precise page (LUT/anchor hit, percent jump, explicit page) or only an estimate.
@@ -3006,6 +3039,10 @@ void EpubReaderActivity::NavigationTarget::resolveInto(Section& sec, int spineIn
     case Kind::Page: {
       sec.currentPage = page;
       isEstimate = true;
+      if (const auto p = relaidOutRestorePage(sec, spineIndex)) {
+        sec.currentPage = *p;
+        isEstimate = false;
+      }
       break;
     }
   }
@@ -4881,29 +4918,31 @@ bool EpubReaderActivity::maybeRestartForFragmentedHeap(const uint32_t freeHeap, 
 }
 
 bool EpubReaderActivity::writeReaderProgressCache(const std::string& cachePath, const int spineIndex,
-                                                  const int currentPage, const int pageCount, const uint8_t percent) {
+                                                  const int currentPage, const int pageCount, const uint8_t percent,
+                                                  const std::optional<uint16_t> paragraphIndex) {
   FsFile f;
   if (!Storage.openFileForWrite("ERS", cachePath + "/progress.bin", f)) {
     LOG_ERR("ERS", "Failed to open progress cache: %s", cachePath.c_str());
     return false;
   }
 
-  uint8_t data[7];
-  data[0] = spineIndex & 0xFF;
-  data[1] = (spineIndex >> 8) & 0xFF;
-  data[2] = currentPage & 0xFF;
-  data[3] = (currentPage >> 8) & 0xFF;
-  data[4] = pageCount & 0xFF;
-  data[5] = (pageCount >> 8) & 0xFF;
-  data[6] = percent;
-  f.write(data, 7);
+  EpubProgressRecord record;
+  record.spineIndex = spineIndex;
+  record.page = currentPage;
+  record.pageCount = pageCount;
+  record.percent = percent;
+  record.paragraph = paragraphIndex;
+  uint8_t data[EpubProgressRecord::kMaxSize] = {};
+  const size_t size = record.encode(data);
+  f.write(data, size);
   f.close();
   return true;
 }
 
-void EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
+void EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount,
+                                      const std::optional<uint16_t> paragraphIndex) {
   const uint8_t percent = epubProgressPercentByte(*epub, spineIndex, currentPage, pageCount);
-  if (!writeReaderProgressCache(epub->getCachePath(), spineIndex, currentPage, pageCount, percent)) {
+  if (!writeReaderProgressCache(epub->getCachePath(), spineIndex, currentPage, pageCount, percent, paragraphIndex)) {
     LOG_ERR("ERS", "Could not save progress!");
     return;
   }
