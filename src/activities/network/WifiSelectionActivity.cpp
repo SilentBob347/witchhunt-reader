@@ -843,6 +843,14 @@ void WifiSelectionActivity::loop() {
         showNetworkListFromAutoConnect();
         return;
       }
+    } else if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+      // A manual connect always starts from the list, so Back abandons the attempt and returns
+      // there. Without it a hidden SSID that does not exist holds the screen for the whole timeout.
+      LOG_DBG("WIFI", "User abandoned connect to %s", selectedSSID.c_str());
+      WiFi.disconnect();
+      state = WifiSelectionState::NETWORK_LIST;
+      requestUpdate();
+      return;
     }
     checkConnectionStatus();
     return;
@@ -1192,15 +1200,10 @@ void WifiSelectionActivity::renderConnecting() const {
     renderer.drawCenteredText(UI_10_FONT_ID, top, ssidInfo.c_str());
   }
 
-  // Back cancels any scan; while the saved-network flow runs on its own, Confirm stops it and
-  // shows the list. A manual connect takes no input, so it gets no hints.
-  if (autoConnect) {
-    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_SHOW_NETWORKS), "", "");
-    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-  } else if (state == WifiSelectionState::SCANNING) {
-    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
-    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-  }
+  // Back cancels in every phase shown here (a manual connect returns to the list); while the
+  // saved-network flow runs on its own, Confirm also stops it and shows the list.
+  const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), autoConnect ? tr(STR_SHOW_NETWORKS) : "", "", "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 
 void WifiSelectionActivity::renderConnected() const {
