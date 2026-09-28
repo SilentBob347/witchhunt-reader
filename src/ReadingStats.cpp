@@ -5,7 +5,6 @@
 #include <HalClock.h>
 #include <HalStorage.h>
 #include <Logging.h>
-#include <Memory.h>
 
 #include <algorithm>
 #include <ctime>
@@ -51,12 +50,11 @@ void recoverInterruptedSwap(const std::string& path) {
   }
 }
 
-// Few, large card writes. The X3's card takes ~17 ms per write call whatever its size (measured: a
-// 108 KB history went out as 107 writes of 1 KB in 1.8 s), so the chunk is as large as the heap
-// allows. Below 1 KB a BufferedPrint passes bytes through one call each -- minutes for a full
-// history -- so that is refused as out of memory instead.
-constexpr size_t kWriteChunkMax = 8192;
-constexpr size_t kWriteChunkMin = 1024;
+// The copy's write buffer. Its size does not matter to the card: measured on the X3 with a 108 KB
+// history, 107 writes of 1 KB and 14 writes of 8 KB both cost ~1.9 s -- the card takes ~17.7 ms per
+// KB written, however it is split. What matters is that there is one: without its buffer a
+// BufferedPrint passes each byte through as its own file call, minutes for a full history.
+constexpr size_t kWriteChunk = 1024;
 
 // Diagnostics for the "write done" line: time, calls and bytes that reached the card.
 class TimedPrint final : public Print {
@@ -392,20 +390,16 @@ ReadingStatsStore::WriteResult ReadingStatsStore::write(
     FsFile in;
     const bool inOpen = haveInput && Storage.openFileForRead("RST", path_.c_str(), in) && in.size() > 0;
     FsFile out;
-    // The copy goes out a byte at a time; batch it into few SD calls (see kWriteChunkMax).
+    // The copy goes out a byte at a time; batch it (see kWriteChunk).
     TimedPrint timed(out);
-    std::unique_ptr<BufferedPrint> buffered;
-    for (size_t chunk = kWriteChunkMax; chunk >= kWriteChunkMin && !buffered; chunk /= 2) {
-      buffered = makeUniqueNoThrow<BufferedPrint>(timed, chunk);
-      if (buffered && buffered->capacity() != chunk) buffered.reset();
-    }
-    if (!buffered) {
-      LOG_ERR("RST", "OOM: no write buffer of %u bytes; history left as is", static_cast<unsigned>(kWriteChunkMin));
+    BufferedPrint buffered(timed, kWriteChunk);
+    if (buffered.capacity() == 0) {
+      LOG_ERR("RST", "OOM: no %u-byte write buffer; history left as is", static_cast<unsigned>(kWriteChunk));
       return WriteResult::NoMemory;
     }
     if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return WriteResult::Failed;
-    const auto copied = ReadingStatsFile::writeRewrite(inOpen ? &in : nullptr, rewrite, *buffered);
-    written = buffered->flushBuffer() && copied == ReadingStatsFile::ScanResult::Ok;
+    const auto copied = ReadingStatsFile::writeRewrite(inOpen ? &in : nullptr, rewrite, buffered);
+    written = buffered.flushBuffer() && copied == ReadingStatsFile::ScanResult::Ok;
     sdMs = timed.ms;
     sdCalls = timed.calls;
     sdBytes = timed.bytes;
