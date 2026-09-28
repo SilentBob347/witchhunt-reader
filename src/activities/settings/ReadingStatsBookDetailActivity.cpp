@@ -3,6 +3,7 @@
 #include <GfxRenderer.h>
 #include <HalClock.h>
 #include <I18n.h>
+#include <Logging.h>
 #include <Utf8.h>
 
 #include <algorithm>
@@ -12,7 +13,9 @@
 #include <utility>
 
 #include "MappedInputManager.h"
+#include "ReadingSessionTracker.h"
 #include "ReadingStats.h"
+#include "activities/util/ConfirmationActivity.h"
 #include "components/BookProgressPresentation.h"
 #include "components/CardLayout.h"
 #include "components/UITheme.h"
@@ -61,6 +64,41 @@ void ReadingStatsBookDetailActivity::loop() {
     finish();
     return;
   }
+  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm) && canRemove()) {
+    confirmRemove();
+  }
+}
+
+// Not while this book's session is still open (this screen opened from the reader's menu, or
+// settings reached over an open book): the session lands in the store when the reader closes and
+// would bring the entry straight back.
+bool ReadingStatsBookDetailActivity::canRemove() const {
+  if (!READING_STATS.findBook(docId)) return false;
+  const auto& tracker = globalReadingSessionTracker();
+  return !(tracker.isActive() && tracker.getDocId() == docId);
+}
+
+void ReadingStatsBookDetailActivity::confirmRemove() {
+  const BookReadingStats* book = READING_STATS.findBook(docId);
+  const std::string title = book->title.empty() ? docId : book->title;
+  startActivityForResult(
+      std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_READING_STATS_REMOVE_BOOK), title),
+      [this](const ActivityResult& res) {
+        if (res.isCancelled) {
+          requestUpdate();
+          return;
+        }
+        {
+          // render() dereferences this book's entry on the render task.
+          RenderLock lock(*this);
+          READING_STATS.removeBook(docId);
+        }
+        if (!READING_STATS.saveToFile()) {
+          LOG_ERR("RST", "saveToFile failed (remove) doc=%s", docId.c_str());
+        }
+        // Nothing left to show; the list underneath rebuilds when it regains the screen.
+        finish();
+      });
 }
 
 void ReadingStatsBookDetailActivity::render(RenderLock&&) {
@@ -98,8 +136,8 @@ void ReadingStatsBookDetailActivity::render(RenderLock&&) {
   CardLayout layout(renderer, contentRect, startY, cfg);
 
   if (!book) {
-    // The book may have been removed from the store between the list and
-    // the detail screen (e.g. a future "clear stats for this book" action).
+    // No history for this book: opened from the reader's menu before its
+    // first session has been recorded, or the history failed to load.
     // Show a placeholder rather than crash on a null deref.
     layout.card(nullptr, [](CardLayout::Body& b) { b.centeredMessage(tr(STR_READING_STATS_NO_DATA)); });
   } else {
@@ -187,7 +225,7 @@ void ReadingStatsBookDetailActivity::render(RenderLock&&) {
     }
   }
 
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), canRemove() ? tr(STR_REMOVE) : "", "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();

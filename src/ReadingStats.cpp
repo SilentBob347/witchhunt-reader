@@ -28,6 +28,19 @@ void mergeDay(std::vector<DayBucket>& days, uint16_t dayIndex, uint32_t seconds,
   if (days.size() > maxDays) days.erase(days.begin(), days.begin() + static_cast<long>(days.size() - maxDays));
 }
 
+// Take `seconds` back out of the bucket for `dayIndex`, dropping the bucket once it is empty: an
+// empty bucket would still count as a reading day in the longest-streak walk.
+void unmergeDay(std::vector<DayBucket>& days, const uint16_t dayIndex, const uint32_t seconds) {
+  auto it = std::lower_bound(days.begin(), days.end(), dayIndex,
+                             [](const DayBucket& b, uint16_t v) { return b.dayIndex < v; });
+  if (it == days.end() || it->dayIndex != dayIndex) return;
+  if (it->seconds > seconds) {
+    it->seconds -= seconds;
+  } else {
+    days.erase(it);
+  }
+}
+
 // Length of the run of consecutive reading days that ends on `day`, from a sorted day map.
 uint16_t runEndingAt(const std::vector<DayBucket>& days, const uint16_t day) {
   auto it =
@@ -198,6 +211,17 @@ void ReadingStatsStore::markFinished(const std::string& docId, const std::string
     it->lastFinishedEpoch = walltimeEpoch;
     if (it->lastReadEpoch < walltimeEpoch) it->lastReadEpoch = walltimeEpoch;
   }
+}
+
+bool ReadingStatsStore::removeBook(const std::string& docId) {
+  auto it = std::find_if(books.begin(), books.end(), [&docId](const BookReadingStats& b) { return b.docId == docId; });
+  if (it == books.end()) return false;
+  globalTotalSeconds -= std::min(globalTotalSeconds, it->totalSeconds);
+  globalTotalSessions -= std::min(globalTotalSessions, it->sessions);
+  globalTotalPagesTurned -= std::min(globalTotalPagesTurned, it->pagesTurned);
+  for (const DayBucket& day : it->days) unmergeDay(globalDays, day.dayIndex, day.seconds);
+  books.erase(it);
+  return true;
 }
 
 size_t ReadingStatsStore::getFinishedBookCount() const {

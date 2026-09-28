@@ -84,6 +84,14 @@ class ReadingStatsStore {
   void markFinished(const std::string& docId, const std::string& title, const std::string& author,
                     time_t walltimeEpoch);
 
+  // Forget one book: its entry goes, and its time, sessions, pages and day buckets come back out of
+  // the global aggregates, so the stats read as if it had never been read. Exact for everything
+  // the screens show — a book keeps its newest kMaxBookDays buckets, which always cover the 30-day
+  // sparkline and the current streak. The persisted longest-streak record stays: it is a number,
+  // not something the book can be subtracted from. Returns false for an unknown docId. Caller
+  // saves.
+  bool removeBook(const std::string& docId);
+
   // Lookup by document hash; returns nullptr if unknown.
   const BookReadingStats* findBook(const std::string& docId) const;
 

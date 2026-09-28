@@ -65,9 +65,18 @@ void ReadingStatsBookListActivity::loop() {
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       const BookReadingStats* book = sortedBooks[selectedIndex];
       startActivityForResult(std::make_unique<ReadingStatsBookDetailActivity>(renderer, mappedInput, book->docId),
-                             // After detail closes the underlying store hasn't changed (it's
-                             // read-only), so just redraw — selectedIndex is preserved.
-                             [this](const ActivityResult&) { requestUpdate(); });
+                             [this](const ActivityResult&) {
+                               // The detail screen may have removed its book, which leaves
+                               // sortedBooks pointing into a vector that has shifted. Rebuild,
+                               // keeping the selection on the same row where there still is one.
+                               {
+                                 RenderLock lock(*this);
+                                 rebuildSortedBooks();
+                                 selectedIndex =
+                                     std::min(selectedIndex, std::max(0, static_cast<int>(sortedBooks.size()) - 1));
+                               }
+                               requestUpdate();
+                             });
     }
   }
 }
