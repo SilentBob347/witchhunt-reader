@@ -92,6 +92,13 @@ class ReadingStatsStore {
   // saves.
   bool removeBook(const std::string& docId);
 
+  // removeBook() + saveToFile() for a caller that cannot afford to load the history: the web server,
+  // running next to Wi-Fi. Streams the file instead (ReadingStatsFile), and swaps the result in only
+  // once it reads back as the same history less that one book. Works on the store itself when it is
+  // loaded, so the two can never disagree.
+  enum class FileRemoval : uint8_t { Removed, NotFound, Failed };
+  FileRemoval removeBookFromFile(const std::string& docId);
+
   // Lookup by document hash; returns nullptr if unknown.
   const BookReadingStats* findBook(const std::string& docId) const;
 

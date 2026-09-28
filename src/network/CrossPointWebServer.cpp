@@ -372,6 +372,7 @@ void CrossPointWebServer::begin() {
   server->on("/stats", HTTP_GET, [this] { handleStatsPage(); });
   server->on("/api/stats", HTTP_GET, [this] { handleStatsApi(); });
   server->on("/api/stats/export", HTTP_GET, [this] { handleStatsExport(); });
+  server->on("/api/stats/remove", HTTP_POST, [this] { handleStatsRemove(); });
 
   server->on("/fonts", HTTP_GET, [this] { handleFontsPage(); });
   server->on("/api/fonts", HTTP_GET, [this] { handleFontList(); });
@@ -666,6 +667,31 @@ void CrossPointWebServer::handleStatsApi() const {
   ReadingStatsFile::writeDashboard(file, summary, currentLocalDayIndex(), out);
   response.finish();
   LOG_WEB_MEM("stats_api_exit");
+}
+
+// Body: {"docId": "..."}. Same removal as the device's per-book stats screen: the book's entry goes
+// and its time comes back out of the totals. Streamed through the file like the dashboard.
+void CrossPointWebServer::handleStatsRemove() const {
+  if (rejectIfLowMemory(server.get())) return;
+  JsonDocument req;
+  if (deserializeJson(req, server->arg("plain")) || !req["docId"].is<const char*>()) {
+    server->send(400, "application/json", "{\"error\":\"Invalid request\"}");
+    return;
+  }
+  const std::string docId = req["docId"].as<const char*>();
+
+  switch (READING_STATS.removeBookFromFile(docId)) {
+    case ReadingStatsStore::FileRemoval::Removed:
+      LOG_DBG("WEB", "Removed from reading stats: %s", docId.c_str());
+      server->send(200, "application/json", "{\"ok\":true}");
+      return;
+    case ReadingStatsStore::FileRemoval::NotFound:
+      server->send(404, "application/json", "{\"error\":\"Book not found\"}");
+      return;
+    case ReadingStatsStore::FileRemoval::Failed:
+      server->send(500, "application/json", "{\"error\":\"Could not update the reading stats\"}");
+      return;
+  }
 }
 
 void CrossPointWebServer::handleStatsExport() const {

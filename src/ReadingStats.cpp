@@ -1,5 +1,6 @@
 #include "ReadingStats.h"
 
+#include <BufferedPrint.h>
 #include <HalClock.h>
 #include <HalStorage.h>
 #include <JsonSettingsIO.h>
@@ -12,6 +13,25 @@
 
 namespace {
 constexpr const char* READING_STATS_FILE = ReadingStatsFile::kPath;
+
+// Puts a finished temporary file in place of the store's file.
+bool swapIn(const std::string& tmpPath) {
+  Storage.remove(READING_STATS_FILE);
+  if (!Storage.rename(tmpPath.c_str(), READING_STATS_FILE)) {
+    LOG_ERR("RST", "Could not rename %s into place", tmpPath.c_str());
+    return false;
+  }
+  return true;
+}
+
+// The streamed removal's safety check: the new file has to parse, must not hold the book, and must
+// still hold every other one.
+bool readsBackWithout(const std::string& path, const std::string& docId, const uint32_t expectedBooks) {
+  FsFile in;
+  if (!Storage.openFileForRead("RST", path.c_str(), in)) return false;
+  ReadingStatsFile::Summary check;
+  return ReadingStatsFile::summarize(in, check, docId) && !check.found && check.bookCount == expectedBooks;
+}
 
 // Add `seconds` to the bucket for `dayIndex` in `days`, inserting in sorted
 // position if absent. dayIndex == 0 ("unknown day") is silently skipped here —
@@ -313,12 +333,41 @@ bool ReadingStatsStore::saveToFile() const {
       return false;
     }
   }
-  Storage.remove(READING_STATS_FILE);
-  if (!Storage.rename(tmpPath.c_str(), READING_STATS_FILE)) {
-    LOG_ERR("RST", "saveToFile: could not rename %s into place", tmpPath.c_str());
-    return false;
+  return swapIn(tmpPath);
+}
+
+ReadingStatsStore::FileRemoval ReadingStatsStore::removeBookFromFile(const std::string& docId) {
+  if (loaded_) {
+    if (!removeBook(docId)) return FileRemoval::NotFound;
+    return saveToFile() ? FileRemoval::Removed : FileRemoval::Failed;
   }
-  return true;
+  if (!Storage.exists(READING_STATS_FILE)) return FileRemoval::NotFound;
+  const std::string tmpPath = std::string(READING_STATS_FILE) + ".tmp";
+  uint32_t booksLeft = 0;
+  bool written = false;
+  {
+    FsFile in;
+    if (!Storage.openFileForRead("RST", READING_STATS_FILE, in)) return FileRemoval::Failed;
+    ReadingStatsFile::Summary summary;
+    if (!ReadingStatsFile::summarize(in, summary, docId)) {
+      LOG_ERR("RST", "removeBookFromFile: history file unreadable; left as is");
+      return FileRemoval::Failed;
+    }
+    if (!summary.found) return FileRemoval::NotFound;
+    booksLeft = summary.bookCount - 1;
+    FsFile out;
+    if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return FileRemoval::Failed;
+    // The copy goes out a byte at a time; batch it into few SD calls.
+    BufferedPrint buffered(out, 1024);
+    ReadingStatsFile::writeWithoutTarget(in, summary, buffered);
+    written = buffered.flushBuffer();
+  }
+  if (!written || !readsBackWithout(tmpPath, docId, booksLeft)) {
+    LOG_ERR("RST", "removeBookFromFile: rewritten history did not read back; left as is");
+    Storage.remove(tmpPath.c_str());
+    return FileRemoval::Failed;
+  }
+  return swapIn(tmpPath) ? FileRemoval::Removed : FileRemoval::Failed;
 }
 
 bool ReadingStatsStore::loadFromFile() {

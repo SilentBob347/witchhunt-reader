@@ -16,6 +16,8 @@ target_include_directories(ReadingStatsTest PRIVATE
   ${REPO_ROOT}/lib/Logging
   ${REPO_ROOT}/lib/JsonParser
   ${REPO_ROOT}/lib/Memory
+  # BufferedPrint.h
+  ${REPO_ROOT}/lib/GfxRenderer
 )
 
 # localDayIndexFromEpoch() calls localtime_r, which MinGW's <time.h> declares only on request.
