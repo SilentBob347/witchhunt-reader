@@ -130,8 +130,7 @@ void ReadingStatsStore::recordSession(const std::string& docId, const std::strin
       // (lastReadEpoch 0) sorts as the oldest.
       auto victim =
           std::min_element(books.begin(), books.end(), [](const BookReadingStats& a, const BookReadingStats& b) {
-            if (a.lastReadEpoch != b.lastReadEpoch) return a.lastReadEpoch < b.lastReadEpoch;
-            return a.totalSeconds < b.totalSeconds;
+            return evictsBefore(a.lastReadEpoch, a.totalSeconds, b.lastReadEpoch, b.totalSeconds);
           });
       LOG_INF("RST", "Book cap (%u) reached; dropping the least recently read: %s", static_cast<unsigned>(kMaxBooks),
               victim->title.c_str());
@@ -267,6 +266,12 @@ size_t ReadingStatsStore::getFinishedBookCount() const {
 const BookReadingStats* ReadingStatsStore::findBook(const std::string& docId) const {
   auto it = std::find_if(books.begin(), books.end(), [&docId](const BookReadingStats& b) { return b.docId == docId; });
   return it == books.end() ? nullptr : &*it;
+}
+
+bool ReadingStatsStore::evictsBefore(const time_t aLastRead, const uint32_t aSeconds, const time_t bLastRead,
+                                     const uint32_t bSeconds) {
+  if (aLastRead != bLastRead) return aLastRead < bLastRead;
+  return aSeconds < bSeconds;
 }
 
 float ReadingStatsStore::pooledSecondsPerPercent(const uint32_t globalTotalSeconds, const uint32_t countedSeconds,

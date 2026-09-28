@@ -65,6 +65,16 @@ std::string dashboardOf(const std::string& file, const uint16_t today) {
   return out.text;
 }
 
+using ScanResult = ReadingStatsFile::ScanResult;
+
+ReadingStatsFile::Summary scanOf(const std::string& file, const ReadingStatsFile::ScanRequest& request,
+                                 ScanResult expected = ScanResult::Ok) {
+  HalFile in = HalFile::fromString(file);
+  ReadingStatsFile::Summary summary;
+  EXPECT_EQ(ReadingStatsFile::scan(in, summary, request), expected);
+  return summary;
+}
+
 // A book entry without its closing brace, for splicing the dashboard's added field in.
 std::string open(const std::string& book) { return book.substr(0, book.size() - 1); }
 
@@ -213,4 +223,115 @@ TEST(ReadingStatsFileDashboard, FinishedBookNeedsNoTime) {
             R"({"totalSeconds":900,"totalSessions":1,"totalPagesTurned":9,"bookCount":1,"finishedBookCount":1,)"
             R"("todayDayIndex":0,"globalDays":[[20463,900]],"books":[)" +
                 open(done) + R"(,"etaSeconds":0})" + "]}");
+}
+
+TEST(ReadingStatsFileScan, DecodesTheWholeTarget) {
+  const std::string head = R"({"totalSeconds":900,"books":[)";
+  const std::string dated =
+      // A JSON unicode escape, six characters on disk; the parser passes it through undecoded.
+      R"({"docId":"d","title":"Say \"hi\" )" + std::string("\\u00e9") +
+      R"(","author":"X","totalSeconds":900,"pagesTurned":9,"sessions":3,)"
+      R"("firstReadEpoch":1767225600,"lastReadEpoch":1768046400,"progress":100,"finishedCount":2,)"
+      R"("lastFinishedEpoch":1768046400,"finished":true,"days":[[20463,900]]})";
+  ReadingStatsFile::ScanRequest request;
+  request.findDocId = "d";
+
+  const auto summary = scanOf(head + dated + "]}", request);
+
+  ASSERT_TRUE(summary.found);
+  const BookReadingStats& b = summary.target;
+  // The parser passes \u escapes through undecoded; titles are for display only.
+  EXPECT_EQ(b.title, "Say \"hi\" \\u00e9");
+  EXPECT_EQ(b.author, "X");
+  EXPECT_EQ(b.totalSeconds, 900u);
+  EXPECT_EQ(b.pagesTurned, 9u);
+  EXPECT_EQ(b.sessions, 3u);
+  EXPECT_EQ(b.firstReadEpoch, 1767225600);
+  EXPECT_EQ(b.lastReadEpoch, 1768046400);
+  EXPECT_EQ(b.progress, 100);
+  EXPECT_EQ(b.finishedCount, 2);
+  EXPECT_EQ(b.lastFinishedEpoch, 1768046400);
+  EXPECT_EQ(pairsOf(b.days), (std::vector<std::pair<uint16_t, uint32_t>>{{20463, 900}}));
+  EXPECT_EQ(summary.targetFirst, head.size());
+}
+
+TEST(ReadingStatsFileScan, LegacyFinishedFlagCountsAsOneFinish) {
+  const std::string legacy = R"({"docId":"l","totalSeconds":60,"progress":100,"finished":true,"days":[]})";
+  ReadingStatsFile::ScanRequest request;
+  request.findDocId = "l";
+
+  const auto summary = scanOf(R"({"totalSeconds":60,"books":[)" + legacy + "]}", request);
+
+  ASSERT_TRUE(summary.found);
+  EXPECT_EQ(summary.target.finishedCount, 1);
+  EXPECT_EQ(summary.finishedBookCount, 1u);
+}
+
+TEST(ReadingStatsFileScan, IndexOrdersBooksByTime) {
+  ReadingStatsFile::ScanRequest request;
+  request.wantIndex = true;
+
+  const auto summary = scanOf(kFile, request);
+
+  std::vector<std::pair<uint32_t, uint32_t>> index;
+  for (const auto& e : summary.byTime) index.emplace_back(e.totalSeconds, e.offset);
+  EXPECT_EQ(index, (std::vector<std::pair<uint32_t, uint32_t>>{{1000, static_cast<uint32_t>(kFile.find(kBookA))},
+                                                               {300, static_cast<uint32_t>(kFile.find(kBookB))},
+                                                               {50, static_cast<uint32_t>(kFile.find(kBookC))}}));
+}
+
+TEST(ReadingStatsFileScan, VictimIsTheLeastRecentlyReadThenTheLeastRead) {
+  const std::string x = R"({"docId":"x","totalSeconds":10,"lastReadEpoch":300,"days":[]})";
+  const std::string y = R"({"docId":"y","totalSeconds":300,"lastReadEpoch":100,"days":[]})";
+  const std::string z = R"({"docId":"z","totalSeconds":50,"lastReadEpoch":100,"days":[]})";
+  const std::string file = R"({"totalSeconds":360,"books":[)" + x + "," + y + "," + z + "]}";
+  ReadingStatsFile::ScanRequest request;
+  request.wantVictim = true;
+
+  const auto summary = scanOf(file, request);
+
+  ASSERT_TRUE(summary.hasVictim);
+  EXPECT_EQ(summary.victimDocId, "z");
+  EXPECT_EQ(summary.victimFirst, file.find(z));
+}
+
+TEST(ReadingStatsFileScan, RecentsReportKnownAndUnknownBooks) {
+  ReadingStatsFile::ScanRequest request;
+  request.recentDocIds = {"b", "zz"};
+
+  const auto summary = scanOf(kFile, request);
+
+  ASSERT_EQ(summary.recents.size(), 2u);
+  EXPECT_EQ(summary.recents[0].docId, "b");
+  EXPECT_TRUE(summary.recents[0].known);
+  EXPECT_EQ(summary.recents[0].totalSeconds, 300u);
+  EXPECT_EQ(summary.recents[0].knownDays, 1);
+  EXPECT_EQ(summary.recents[0].progress, 40);
+  EXPECT_EQ(summary.recents[1].docId, "zz");
+  EXPECT_FALSE(summary.recents[1].known);
+}
+
+TEST(ReadingStatsFileScan, TruncatedFileIsMalformed) {
+  scanOf(kFile.substr(0, kFile.size() / 2), {}, ScanResult::Malformed);
+}
+
+TEST(ReadingStatsFileBookAt, DecodesTheEntryAtAnOffset) {
+  HalFile in = HalFile::fromString(kFile);
+  BookReadingStats book;
+
+  ASSERT_EQ(ReadingStatsFile::readBookAt(in, kFile.find(kBookB), book), ScanResult::Ok);
+
+  EXPECT_EQ(book.docId, "b");
+  EXPECT_EQ(book.title, "B");
+  EXPECT_EQ(book.totalSeconds, 300u);
+  EXPECT_EQ(book.finishedCount, 1);
+  EXPECT_EQ(pairsOf(book.days), (std::vector<std::pair<uint16_t, uint32_t>>{{20463, 300}}));
+}
+
+TEST(ReadingStatsFileBookAt, CutOffEntryIsMalformed) {
+  const std::string cut = kFile.substr(0, kFile.find(kBookA) + kBookA.size() / 2);
+  HalFile in = HalFile::fromString(cut);
+  BookReadingStats book;
+
+  EXPECT_EQ(ReadingStatsFile::readBookAt(in, kFile.find(kBookA), book), ScanResult::Malformed);
 }

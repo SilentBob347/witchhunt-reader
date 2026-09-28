@@ -4,10 +4,13 @@
 #include <Memory.h>
 #include <StreamingJsonParser.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+
+#include "ReadingStats.h"
 
 namespace ReadingStatsFile {
 namespace {
@@ -37,57 +40,90 @@ uint32_t toCount(const char* text) {
   return static_cast<uint32_t>(v);
 }
 
+time_t toEpoch(const char* text) {
+  const long long v = strtoll(text, nullptr, 10);
+  return v > 0 ? static_cast<time_t>(v) : 0;
+}
+
 // Walks the file with the SAX parser, keeping track of where it is in the stats layout, and hands
-// the subclasses what they need: the top-level counters, the global day buckets, and each book's
-// counters and days together with the offsets of its braces. Fed a byte at a time so that every
-// event knows the offset of the byte that caused it, and onByte() sees each byte after the parser
-// has.
+// the subclasses what they need: the top-level counters, the global day buckets, and each book
+// with the offsets of its braces. Fed a byte at a time so that every event knows the offset of the
+// byte that caused it, and onByte() sees each byte after the parser has.
 //
 //   { "totalSeconds": n, ..., "globalDays": [[d, s], ...], "books": [ { ..., "days": [[d, s]] } ] }
 //   depth 1                   2            3              2          3            4  5
+//
+// In single-book mode (readBookAt) the input starts at one entry's opening brace: the book is at
+// depth 1, its days at 2 and 3, and the pass ends when that object closes.
 class Scanner {
  public:
   struct Book {
     std::string docId;
+    std::string title;
+    std::string author;
     uint32_t totalSeconds = 0;
     uint32_t pagesTurned = 0;
     uint32_t sessions = 0;
+    time_t firstReadEpoch = 0;
+    time_t lastReadEpoch = 0;
     uint8_t progress = 0;
     uint16_t finishedCount = 0;
     bool hasFinishedCount = false;
     bool finishedFlag = false;  // the legacy bool, read only when finishedCount is absent
+    time_t lastFinishedEpoch = 0;
     std::vector<DayBucket> days;
     size_t first = 0;  // offset of '{'
     bool hasFields = false;
+
+    bool finished() const { return hasFinishedCount ? finishedCount > 0 : finishedFlag; }
+
+    // As a load would hold it.
+    BookReadingStats toStats() const {
+      BookReadingStats s;
+      s.docId = docId;
+      s.title = title;
+      s.author = author;
+      s.totalSeconds = totalSeconds;
+      s.pagesTurned = pagesTurned;
+      s.sessions = sessions;
+      s.firstReadEpoch = firstReadEpoch;
+      s.lastReadEpoch = lastReadEpoch;
+      s.progress = progress;
+      s.finishedCount = hasFinishedCount ? finishedCount : (finishedFlag ? 1 : 0);
+      s.lastFinishedEpoch = lastFinishedEpoch;
+      s.days = days;
+      ReadingStatsStore::trimBookDays(s.days);
+      return s;
+    }
   };
 
+  explicit Scanner(const bool singleBook = false) : singleBook_(singleBook) {}
   virtual ~Scanner() = default;
 
-  // False when the parser cannot be allocated, the file cannot be read, or it is not a well-formed
-  // stats file: a single JSON object that closes.
-  bool run(HalFile& in) {
+  ScanResult run(HalFile& in, const size_t start = 0) {
     auto parser = makeUniqueNoThrow<StreamingJsonParser>(callbacks());
     // Large reads: every file call costs ~1.5 ms on SD whatever its size (BufferedFileIO.h), and a
     // full history is ~100 KB.
     auto block = makeUniqueNoThrow<char[]>(kReadBlock);
     if (!parser || !block) {
       LOG_ERR("RSF", "OOM: stats file parser");
-      return false;
+      return ScanResult::NoMemory;
     }
-    if (!in.seekSet(0)) return false;
+    if (!in.seekSet(start)) return ScanResult::IoError;
     char* const bytes = block.get();
-    size_t offset = 0;
-    for (;;) {
+    size_t offset = start;
+    while (!done_) {
       const int n = in.read(bytes, kReadBlock);
-      if (n < 0) return false;
+      if (n < 0) return ScanResult::IoError;
       if (n == 0) break;
-      for (int i = 0; i < n; ++i, ++offset) {
+      for (int i = 0; i < n && !done_; ++i, ++offset) {
         offset_ = offset;
         parser->feed(&bytes[i], 1);
         onByte(bytes[i], offset, insideBooks(offset));
       }
     }
-    return !parser->hasError() && rootClosed_ && depth_ == 0;
+    const bool complete = singleBook_ ? done_ : (rootClosed_ && depth_ == 0);
+    return !parser->hasError() && complete ? ScanResult::Ok : ScanResult::Malformed;
   }
 
  protected:
@@ -105,12 +141,17 @@ class Scanner {
   enum class Field : uint8_t {
     Other,
     DocId,
+    Title,
+    Author,
     TotalSeconds,
     PagesTurned,
     Sessions,
+    FirstRead,
+    LastRead,
     Progress,
     FinishedCount,
     Finished,
+    LastFinished,
     Days
   };
 
@@ -126,21 +167,26 @@ class Scanner {
 
   static Field fieldFor(const char* key) {
     if (strcmp(key, "docId") == 0) return Field::DocId;
+    if (strcmp(key, "title") == 0) return Field::Title;
+    if (strcmp(key, "author") == 0) return Field::Author;
     if (strcmp(key, "totalSeconds") == 0) return Field::TotalSeconds;
     if (strcmp(key, "pagesTurned") == 0) return Field::PagesTurned;
     if (strcmp(key, "sessions") == 0) return Field::Sessions;
+    if (strcmp(key, "firstReadEpoch") == 0) return Field::FirstRead;
+    if (strcmp(key, "lastReadEpoch") == 0) return Field::LastRead;
     if (strcmp(key, "progress") == 0) return Field::Progress;
     if (strcmp(key, "finishedCount") == 0) return Field::FinishedCount;
     if (strcmp(key, "finished") == 0) return Field::Finished;
+    if (strcmp(key, "lastFinishedEpoch") == 0) return Field::LastFinished;
     if (strcmp(key, "days") == 0) return Field::Days;
     return Field::Other;
   }
 
-  bool inBooksArray() const { return top_ == Top::Books; }
-  bool atBook() const { return inBooksArray() && depth_ == 3; }
-  bool atDayPair() const {
-    return (top_ == Top::GlobalDays && depth_ == 3) || (inBooksArray() && field_ == Field::Days && depth_ == 5);
-  }
+  int bookDepth() const { return singleBook_ ? 1 : 3; }
+  bool inBookScope() const { return singleBook_ || top_ == Top::Books; }
+  bool atBook() const { return inBookScope() && depth_ == bookDepth(); }
+  bool atBookDayPair() const { return inBookScope() && field_ == Field::Days && depth_ == bookDepth() + 2; }
+  bool atGlobalDayPair() const { return !singleBook_ && top_ == Top::GlobalDays && depth_ == 3; }
 
   bool insideBooks(const size_t offset) const {
     return booksOpen_ != kNone && offset > booksOpen_ && (booksClose_ == kNone || offset < booksClose_);
@@ -148,14 +194,9 @@ class Scanner {
 
   void objectStart() {
     ++depth_;
-    if (depth_ == 1 && !rootSeen_) rootSeen_ = true;
+    if (!singleBook_ && depth_ == 1) rootSeen_ = true;
     if (atBook()) {
-      book_.docId.clear();
-      book_.totalSeconds = book_.pagesTurned = book_.sessions = 0;
-      book_.progress = 0;
-      book_.finishedCount = 0;
-      book_.hasFinishedCount = book_.finishedFlag = book_.hasFields = false;
-      book_.days.clear();
+      book_ = Book{};
       book_.first = offset_;
       field_ = Field::Other;
       onBookStart(offset_);
@@ -164,14 +205,17 @@ class Scanner {
 
   void objectEnd() {
     if (atBook()) onBookEnd(book_, offset_);
-    if (depth_ == 1 && rootSeen_) rootClosed_ = true;
+    if (depth_ == 1) {
+      if (singleBook_) done_ = true;
+      if (!singleBook_ && rootSeen_) rootClosed_ = true;
+    }
     if (depth_ > 0) --depth_;
   }
 
   void arrayStart() {
     ++depth_;
-    if (depth_ == 2 && inBooksArray() && booksOpen_ == kNone) booksOpen_ = offset_;
-    if (atDayPair()) {
+    if (!singleBook_ && depth_ == 2 && top_ == Top::Books && booksOpen_ == kNone) booksOpen_ = offset_;
+    if (atGlobalDayPair() || atBookDayPair()) {
       pairIndex_ = 0;
       pairDay_ = 0;
       pairSeconds_ = 0;
@@ -179,20 +223,20 @@ class Scanner {
   }
 
   void arrayEnd() {
-    if (atDayPair() && pairIndex_ >= 2 && pairDay_ != 0 && pairSeconds_ != 0) {
+    if ((atGlobalDayPair() || atBookDayPair()) && pairIndex_ >= 2 && pairDay_ != 0 && pairSeconds_ != 0) {
       // Same filter as the loader: a zero day or zero seconds is not a bucket.
-      if (top_ == Top::GlobalDays) {
+      if (atGlobalDayPair()) {
         onGlobalDay(pairDay_, pairSeconds_);
       } else {
         book_.days.push_back({pairDay_, pairSeconds_});
       }
     }
-    if (depth_ == 2 && inBooksArray() && booksClose_ == kNone) booksClose_ = offset_;
+    if (!singleBook_ && depth_ == 2 && top_ == Top::Books && booksClose_ == kNone) booksClose_ = offset_;
     if (depth_ > 0) --depth_;
   }
 
   void key(const char* text) {
-    if (depth_ == 1) {
+    if (!singleBook_ && depth_ == 1) {
       top_ = topFor(text);
     } else if (atBook()) {
       field_ = fieldFor(text);
@@ -201,30 +245,38 @@ class Scanner {
   }
 
   void number(const char* text) {
-    if (depth_ == 1) {
+    if (!singleBook_ && depth_ == 1) {
       onCounter(top_, toCount(text));
-    } else if (atDayPair()) {
+    } else if (atGlobalDayPair() || atBookDayPair()) {
       if (pairIndex_ == 0) pairDay_ = static_cast<uint16_t>(std::min<uint32_t>(toCount(text), 0xFFFF));
       if (pairIndex_ == 1) pairSeconds_ = toCount(text);
       ++pairIndex_;
     } else if (atBook()) {
-      const uint32_t v = toCount(text);
       switch (field_) {
         case Field::TotalSeconds:
-          book_.totalSeconds = v;
+          book_.totalSeconds = toCount(text);
           break;
         case Field::PagesTurned:
-          book_.pagesTurned = v;
+          book_.pagesTurned = toCount(text);
           break;
         case Field::Sessions:
-          book_.sessions = v;
+          book_.sessions = toCount(text);
+          break;
+        case Field::FirstRead:
+          book_.firstReadEpoch = toEpoch(text);
+          break;
+        case Field::LastRead:
+          book_.lastReadEpoch = toEpoch(text);
           break;
         case Field::Progress:
-          book_.progress = static_cast<uint8_t>(std::min<uint32_t>(v, 0xFF));
+          book_.progress = static_cast<uint8_t>(std::min<uint32_t>(toCount(text), 0xFF));
           break;
         case Field::FinishedCount:
-          book_.finishedCount = static_cast<uint16_t>(std::min<uint32_t>(v, 0xFFFF));
+          book_.finishedCount = static_cast<uint16_t>(std::min<uint32_t>(toCount(text), 0xFFFF));
           book_.hasFinishedCount = true;
+          break;
+        case Field::LastFinished:
+          book_.lastFinishedEpoch = toEpoch(text);
           break;
         default:
           break;
@@ -233,7 +285,10 @@ class Scanner {
   }
 
   void string(const char* text) {
-    if (atBook() && field_ == Field::DocId) book_.docId = text;
+    if (!atBook()) return;
+    if (field_ == Field::DocId) book_.docId = text;
+    if (field_ == Field::Title) book_.title = text;
+    if (field_ == Field::Author) book_.author = text;
   }
 
   void boolean(const bool value) {
@@ -254,10 +309,12 @@ class Scanner {
     return cb;
   }
 
+  const bool singleBook_;
   size_t offset_ = 0;
   int depth_ = 0;
   bool rootSeen_ = false;
   bool rootClosed_ = false;
+  bool done_ = false;
   Top top_ = Top::Other;
   Field field_ = Field::Other;
   size_t booksOpen_ = kNone;
@@ -270,22 +327,28 @@ class Scanner {
 
 class SummaryScan final : public Scanner {
  public:
-  SummaryScan(Summary& summary, const std::string& findDocId) : summary_(summary), findDocId_(findDocId) {}
+  SummaryScan(Summary& summary, const ScanRequest& request) : summary_(summary), request_(request) {
+    summary_.recents.resize(request.recentDocIds.size());
+    for (size_t i = 0; i < request.recentDocIds.size(); ++i) summary_.recents[i].docId = request.recentDocIds[i];
+  }
 
-  // The byte range that removes the target, taking one separating comma with it: the one before it
-  // when it has a predecessor, else the one after it.
-  void settleCut() {
-    if (!summary_.found) return;
-    if (prevLast_ != kNone) {
-      summary_.cutFirst = prevLast_ + 1;
-      summary_.cutLast = targetLast_;
-    } else if (nextFirst_ != kNone) {
-      summary_.cutFirst = targetFirst_;
-      summary_.cutLast = nextFirst_ - 1;
-    } else {
-      summary_.cutFirst = targetFirst_;
-      summary_.cutLast = targetLast_;
+  // After the pass: the target's cut range, taking one separating comma with it (the one before
+  // it when it has a predecessor, else the one after it), and the index in time order.
+  void settle() {
+    if (summary_.found) {
+      if (prevLast_ != kNone) {
+        summary_.cutFirst = prevLast_ + 1;
+        summary_.cutLast = targetLast_;
+      } else if (nextFirst_ != kNone) {
+        summary_.cutFirst = summary_.targetFirst;
+        summary_.cutLast = nextFirst_ - 1;
+      } else {
+        summary_.cutFirst = summary_.targetFirst;
+        summary_.cutLast = targetLast_;
+      }
     }
+    std::stable_sort(summary_.byTime.begin(), summary_.byTime.end(),
+                     [](const IndexEntry& a, const IndexEntry& b) { return a.totalSeconds > b.totalSeconds; });
   }
 
  private:
@@ -320,21 +383,33 @@ class SummaryScan final : public Scanner {
     // The loader skips an entry without a docId; so does everything counted here.
     if (!book.docId.empty()) {
       ++summary_.bookCount;
-      if (book.hasFinishedCount ? book.finishedCount > 0 : book.finishedFlag) ++summary_.finishedBookCount;
+      if (book.finished()) ++summary_.finishedBookCount;
       if (ReadingStatsStore::countsTowardPace(book.progress)) {
         summary_.paceSeconds += book.totalSeconds;
         summary_.pacePercents += book.progress;
       }
-      if (!summary_.found && !findDocId_.empty() && book.docId == findDocId_) {
+      if (request_.wantIndex) summary_.byTime.push_back({book.totalSeconds, static_cast<uint32_t>(book.first)});
+      if (request_.wantVictim &&
+          (!summary_.hasVictim ||
+           ReadingStatsStore::evictsBefore(book.lastReadEpoch, book.totalSeconds, victimLastRead_, victimSeconds_))) {
+        summary_.hasVictim = true;
+        summary_.victimDocId = book.docId;
+        summary_.victimFirst = book.first;
+        victimLastRead_ = book.lastReadEpoch;
+        victimSeconds_ = book.totalSeconds;
+      }
+      for (RecentSnapshot& recent : summary_.recents) {
+        if (recent.known || recent.docId != book.docId) continue;
+        recent.known = true;
+        recent.totalSeconds = book.totalSeconds;
+        recent.knownDays = static_cast<uint16_t>(std::min(book.days.size(), ReadingStatsStore::kMaxBookDays));
+        recent.lastReadEpoch = book.lastReadEpoch;
+        recent.progress = book.progress;
+      }
+      if (!summary_.found && !request_.findDocId.empty() && book.docId == request_.findDocId) {
         summary_.found = true;
-        summary_.target.docId = book.docId;
-        summary_.target.totalSeconds = book.totalSeconds;
-        summary_.target.sessions = book.sessions;
-        summary_.target.pagesTurned = book.pagesTurned;
-        summary_.target.days = book.days;
-        // What a load would have kept of it, which is what removeBook() would take out.
-        ReadingStatsStore::trimBookDays(summary_.target.days);
-        targetFirst_ = book.first;
+        summary_.target = book.toStats();
+        summary_.targetFirst = book.first;
         targetLast_ = last;
         prevLast_ = lastBookLast_;
       }
@@ -343,12 +418,23 @@ class SummaryScan final : public Scanner {
   }
 
   Summary& summary_;
-  const std::string& findDocId_;
+  const ScanRequest& request_;
   size_t lastBookLast_ = kNone;
   size_t prevLast_ = kNone;
-  size_t targetFirst_ = kNone;
   size_t targetLast_ = kNone;
   size_t nextFirst_ = kNone;
+  time_t victimLastRead_ = 0;
+  uint32_t victimSeconds_ = 0;
+};
+
+class BookAt final : public Scanner {
+ public:
+  explicit BookAt(BookReadingStats& out) : Scanner(/*singleBook=*/true), out_(out) {}
+
+ private:
+  void onBookEnd(const Book& book, size_t) override { out_ = book.toStats(); }
+
+  BookReadingStats& out_;
 };
 
 // Copies the books array's contents through, adding each book's time-to-finish before its closing
@@ -401,14 +487,27 @@ class CopyWithout final : public Scanner {
 
 }  // namespace
 
-bool summarize(HalFile& in, Summary& summary, const std::string& findDocId) {
+ScanResult scan(HalFile& in, Summary& summary, const ScanRequest& request) {
   summary = Summary{};
-  SummaryScan scan(summary, findDocId);
-  if (!scan.run(in)) return false;
+  SummaryScan pass(summary, request);
+  const ScanResult result = pass.run(in);
+  if (result != ScanResult::Ok) return result;
   // What a load would hold: the newest kMaxGlobalDays buckets, the record folded in first.
   ReadingStatsStore::trimGlobalDays(summary.globalDays, summary.longestStreak);
-  scan.settleCut();
-  return true;
+  pass.settle();
+  return ScanResult::Ok;
+}
+
+bool summarize(HalFile& in, Summary& summary, const std::string& findDocId) {
+  ScanRequest request;
+  request.findDocId = findDocId;
+  return scan(in, summary, request) == ScanResult::Ok;
+}
+
+ScanResult readBookAt(HalFile& in, const size_t offset, BookReadingStats& book) {
+  book = BookReadingStats{};
+  BookAt pass(book);
+  return pass.run(in, offset);
 }
 
 void writeDashboard(HalFile& in, const Summary& summary, const uint16_t today, Print& out) {
@@ -431,7 +530,7 @@ void writeDashboard(HalFile& in, const Summary& summary, const uint16_t today, P
   emit(out, ",\"books\":[");
   DashboardCopy copy(
       out, ReadingStatsStore::pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents));
-  if (!copy.run(in)) {
+  if (copy.run(in) != ScanResult::Ok) {
     LOG_ERR("RSF", "Stats file changed or failed between passes; dashboard truncated");
   }
   emit(out, "]}");
@@ -454,7 +553,7 @@ void writeWithoutTarget(HalFile& in, const Summary& summary, Print& out) {
   emitDays(out, globalDays);
   emit(out, ",\"books\":[");
   CopyWithout copy(out, summary.cutFirst, summary.cutLast);
-  if (!copy.run(in)) {
+  if (copy.run(in) != ScanResult::Ok) {
     LOG_ERR("RSF", "Stats file changed or failed between passes; copy truncated");
   }
   emit(out, "]}");

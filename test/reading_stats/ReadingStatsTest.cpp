@@ -115,6 +115,17 @@ TEST(ReadingStatsRemoveBook, UnknownBookChangesNothing) {
   EXPECT_EQ(secondsReadOn(store, kNoon), 600u);
 }
 
+TEST(ReadingStatsEviction, LeastRecentlyReadGoesFirstThenTheLeastRead) {
+  // (lastRead, seconds) pairs: an older last read goes first whatever the time spent...
+  EXPECT_TRUE(ReadingStatsStore::evictsBefore(50, 999, 100, 1));
+  EXPECT_FALSE(ReadingStatsStore::evictsBefore(100, 1, 50, 999));
+  // ...and on the same last read, the book with less time goes first.
+  EXPECT_TRUE(ReadingStatsStore::evictsBefore(100, 50, 100, 300));
+  EXPECT_FALSE(ReadingStatsStore::evictsBefore(100, 300, 100, 50));
+  // A full tie is not "before": the first candidate found stays the victim.
+  EXPECT_FALSE(ReadingStatsStore::evictsBefore(100, 50, 100, 50));
+}
+
 TEST(ReadingStatsRemoveBook, NeverWrapsTotalsBelowZero) {
   // The history file sits on the SD card and the web dashboard offers it for download; a file
   // edited by hand can carry a book with more time than the global total. Removing that book must

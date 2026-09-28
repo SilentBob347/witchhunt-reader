@@ -4,40 +4,11 @@
 #include <string>
 #include <vector>
 
-// Day buckets are keyed by an ordinal day count (days since 1970-01-01 in
-// LOCAL time, computed by localDayIndex() below). A "reading day" is the
-// calendar day the session ENDED in — phase 2 keeps this simple and doesn't
-// model the KOReader "day shift" / hour cutoff setting yet.
-struct DayBucket {
-  uint16_t dayIndex = 0;
-  uint32_t seconds = 0;
-};
+#include "ReadingStatsTypes.h"
 
 // Helpers — both return 0 when HalClock is unsynced (caller should skip).
 uint16_t localDayIndexFromEpoch(time_t epoch);
 uint16_t currentLocalDayIndex();
-
-// Per-book reading statistics. Keyed by KOReader document hash (or filename
-// hash fallback) so a renamed/moved file keeps its history.
-struct BookReadingStats {
-  std::string docId;
-  std::string title;
-  std::string author;
-  uint32_t totalSeconds = 0;  // idle-clamped, sum across all sessions
-  uint32_t pagesTurned = 0;   // forward + backward
-  uint32_t sessions = 0;      // session-open count
-  // 0 if HalClock was never synced when the session ran. Treat as "unknown".
-  time_t firstReadEpoch = 0;
-  time_t lastReadEpoch = 0;
-  uint8_t progress = 0;          // 0-100, snapshot of last known progress
-  uint16_t finishedCount = 0;    // number of times the user has marked it finished
-  time_t lastFinishedEpoch = 0;  // wallclock of the most recent finish (0 if unknown)
-  // Sparse day buckets, sorted ascending by dayIndex. Only days with reading
-  // are stored — the typical case is a few dozen entries. Bucket with
-  // dayIndex == 0 is reserved for "clock-unknown" sessions and is excluded
-  // from sparklines/streaks but kept so totals remain consistent.
-  std::vector<DayBucket> days;
-};
 
 // Singleton store for per-book + global reading stats.
 //
@@ -132,6 +103,9 @@ class ReadingStatsStore {
   // The longest run in `days`, or the persisted `record` when that is longer.
   static uint16_t longestStreakIn(const std::vector<DayBucket>& days, uint16_t record);
   static bool countsTowardPace(const uint8_t progress) { return progress >= MIN_BOOK_PROGRESS_FOR_PERSONAL_RATE; }
+  // The cap's eviction order: the least recently read book goes first (an entry never read with
+  // the clock set, lastReadEpoch 0, is the oldest); on the same date, the one with less time.
+  static bool evictsBefore(time_t aLastRead, uint32_t aSeconds, time_t bLastRead, uint32_t bSeconds);
   // The global pace from the sums over the books that count toward it; 0 below
   // MIN_GLOBAL_SECONDS_FOR_RATE of reading overall.
   static float pooledSecondsPerPercent(uint32_t globalTotalSeconds, uint32_t countedSeconds, uint32_t countedPercents);
