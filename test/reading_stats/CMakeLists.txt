@@ -1,6 +1,9 @@
 add_executable(ReadingStatsTest
   ReadingStatsTest.cpp
+  ReadingStatsFileTest.cpp
   ${REPO_ROOT}/src/ReadingStats.cpp
+  ${REPO_ROOT}/src/ReadingStatsFile.cpp
+  ${REPO_ROOT}/lib/JsonParser/StreamingJsonParser.cpp
 )
 
 target_include_directories(ReadingStatsTest PRIVATE
@@ -11,6 +14,8 @@ target_include_directories(ReadingStatsTest PRIVATE
   # HalClock.h, whose now()/isSynced() the test stubs.
   ${REPO_ROOT}/lib/hal
   ${REPO_ROOT}/lib/Logging
+  ${REPO_ROOT}/lib/JsonParser
+  ${REPO_ROOT}/lib/Memory
 )
 
 # localDayIndexFromEpoch() calls localtime_r, which MinGW's <time.h> declares only on request.

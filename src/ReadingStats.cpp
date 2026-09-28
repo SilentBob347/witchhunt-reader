@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <ctime>
 
+#include "ReadingStatsFile.h"
+
 namespace {
-constexpr char READING_STATS_FILE[] = "/.crosspoint/reading-stats.json";
+constexpr const char* READING_STATS_FILE = ReadingStatsFile::kPath;
 
 // Add `seconds` to the bucket for `dayIndex` in `days`, inserting in sorted
 // position if absent. dayIndex == 0 ("unknown day") is silently skipped here —
