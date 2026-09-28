@@ -586,8 +586,7 @@ void writeDashboard(HalFile& in, const Summary& summary, const uint16_t today, P
 void writeWithoutTarget(HalFile& in, const Summary& summary, Print& out) {
   Rewrite rewrite;
   rewrite.totals = summary;  // the ReadingTotals part
-  ReadingStatsStore::takeOut(summary.target, rewrite.totals.totalSeconds, rewrite.totals.totalSessions,
-                             rewrite.totals.totalPagesTurned, rewrite.totals.globalDays);
+  ReadingStatsStore::takeOut(summary.target, rewrite.totals);
   rewrite.dropAt = summary.targetFirst;
   if (writeRewrite(&in, rewrite, out) != ScanResult::Ok) {
     LOG_ERR("RSF", "Stats file changed or failed between passes; copy truncated");

@@ -138,36 +138,38 @@ void ReadingStatsStore::recordSession(const std::string& docId, const std::strin
     }
     BookReadingStats fresh;
     fresh.docId = docId;
-    fresh.title = title;
-    fresh.author = author;
     books.push_back(std::move(fresh));
     it = books.end() - 1;
-  } else {
-    if (!title.empty()) it->title = title;
-    if (!author.empty()) it->author = author;
   }
+  applySession(*it, totals_, title, author, sessionSeconds, sessionPagesTurned, progress, walltimeEpoch);
+}
 
-  it->totalSeconds += sessionSeconds;
-  it->pagesTurned += sessionPagesTurned;
-  it->progress = progress;
+void ReadingStatsStore::applySession(BookReadingStats& book, ReadingTotals& totals, const std::string& title,
+                                     const std::string& author, const uint32_t sessionSeconds,
+                                     const uint32_t sessionPagesTurned, const uint8_t progress,
+                                     const time_t walltimeEpoch) {
+  if (!title.empty()) book.title = title;
+  if (!author.empty()) book.author = author;
+  book.totalSeconds += sessionSeconds;
+  book.pagesTurned += sessionPagesTurned;
+  book.progress = progress;
   if (sessionSeconds > 0) {
-    it->sessions += 1;
-    globalTotalSessions += 1;
+    book.sessions += 1;
+    totals.totalSessions += 1;
   }
   if (walltimeEpoch != 0) {
-    if (it->firstReadEpoch == 0) it->firstReadEpoch = walltimeEpoch;
-    it->lastReadEpoch = walltimeEpoch;
+    if (book.firstReadEpoch == 0) book.firstReadEpoch = walltimeEpoch;
+    book.lastReadEpoch = walltimeEpoch;
     const uint16_t day = localDayIndexFromEpoch(walltimeEpoch);
-    mergeDay(it->days, day, sessionSeconds, kMaxBookDays);
-    mergeDay(globalDays, day, sessionSeconds, kMaxGlobalDays);
+    mergeDay(book.days, day, sessionSeconds, kMaxBookDays);
+    mergeDay(totals.globalDays, day, sessionSeconds, kMaxGlobalDays);
     // Fold this day's run into the persisted longest streak while the whole run is still in the
     // window (a run longer than the window is already the record).
-    const uint16_t run = runEndingAt(globalDays, day);
-    if (run > longestStreak_) longestStreak_ = run;
+    const uint16_t run = runEndingAt(totals.globalDays, day);
+    if (run > totals.longestStreak) totals.longestStreak = run;
   }
-
-  globalTotalSeconds += sessionSeconds;
-  globalTotalPagesTurned += sessionPagesTurned;
+  totals.totalSeconds += sessionSeconds;
+  totals.totalPagesTurned += sessionPagesTurned;
 }
 
 uint32_t ReadingStatsStore::secondsOn(const std::vector<DayBucket>& days, const uint16_t dayIndex) {
@@ -211,13 +213,17 @@ uint16_t ReadingStatsStore::longestStreakIn(const std::vector<DayBucket>& days, 
   return longest;
 }
 
-uint32_t ReadingStatsStore::getSecondsForDay(const uint16_t dayIndex) const { return secondsOn(globalDays, dayIndex); }
-
-uint16_t ReadingStatsStore::computeCurrentStreak(const uint16_t today) const {
-  return currentStreakIn(globalDays, today);
+uint32_t ReadingStatsStore::getSecondsForDay(const uint16_t dayIndex) const {
+  return secondsOn(totals_.globalDays, dayIndex);
 }
 
-uint16_t ReadingStatsStore::computeLongestStreak() const { return longestStreakIn(globalDays, longestStreak_); }
+uint16_t ReadingStatsStore::computeCurrentStreak(const uint16_t today) const {
+  return currentStreakIn(totals_.globalDays, today);
+}
+
+uint16_t ReadingStatsStore::computeLongestStreak() const {
+  return longestStreakIn(totals_.globalDays, totals_.longestStreak);
+}
 
 void ReadingStatsStore::markFinished(const std::string& docId, const std::string& title, const std::string& author,
                                      time_t walltimeEpoch) {
@@ -226,34 +232,35 @@ void ReadingStatsStore::markFinished(const std::string& docId, const std::string
   if (it == books.end()) {
     BookReadingStats fresh;
     fresh.docId = docId;
-    fresh.title = title;
-    fresh.author = author;
     books.push_back(std::move(fresh));
     it = books.end() - 1;
-  } else {
-    if (!title.empty()) it->title = title;
-    if (!author.empty()) it->author = author;
   }
-  it->finishedCount += 1;
-  it->progress = 100;
+  applyFinish(*it, title, author, walltimeEpoch);
+}
+
+void ReadingStatsStore::applyFinish(BookReadingStats& book, const std::string& title, const std::string& author,
+                                    const time_t walltimeEpoch) {
+  if (!title.empty()) book.title = title;
+  if (!author.empty()) book.author = author;
+  book.finishedCount += 1;
+  book.progress = 100;
   if (walltimeEpoch != 0) {
-    it->lastFinishedEpoch = walltimeEpoch;
-    if (it->lastReadEpoch < walltimeEpoch) it->lastReadEpoch = walltimeEpoch;
+    book.lastFinishedEpoch = walltimeEpoch;
+    if (book.lastReadEpoch < walltimeEpoch) book.lastReadEpoch = walltimeEpoch;
   }
 }
 
-void ReadingStatsStore::takeOut(const BookReadingStats& book, uint32_t& totalSeconds, uint32_t& totalSessions,
-                                uint32_t& totalPagesTurned, std::vector<DayBucket>& globalDays) {
-  totalSeconds -= std::min(totalSeconds, book.totalSeconds);
-  totalSessions -= std::min(totalSessions, book.sessions);
-  totalPagesTurned -= std::min(totalPagesTurned, book.pagesTurned);
-  for (const DayBucket& day : book.days) unmergeDay(globalDays, day.dayIndex, day.seconds);
+void ReadingStatsStore::takeOut(const BookReadingStats& book, ReadingTotals& totals) {
+  totals.totalSeconds -= std::min(totals.totalSeconds, book.totalSeconds);
+  totals.totalSessions -= std::min(totals.totalSessions, book.sessions);
+  totals.totalPagesTurned -= std::min(totals.totalPagesTurned, book.pagesTurned);
+  for (const DayBucket& day : book.days) unmergeDay(totals.globalDays, day.dayIndex, day.seconds);
 }
 
 bool ReadingStatsStore::removeBook(const std::string& docId) {
   auto it = std::find_if(books.begin(), books.end(), [&docId](const BookReadingStats& b) { return b.docId == docId; });
   if (it == books.end()) return false;
-  takeOut(*it, globalTotalSeconds, globalTotalSessions, globalTotalPagesTurned, globalDays);
+  takeOut(*it, totals_);
   books.erase(it);
   return true;
 }
@@ -305,7 +312,7 @@ float ReadingStatsStore::globalAvgSecondsPerPercent() const {
     totalProgressPercents += b.progress;
     totalSecondsFromCountedBooks += b.totalSeconds;
   }
-  return pooledSecondsPerPercent(globalTotalSeconds, totalSecondsFromCountedBooks, totalProgressPercents);
+  return pooledSecondsPerPercent(totals_.totalSeconds, totalSecondsFromCountedBooks, totalProgressPercents);
 }
 
 float ReadingStatsStore::avgSecondsPerPercent(const std::string& docId) const {
@@ -433,14 +440,14 @@ void ReadingStatsStore::replaceLoaded(std::vector<BookReadingStats>&& loadedBook
                                       const uint32_t totalSessions, const uint32_t totalPagesTurned,
                                       const uint16_t longestStreak) {
   books = std::move(loadedBooks);
-  globalDays = std::move(loadedGlobalDays);
-  globalTotalSeconds = totalSeconds;
-  globalTotalSessions = totalSessions;
-  globalTotalPagesTurned = totalPagesTurned;
-  longestStreak_ = longestStreak;
+  totals_.globalDays = std::move(loadedGlobalDays);
+  totals_.totalSeconds = totalSeconds;
+  totals_.totalSessions = totalSessions;
+  totals_.totalPagesTurned = totalPagesTurned;
+  totals_.longestStreak = longestStreak;
   // Files written before the caps existed: trim once here, the next save persists it.
   for (auto& book : books) trimBookDays(book.days);
-  trimGlobalDays(globalDays, longestStreak_);
+  trimGlobalDays(totals_.globalDays, totals_.longestStreak);
 }
 
 void ReadingStatsStore::trimBookDays(std::vector<DayBucket>& days) {
@@ -463,11 +470,7 @@ void ReadingStatsStore::release() {
   // plus a per-book days vector each. Swap with an empty temporary so the buffers actually go
   // back to the heap.
   std::vector<BookReadingStats>().swap(books);
-  std::vector<DayBucket>().swap(globalDays);
-  globalTotalSeconds = 0;
-  globalTotalSessions = 0;
-  globalTotalPagesTurned = 0;
-  longestStreak_ = 0;
+  totals_ = ReadingTotals{};  // move assignment frees the old buckets
   loaded_ = false;
   LOG_DBG("RST", "Store released (free=%lu contig=%lu)", static_cast<unsigned long>(esp_get_free_heap_size()),
           static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)));

@@ -23,17 +23,8 @@ class ReadingStatsStore {
 
   std::vector<BookReadingStats> books;
 
-  // Global aggregates — sum across all books.
-  uint32_t globalTotalSeconds = 0;
-  uint32_t globalTotalSessions = 0;
-  uint32_t globalTotalPagesTurned = 0;
-  // Global per-day reading time, sorted ascending. Same shape as per-book.
-  // Used to compute streaks and the sparkline on the stats screen.
-  std::vector<DayBucket> globalDays;
-  // Longest run of consecutive reading days ever seen, persisted. globalDays keeps only the
-  // newest kMaxGlobalDays buckets (memory audit 2026-09, R8), so a streak that started before
-  // that window would otherwise be forgotten; recordSession() folds each session's run into it.
-  uint16_t longestStreak_ = 0;
+  // Global aggregates — sum across all books, the day buckets and the persisted streak record.
+  ReadingTotals totals_;
 
  public:
   static ReadingStatsStore& getInstance() { return instance; }
@@ -116,9 +107,17 @@ class ReadingStatsStore {
   // `record`, since the record may live in them.
   static void trimGlobalDays(std::vector<DayBucket>& days, uint16_t& record);
   static void trimBookDays(std::vector<DayBucket>& days);
-  // Takes one book's contribution back out of the global aggregates (removeBook()'s arithmetic).
-  static void takeOut(const BookReadingStats& book, uint32_t& totalSeconds, uint32_t& totalSessions,
-                      uint32_t& totalPagesTurned, std::vector<DayBucket>& globalDays);
+  // Takes one book's contribution back out of the global figures (removal's arithmetic).
+  static void takeOut(const BookReadingStats& book, ReadingTotals& totals);
+  // A finished session applied to one book and the global figures (the session end's arithmetic):
+  // counters, the book's and the global day buckets, the streak record. `title` / `author` replace
+  // the book's only when non-empty.
+  static void applySession(BookReadingStats& book, ReadingTotals& totals, const std::string& title,
+                           const std::string& author, uint32_t sessionSeconds, uint32_t sessionPagesTurned,
+                           uint8_t progress, time_t walltimeEpoch);
+  // One more finish of the book.
+  static void applyFinish(BookReadingStats& book, const std::string& title, const std::string& author,
+                          time_t walltimeEpoch);
 
   const std::vector<BookReadingStats>& getBooks() const { return books; }
   // Bounds (memory audit 2026-09, R8). The store used to grow without limit -- an entry per
@@ -130,20 +129,20 @@ class ReadingStatsStore {
   static constexpr size_t kMaxBooks = 100;
   static constexpr size_t kMaxBookDays = 60;
   static constexpr size_t kMaxGlobalDays = 400;
-  uint16_t getLongestStreakSeen() const { return longestStreak_; }
+  uint16_t getLongestStreakSeen() const { return totals_.longestStreak; }
   // Loader entry point (JsonSettingsIO::loadReadingStats): replaces the whole in-memory history.
   void replaceLoaded(std::vector<BookReadingStats>&& loadedBooks, std::vector<DayBucket>&& loadedGlobalDays,
                      uint32_t totalSeconds, uint32_t totalSessions, uint32_t totalPagesTurned, uint16_t longestStreak);
-  uint32_t getGlobalTotalSeconds() const { return globalTotalSeconds; }
-  uint32_t getGlobalTotalSessions() const { return globalTotalSessions; }
-  uint32_t getGlobalTotalPagesTurned() const { return globalTotalPagesTurned; }
+  uint32_t getGlobalTotalSeconds() const { return totals_.totalSeconds; }
+  uint32_t getGlobalTotalSessions() const { return totals_.totalSessions; }
+  uint32_t getGlobalTotalPagesTurned() const { return totals_.totalPagesTurned; }
   size_t getBookCount() const { return books.size(); }
   // Count of distinct books that have been finished at least once. Derived
   // on read so we don't need a separate aggregate counter to keep in sync.
   size_t getFinishedBookCount() const;
 
   // Read-only view of the global day map.
-  const std::vector<DayBucket>& getGlobalDays() const { return globalDays; }
+  const std::vector<DayBucket>& getGlobalDays() const { return totals_.globalDays; }
 
   // Seconds read on a specific local-day index. 0 if unknown.
   uint32_t getSecondsForDay(uint16_t dayIndex) const;
