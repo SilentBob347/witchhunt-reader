@@ -23,6 +23,7 @@
 #include "HttpFileStreamer.h"
 #include "OpdsServerStore.h"
 #include "ReadingStats.h"
+#include "ReadingStatsFile.h"
 #include "SdCardFontGlobals.h"
 #include "SdCardFontRegistry.h"
 #include "SettingsList.h"
@@ -639,84 +640,54 @@ void CrossPointWebServer::handleStatsPage() const {
 void CrossPointWebServer::handleStatsApi() const {
   if (rejectIfLowMemory(server.get())) return;
   LOG_WEB_MEM("stats_api_enter");
-  // Wire the same data the on-device screens use into a JSON payload the
-  // browser dashboard can consume. We pre-compute streaks and todayDayIndex
-  // here so the browser doesn't have to recreate the day-index math; the day
-  // arrays still go across untouched so the browser can render the sparkline.
-  const auto& store = READING_STATS;
-  const uint16_t today = currentLocalDayIndex();
-  const bool haveStreak = today != 0 && !store.getGlobalDays().empty();
-
-  JsonDocument doc;
-  doc["totalSeconds"] = store.getGlobalTotalSeconds();
-  doc["totalSessions"] = store.getGlobalTotalSessions();
-  doc["totalPagesTurned"] = store.getGlobalTotalPagesTurned();
-  doc["bookCount"] = static_cast<uint32_t>(store.getBookCount());
-  doc["finishedBookCount"] = static_cast<uint32_t>(store.getFinishedBookCount());
-  doc["todayDayIndex"] = today;
-  // Global reading pace (seconds per book progress percent) — exposed so the
-  // dashboard can render fallback ETAs for books that don't yet have enough
-  // personal data to estimate from.
-  doc["globalSecondsPerPercent"] = store.globalAvgSecondsPerPercent();
-  if (haveStreak) {
-    doc["currentStreak"] = store.computeCurrentStreak(today);
-    doc["longestStreak"] = store.computeLongestStreak();
+  // The figures the on-device screens show, with streaks and todayDayIndex pre-computed so the
+  // browser doesn't have to recreate the day-index math; the day arrays go across untouched so it
+  // can render the sparkline.
+  //
+  // Streamed from the file, never loaded: the store's full load plus a JSON document of the whole
+  // payload does not fit next to Wi-Fi once the history grows. ReadingStatsFile holds a parser and
+  // the global day buckets, and the books go through to the chunked response as stored.
+  FsFile file;
+  if (!Storage.exists(ReadingStatsFile::kPath) || !Storage.openFileForRead("WEB", ReadingStatsFile::kPath, file) ||
+      file.size() == 0) {
+    // No history yet (an absent or empty file, as for the loader).
+    server->send(200, "application/json", "{\"totalSeconds\":0,\"books\":[]}");
+    return;
   }
-
-  // Day buckets as [[dayIndex, seconds], …] — same compact shape as on disk
-  // so the browser code can treat the export and the live API identically.
-  JsonArray globalDays = doc["globalDays"].to<JsonArray>();
-  for (const auto& d : store.getGlobalDays()) {
-    JsonArray pair = globalDays.add<JsonArray>();
-    pair.add(d.dayIndex);
-    pair.add(d.seconds);
+  ReadingStatsFile::Summary summary;
+  if (!ReadingStatsFile::summarize(file, summary)) {
+    server->send(500, "application/json", "{\"error\":\"Reading stats could not be read\"}");
+    return;
   }
-
-  JsonArray booksArr = doc["books"].to<JsonArray>();
-  for (const auto& book : store.getBooks()) {
-    JsonObject obj = booksArr.add<JsonObject>();
-    obj["docId"] = book.docId;
-    obj["title"] = book.title;
-    obj["author"] = book.author;
-    obj["totalSeconds"] = book.totalSeconds;
-    obj["pagesTurned"] = book.pagesTurned;
-    obj["sessions"] = book.sessions;
-    obj["firstReadEpoch"] = static_cast<int64_t>(book.firstReadEpoch);
-    obj["lastReadEpoch"] = static_cast<int64_t>(book.lastReadEpoch);
-    obj["progress"] = book.progress;
-    obj["finishedCount"] = book.finishedCount;
-    obj["lastFinishedEpoch"] = static_cast<int64_t>(book.lastFinishedEpoch);
-    // Keep the legacy bool so the existing dashboard JS keeps working.
-    obj["finished"] = book.finishedCount > 0;
-    // Estimated seconds to finish the book at the user's pace. 0 = unknown
-    // (no rate available yet, or the book is already at 100%).
-    const float remainingPercent = book.progress < 100 ? (100.0f - static_cast<float>(book.progress)) : 0.0f;
-    obj["etaSeconds"] = store.estimateRemainingSeconds(book.docId, remainingPercent);
-    obj["secondsPerPercent"] = store.avgSecondsPerPercent(book.docId);
-    JsonArray days = obj["days"].to<JsonArray>();
-    for (const auto& d : book.days) {
-      JsonArray pair = days.add<JsonArray>();
-      pair.add(d.dayIndex);
-      pair.add(d.seconds);
-    }
-  }
-
+  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server->send(200, "application/json", "");
+  ChunkedResponse response(server.get());
+  ChunkedPrint out(response);
+  ReadingStatsFile::writeDashboard(file, summary, currentLocalDayIndex(), out);
+  response.finish();
   LOG_WEB_MEM("stats_api_exit");
-  sendJson(server.get(), 200, doc);
 }
 
 void CrossPointWebServer::handleStatsExport() const {
-  // Stream the raw stats file straight from SD — this is the same shape the
-  // device writes and reads, so it round-trips cleanly through external
-  // tooling without us having to maintain a second schema.
-  constexpr const char* kStatsFile = "/.crosspoint/reading-stats.json";
-  if (!Storage.exists(kStatsFile)) {
+  // The raw stats file, streamed from SD -- the same shape the device writes and reads, so it
+  // round-trips cleanly through external tooling without a second schema.
+  FsFile file;
+  if (!Storage.exists(ReadingStatsFile::kPath)) {
     server->send(404, "application/json", "{}");
     return;
   }
-  String content = Storage.readFile(kStatsFile);
+  if (!Storage.openFileForRead("WEB", ReadingStatsFile::kPath, file)) {
+    server->send(500, "application/json", "{}");
+    return;
+  }
+  server->setContentLength(file.size());
   server->sendHeader("Content-Disposition", "attachment; filename=\"reading-stats.json\"");
-  server->send(200, "application/json", content);
+  server->send(200, "application/json", "");
+  NetworkClient client = server->client();
+  if (!HttpFileStreamer::streamFileToClient(file, client)) {
+    LOG_DBG("WEB", "Stats export interrupted while streaming");
+  }
+  client.clear();
 }
 
 void CrossPointWebServer::handleJszip() const {
