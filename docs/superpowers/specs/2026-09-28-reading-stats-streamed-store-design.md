@@ -1,5 +1,9 @@
 # Reading stats without a resident history — design
 
+> **Superseded in part.** The file layer — sections 3, 4 and 6 and the "no format change"
+> non-goal — is replaced by `2026-09-28-reading-stats-slot-file-design.md`, after the device
+> measured 2.7 s for a worst-case session end. The rest stands and is built.
+>
 > **Status.** Agreed in conversation on 2026-09-28, section by section; this document is the
 > written form for review before an implementation plan. Builds on `feat/stats-remove-book`
 > (per-book removal plus the streamed web dashboard), which introduced `ReadingStatsFile` and
