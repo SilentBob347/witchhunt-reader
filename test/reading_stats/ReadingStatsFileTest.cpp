@@ -75,6 +75,62 @@ ReadingStatsFile::Summary scanOf(const std::string& file, const ReadingStatsFile
   return summary;
 }
 
+// B after one more session, as the device would write it.
+const std::string kBookBAfter =
+    R"({"docId":"b","title":"B","author":"","totalSeconds":450,"pagesTurned":8,"sessions":2,"firstReadEpoch":0,)"
+    R"("lastReadEpoch":0,"progress":50,"finishedCount":1,"lastFinishedEpoch":0,"finished":true,)"
+    R"("days":[[20463,300],[20464,150]]})";
+const std::string kBookD =
+    R"({"docId":"d","title":"D","author":"","totalSeconds":120,"pagesTurned":3,"sessions":1,"firstReadEpoch":0,)"
+    R"("lastReadEpoch":0,"progress":5,"finishedCount":0,"lastFinishedEpoch":0,"finished":false,)"
+    R"("days":[[20464,120]]})";
+
+BookReadingStats bookBAfter() {
+  BookReadingStats b;
+  b.docId = "b";
+  b.title = "B";
+  b.totalSeconds = 450;
+  b.pagesTurned = 8;
+  b.sessions = 2;
+  b.progress = 50;
+  b.finishedCount = 1;
+  b.days = {{20463, 300}, {20464, 150}};
+  return b;
+}
+
+BookReadingStats bookD() {
+  BookReadingStats d;
+  d.docId = "d";
+  d.title = "D";
+  d.totalSeconds = 120;
+  d.pagesTurned = 3;
+  d.sessions = 1;
+  d.progress = 5;
+  d.days = {{20464, 120}};
+  return d;
+}
+
+ReadingTotals totalsOf(uint32_t seconds, uint32_t sessions, uint32_t pages, std::vector<DayBucket> days) {
+  ReadingTotals t;
+  t.totalSeconds = seconds;
+  t.totalSessions = sessions;
+  t.totalPagesTurned = pages;
+  t.longestStreak = 2;
+  t.globalDays = std::move(days);
+  return t;
+}
+
+std::string rewriteOf(const std::string* file, const ReadingStatsFile::Rewrite& rewrite) {
+  StringPrint out;
+  if (file == nullptr) {
+    EXPECT_EQ(ReadingStatsFile::writeRewrite(nullptr, rewrite, out), ReadingStatsFile::ScanResult::Ok);
+  } else {
+    HalFile in = HalFile::fromString(*file);
+    EXPECT_EQ(ReadingStatsFile::writeRewrite(&in, rewrite, out), ReadingStatsFile::ScanResult::Ok);
+  }
+  return out.text;
+}
+
 // A book entry without its closing brace, for splicing the dashboard's added field in.
 std::string open(const std::string& book) { return book.substr(0, book.size() - 1); }
 
@@ -183,10 +239,10 @@ TEST(ReadingStatsFileRemove, CopesWithWhitespaceBetweenBooks) {
                            "\n  " +
                            kBookA + ",\n  " + kBookB + "\n]}";
 
+  // Entries are copied one by one and the separators re-emitted, so the hand-added whitespace goes.
   EXPECT_EQ(removeFrom(file, "a"), R"({"totalSeconds":300,"totalSessions":1,"totalPagesTurned":5,"longestStreak":2,)"
-                                   R"("globalDays":[[20463,300]],"books":[)"
-                                   "\n  " +
-                                       kBookB + "\n]}");
+                                   R"("globalDays":[[20463,300]],"books":[)" +
+                                       kBookB + "]}");
 }
 
 TEST(ReadingStatsFileDashboard, AddsTheTimeToFinishToEveryBook) {
@@ -334,4 +390,82 @@ TEST(ReadingStatsFileBookAt, CutOffEntryIsMalformed) {
   BookReadingStats book;
 
   EXPECT_EQ(ReadingStatsFile::readBookAt(in, kFile.find(kBookA), book), ScanResult::Malformed);
+}
+
+TEST(ReadingStatsFileWriteBook, EscapesTheTitleAndKeepsTheFieldOrder) {
+  BookReadingStats b;
+  b.docId = "e";
+  b.title = "A \"q\" \\ x\ny\x01";
+  b.author = "Ö";
+  b.totalSeconds = 5;
+  b.pagesTurned = 2;
+  b.sessions = 1;
+  b.firstReadEpoch = 1767225600;
+  b.lastReadEpoch = 1768046400;
+  b.progress = 7;
+  b.days = {{20463, 5}};
+  StringPrint out;
+
+  ReadingStatsFile::writeBook(out, b);
+
+  EXPECT_EQ(out.text,
+            R"({"docId":"e","title":"A \"q\" \\ x\ny\u0001","author":"Ö","totalSeconds":5,"pagesTurned":2,)"
+            R"("sessions":1,"firstReadEpoch":1767225600,"lastReadEpoch":1768046400,"progress":7,"finishedCount":0,)"
+            R"("lastFinishedEpoch":0,"finished":false,"days":[[20463,5]]})");
+}
+
+TEST(ReadingStatsFileRewrite, ReplacesAnEntryInPlace) {
+  const BookReadingStats after = bookBAfter();
+  ReadingStatsFile::Rewrite rewrite;
+  rewrite.totals = totalsOf(1500, 5, 26, {{20463, 950}, {20464, 550}});
+  rewrite.replaceAt = kFile.find(kBookB);
+  rewrite.replacement = &after;
+
+  EXPECT_EQ(rewriteOf(&kFile, rewrite),
+            R"({"totalSeconds":1500,"totalSessions":5,"totalPagesTurned":26,"longestStreak":2,)"
+            R"("globalDays":[[20463,950],[20464,550]],"books":[)" +
+                kBookA + "," + kBookBAfter + "," + kBookC + "]}");
+}
+
+TEST(ReadingStatsFileRewrite, DropsOneEntryAndAppendsAnother) {
+  const BookReadingStats d = bookD();
+  ReadingStatsFile::Rewrite rewrite;
+  rewrite.totals = totalsOf(1470, 5, 26, {{20463, 950}, {20464, 520}});
+  rewrite.dropAt = kFile.find(kBookC);
+  rewrite.append = &d;
+
+  EXPECT_EQ(rewriteOf(&kFile, rewrite),
+            R"({"totalSeconds":1470,"totalSessions":5,"totalPagesTurned":26,"longestStreak":2,)"
+            R"("globalDays":[[20463,950],[20464,520]],"books":[)" +
+                kBookA + "," + kBookB + "," + kBookD + "]}");
+}
+
+TEST(ReadingStatsFileRewrite, WithoutAnInputWritesJustTheNewBook) {
+  const BookReadingStats d = bookD();
+  ReadingStatsFile::Rewrite rewrite;
+  rewrite.totals = totalsOf(120, 1, 3, {{20464, 120}});
+  rewrite.append = &d;
+
+  EXPECT_EQ(rewriteOf(nullptr, rewrite),
+            R"({"totalSeconds":120,"totalSessions":1,"totalPagesTurned":3,"longestStreak":2,)"
+            R"("globalDays":[[20464,120]],"books":[)" +
+                kBookD + "]}");
+}
+
+TEST(ReadingStatsFileRewrite, OutputScansBack) {
+  const BookReadingStats after = bookBAfter();
+  ReadingStatsFile::Rewrite rewrite;
+  rewrite.totals = totalsOf(1500, 5, 26, {{20463, 950}, {20464, 550}});
+  rewrite.replaceAt = kFile.find(kBookB);
+  rewrite.replacement = &after;
+  const std::string written = rewriteOf(&kFile, rewrite);
+  ReadingStatsFile::ScanRequest request;
+  request.findDocId = "b";
+
+  const auto summary = scanOf(written, request);
+
+  EXPECT_EQ(summary.bookCount, 3u);
+  ASSERT_TRUE(summary.found);
+  EXPECT_EQ(summary.target.totalSeconds, 450u);
+  EXPECT_EQ(summary.totalSeconds, 1500u);
 }

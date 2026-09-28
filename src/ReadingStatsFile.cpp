@@ -33,6 +33,45 @@ void emitDays(Print& out, const std::vector<DayBucket>& days) {
   emit(out, "]");
 }
 
+void emitString(Print& out, const std::string& text) {
+  emit(out, "\"");
+  for (const char ch : text) {
+    const auto c = static_cast<unsigned char>(ch);
+    switch (c) {
+      case '"':
+        emit(out, "\\\"");
+        break;
+      case '\\':
+        emit(out, "\\\\");
+        break;
+      case '\b':
+        emit(out, "\\b");
+        break;
+      case '\f':
+        emit(out, "\\f");
+        break;
+      case '\n':
+        emit(out, "\\n");
+        break;
+      case '\r':
+        emit(out, "\\r");
+        break;
+      case '\t':
+        emit(out, "\\t");
+        break;
+      default:
+        if (c < 0x20) {
+          char escaped[8];
+          const int n = snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+          emit(out, escaped, static_cast<size_t>(n));
+        } else {
+          out.write(c);
+        }
+    }
+  }
+  emit(out, "\"");
+}
+
 uint32_t toCount(const char* text) {
   const long long v = strtoll(text, nullptr, 10);
   if (v < 0) return 0;
@@ -332,21 +371,8 @@ class SummaryScan final : public Scanner {
     for (size_t i = 0; i < request.recentDocIds.size(); ++i) summary_.recents[i].docId = request.recentDocIds[i];
   }
 
-  // After the pass: the target's cut range, taking one separating comma with it (the one before
-  // it when it has a predecessor, else the one after it), and the index in time order.
+  // After the pass: the index in time order.
   void settle() {
-    if (summary_.found) {
-      if (prevLast_ != kNone) {
-        summary_.cutFirst = prevLast_ + 1;
-        summary_.cutLast = targetLast_;
-      } else if (nextFirst_ != kNone) {
-        summary_.cutFirst = summary_.targetFirst;
-        summary_.cutLast = nextFirst_ - 1;
-      } else {
-        summary_.cutFirst = summary_.targetFirst;
-        summary_.cutLast = targetLast_;
-      }
-    }
     std::stable_sort(summary_.byTime.begin(), summary_.byTime.end(),
                      [](const IndexEntry& a, const IndexEntry& b) { return a.totalSeconds > b.totalSeconds; });
   }
@@ -375,54 +401,42 @@ class SummaryScan final : public Scanner {
     summary_.globalDays.push_back({day, seconds});
   }
 
-  void onBookStart(const size_t first) override {
-    if (summary_.found && nextFirst_ == kNone) nextFirst_ = first;
-  }
-
-  void onBookEnd(const Book& book, const size_t last) override {
+  void onBookEnd(const Book& book, size_t) override {
     // The loader skips an entry without a docId; so does everything counted here.
-    if (!book.docId.empty()) {
-      ++summary_.bookCount;
-      if (book.finished()) ++summary_.finishedBookCount;
-      if (ReadingStatsStore::countsTowardPace(book.progress)) {
-        summary_.paceSeconds += book.totalSeconds;
-        summary_.pacePercents += book.progress;
-      }
-      if (request_.wantIndex) summary_.byTime.push_back({book.totalSeconds, static_cast<uint32_t>(book.first)});
-      if (request_.wantVictim &&
-          (!summary_.hasVictim ||
-           ReadingStatsStore::evictsBefore(book.lastReadEpoch, book.totalSeconds, victimLastRead_, victimSeconds_))) {
-        summary_.hasVictim = true;
-        summary_.victimDocId = book.docId;
-        summary_.victimFirst = book.first;
-        victimLastRead_ = book.lastReadEpoch;
-        victimSeconds_ = book.totalSeconds;
-      }
-      for (RecentSnapshot& recent : summary_.recents) {
-        if (recent.known || recent.docId != book.docId) continue;
-        recent.known = true;
-        recent.totalSeconds = book.totalSeconds;
-        recent.knownDays = static_cast<uint16_t>(std::min(book.days.size(), ReadingStatsStore::kMaxBookDays));
-        recent.lastReadEpoch = book.lastReadEpoch;
-        recent.progress = book.progress;
-      }
-      if (!summary_.found && !request_.findDocId.empty() && book.docId == request_.findDocId) {
-        summary_.found = true;
-        summary_.target = book.toStats();
-        summary_.targetFirst = book.first;
-        targetLast_ = last;
-        prevLast_ = lastBookLast_;
-      }
+    if (book.docId.empty()) return;
+    ++summary_.bookCount;
+    if (book.finished()) ++summary_.finishedBookCount;
+    if (ReadingStatsStore::countsTowardPace(book.progress)) {
+      summary_.paceSeconds += book.totalSeconds;
+      summary_.pacePercents += book.progress;
     }
-    lastBookLast_ = last;
+    if (request_.wantIndex) summary_.byTime.push_back({book.totalSeconds, static_cast<uint32_t>(book.first)});
+    if (request_.wantVictim &&
+        (!summary_.hasVictim ||
+         ReadingStatsStore::evictsBefore(book.lastReadEpoch, book.totalSeconds, victimLastRead_, victimSeconds_))) {
+      summary_.hasVictim = true;
+      summary_.victimDocId = book.docId;
+      summary_.victimFirst = book.first;
+      victimLastRead_ = book.lastReadEpoch;
+      victimSeconds_ = book.totalSeconds;
+    }
+    for (RecentSnapshot& recent : summary_.recents) {
+      if (recent.known || recent.docId != book.docId) continue;
+      recent.known = true;
+      recent.totalSeconds = book.totalSeconds;
+      recent.knownDays = static_cast<uint16_t>(std::min(book.days.size(), ReadingStatsStore::kMaxBookDays));
+      recent.lastReadEpoch = book.lastReadEpoch;
+      recent.progress = book.progress;
+    }
+    if (!summary_.found && !request_.findDocId.empty() && book.docId == request_.findDocId) {
+      summary_.found = true;
+      summary_.target = book.toStats();
+      summary_.targetFirst = book.first;
+    }
   }
 
   Summary& summary_;
   const ScanRequest& request_;
-  size_t lastBookLast_ = kNone;
-  size_t prevLast_ = kNone;
-  size_t targetLast_ = kNone;
-  size_t nextFirst_ = kNone;
   time_t victimLastRead_ = 0;
   uint32_t victimSeconds_ = 0;
 };
@@ -469,20 +483,53 @@ class DashboardCopy final : public Scanner {
   size_t pendingLen_ = 0;
 };
 
-// Copies the books array's contents through, less one byte range.
-class CopyWithout final : public Scanner {
+// Copies the entries through one by one, re-emitting the separators, with the rewrite's edits.
+class RewriteCopy final : public Scanner {
  public:
-  CopyWithout(Print& out, const size_t cutFirst, const size_t cutLast)
-      : out_(out), cutFirst_(cutFirst), cutLast_(cutLast) {}
+  RewriteCopy(Print& out, const Rewrite& rewrite) : out_(out), rewrite_(rewrite) {}
+
+  void appendAfterLast(const BookReadingStats& book) {
+    separate();
+    writeBook(out_, book);
+  }
 
  private:
-  void onByte(const char c, const size_t offset, const bool inBooks) override {
-    if (inBooks && (offset < cutFirst_ || offset > cutLast_)) out_.write(static_cast<uint8_t>(c));
+  enum class Mode : uint8_t { Between, Copy, Skip };
+
+  void onBookStart(const size_t first) override {
+    if (first == rewrite_.dropAt) {
+      mode_ = Mode::Skip;
+      return;
+    }
+    separate();
+    if (first == rewrite_.replaceAt && rewrite_.replacement != nullptr) {
+      writeBook(out_, *rewrite_.replacement);
+      mode_ = Mode::Skip;
+      return;
+    }
+    mode_ = Mode::Copy;
+  }
+
+  void onBookEnd(const Book&, size_t) override { ending_ = true; }
+
+  void onByte(const char c, size_t, bool) override {
+    if (mode_ == Mode::Copy) out_.write(static_cast<uint8_t>(c));
+    if (ending_) {
+      mode_ = Mode::Between;
+      ending_ = false;
+    }
+  }
+
+  void separate() {
+    if (wroteAny_) emit(out_, ",");
+    wroteAny_ = true;
   }
 
   Print& out_;
-  const size_t cutFirst_;
-  const size_t cutLast_;
+  const Rewrite& rewrite_;
+  Mode mode_ = Mode::Between;
+  bool ending_ = false;
+  bool wroteAny_ = false;
 };
 
 }  // namespace
@@ -537,26 +584,53 @@ void writeDashboard(HalFile& in, const Summary& summary, const uint16_t today, P
 }
 
 void writeWithoutTarget(HalFile& in, const Summary& summary, Print& out) {
-  uint32_t totalSeconds = summary.totalSeconds;
-  uint32_t totalSessions = summary.totalSessions;
-  uint32_t totalPagesTurned = summary.totalPagesTurned;
-  std::vector<DayBucket> globalDays = summary.globalDays;
-  ReadingStatsStore::takeOut(summary.target, totalSeconds, totalSessions, totalPagesTurned, globalDays);
+  Rewrite rewrite;
+  rewrite.totals = summary;  // the ReadingTotals part
+  ReadingStatsStore::takeOut(summary.target, rewrite.totals.totalSeconds, rewrite.totals.totalSessions,
+                             rewrite.totals.totalPagesTurned, rewrite.totals.globalDays);
+  rewrite.dropAt = summary.targetFirst;
+  if (writeRewrite(&in, rewrite, out) != ScanResult::Ok) {
+    LOG_ERR("RSF", "Stats file changed or failed between passes; copy truncated");
+  }
+}
 
+void writeBook(Print& out, const BookReadingStats& book) {
+  emit(out, "{\"docId\":");
+  emitString(out, book.docId);
+  emit(out, ",\"title\":");
+  emitString(out, book.title);
+  emit(out, ",\"author\":");
+  emitString(out, book.author);
+  char numbers[192];
+  const int n = snprintf(numbers, sizeof(numbers),
+                         ",\"totalSeconds\":%lu,\"pagesTurned\":%lu,\"sessions\":%lu,\"firstReadEpoch\":%lld,"
+                         "\"lastReadEpoch\":%lld,\"progress\":%u,\"finishedCount\":%u,\"lastFinishedEpoch\":%lld,"
+                         "\"finished\":%s,\"days\":",
+                         static_cast<unsigned long>(book.totalSeconds), static_cast<unsigned long>(book.pagesTurned),
+                         static_cast<unsigned long>(book.sessions), static_cast<long long>(book.firstReadEpoch),
+                         static_cast<long long>(book.lastReadEpoch), book.progress, book.finishedCount,
+                         static_cast<long long>(book.lastFinishedEpoch), book.finishedCount > 0 ? "true" : "false");
+  emit(out, numbers, static_cast<size_t>(n));
+  emitDays(out, book.days);
+  emit(out, "}");
+}
+
+ScanResult writeRewrite(HalFile* in, const Rewrite& rewrite, Print& out) {
   char head[160];
   const int n = snprintf(head, sizeof(head),
                          "{\"totalSeconds\":%lu,\"totalSessions\":%lu,\"totalPagesTurned\":%lu,\"longestStreak\":%u,"
                          "\"globalDays\":",
-                         static_cast<unsigned long>(totalSeconds), static_cast<unsigned long>(totalSessions),
-                         static_cast<unsigned long>(totalPagesTurned), summary.longestStreak);
+                         static_cast<unsigned long>(rewrite.totals.totalSeconds),
+                         static_cast<unsigned long>(rewrite.totals.totalSessions),
+                         static_cast<unsigned long>(rewrite.totals.totalPagesTurned), rewrite.totals.longestStreak);
   emit(out, head, static_cast<size_t>(n));
-  emitDays(out, globalDays);
+  emitDays(out, rewrite.totals.globalDays);
   emit(out, ",\"books\":[");
-  CopyWithout copy(out, summary.cutFirst, summary.cutLast);
-  if (copy.run(in) != ScanResult::Ok) {
-    LOG_ERR("RSF", "Stats file changed or failed between passes; copy truncated");
-  }
+  RewriteCopy copy(out, rewrite);
+  const ScanResult result = in == nullptr ? ScanResult::Ok : copy.run(*in);
+  if (rewrite.append != nullptr) copy.appendAfterLast(*rewrite.append);
   emit(out, "]}");
+  return result;
 }
 
 }  // namespace ReadingStatsFile

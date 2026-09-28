@@ -61,9 +61,6 @@ struct Summary : ReadingTotals {
   bool found = false;
   BookReadingStats target;
   size_t targetFirst = 0;  // offset of its opening brace
-  // Inclusive byte range that removes it from the books array, one separating comma included.
-  size_t cutFirst = 0;
-  size_t cutLast = 0;
 
   std::vector<IndexEntry> byTime;  // descending by time; equal times in file order
 
@@ -82,6 +79,27 @@ bool summarize(HalFile& in, Summary& summary, const std::string& findDocId = "")
 
 // Decodes the single entry whose opening brace is at `offset` (an IndexEntry::offset).
 ScanResult readBookAt(HalFile& in, size_t offset, BookReadingStats& book);
+
+// One book as a JSON object, in the field order the device has always written. Strings are
+// escaped the way ArduinoJson does: quote, backslash and control characters; UTF-8 passes through.
+void writeBook(Print& out, const BookReadingStats& book);
+
+constexpr size_t kNoEntry = static_cast<size_t>(-1);
+
+// A rewrite of the file: new global figures and at most one entry replaced, one dropped and one
+// appended. Entries are identified by the offset of their opening brace, as a scan reported them.
+struct Rewrite {
+  ReadingTotals totals;
+  size_t replaceAt = kNoEntry;
+  const BookReadingStats* replacement = nullptr;
+  size_t dropAt = kNoEntry;
+  const BookReadingStats* append = nullptr;
+};
+
+// Writes the whole new file to `out`: every untouched entry copied byte for byte, separators
+// re-emitted. `in` may be null (no existing entries). Anything but Ok means the copy stopped early;
+// the caller must not use the output.
+ScanResult writeRewrite(HalFile* in, const Rewrite& rewrite, Print& out);
 
 // The /api/stats payload: the global figures, streaks when `today` is known, and every book as
 // stored plus its time-to-finish estimate (etaSeconds). `summary` must come from the same file.
