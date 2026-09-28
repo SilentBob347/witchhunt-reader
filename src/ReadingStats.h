@@ -116,6 +116,29 @@ class ReadingStatsStore {
   // 0 when no rate is available or when remainingPercent <= 0.
   uint32_t estimateRemainingSeconds(const std::string& docId, float remainingPercent) const;
 
+  // ---- The arithmetic behind the methods, on plain data -----------------------
+  //
+  // Shared with ReadingStatsFile, which streams the file for the web server instead of loading it,
+  // so the dashboard and the device agree on every figure.
+  static uint32_t secondsOn(const std::vector<DayBucket>& days, uint16_t dayIndex);
+  static uint16_t currentStreakIn(const std::vector<DayBucket>& days, uint16_t today);
+  // The longest run in `days`, or the persisted `record` when that is longer.
+  static uint16_t longestStreakIn(const std::vector<DayBucket>& days, uint16_t record);
+  static bool countsTowardPace(const uint8_t progress) { return progress >= MIN_BOOK_PROGRESS_FOR_PERSONAL_RATE; }
+  // The global pace from the sums over the books that count toward it; 0 below
+  // MIN_GLOBAL_SECONDS_FOR_RATE of reading overall.
+  static float pooledSecondsPerPercent(uint32_t globalTotalSeconds, uint32_t countedSeconds, uint32_t countedPercents);
+  // A book's own pace, or 0 when it has not covered enough ground to have one.
+  static float ownSecondsPerPercent(uint32_t totalSeconds, uint8_t progress);
+  static uint32_t etaSeconds(float secondsPerPercent, float remainingPercent);
+  // Past the caps, the oldest buckets go; the global trim first folds the streak they held into
+  // `record`, since the record may live in them.
+  static void trimGlobalDays(std::vector<DayBucket>& days, uint16_t& record);
+  static void trimBookDays(std::vector<DayBucket>& days);
+  // Takes one book's contribution back out of the global aggregates (removeBook()'s arithmetic).
+  static void takeOut(const BookReadingStats& book, uint32_t& totalSeconds, uint32_t& totalSessions,
+                      uint32_t& totalPagesTurned, std::vector<DayBucket>& globalDays);
+
   const std::vector<BookReadingStats>& getBooks() const { return books; }
   // Bounds (memory audit 2026-09, R8). The store used to grow without limit -- an entry per
   // book ever opened, a day bucket per reading day per book and globally, for ever -- and its
