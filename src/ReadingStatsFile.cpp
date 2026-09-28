@@ -16,7 +16,10 @@ namespace ReadingStatsFile {
 namespace {
 
 constexpr size_t kNone = std::numeric_limits<size_t>::max();
-constexpr size_t kReadBlock = 1024;
+// Reads in large blocks: every file call costs ~1.5 ms on SD whatever its size (BufferedFileIO.h),
+// and a full history is ~110 KB. 1 KB when 4 KB is not to be had.
+constexpr size_t kReadBlock = 4096;
+constexpr size_t kReadBlockMin = 1024;
 
 void emit(Print& out, const char* text, const size_t len) { out.write(reinterpret_cast<const uint8_t*>(text), len); }
 
@@ -158,9 +161,12 @@ class Scanner {
 
   ScanResult run(HalFile& in, const size_t start = 0) {
     auto parser = makeUniqueNoThrow<StreamingJsonParser>(callbacks());
-    // Large reads: every file call costs ~1.5 ms on SD whatever its size (BufferedFileIO.h), and a
-    // full history is ~100 KB.
-    auto block = makeUniqueNoThrow<char[]>(kReadBlock);
+    size_t blockSize = kReadBlock;
+    auto block = makeUniqueNoThrow<char[]>(blockSize);
+    if (!block) {
+      blockSize = kReadBlockMin;
+      block = makeUniqueNoThrow<char[]>(blockSize);
+    }
     if (!parser || !block) {
       LOG_ERR("RSF", "OOM: stats file parser");
       return ScanResult::NoMemory;
@@ -169,7 +175,7 @@ class Scanner {
     char* const bytes = block.get();
     size_t offset = start;
     while (!done_) {
-      const int n = in.read(bytes, kReadBlock);
+      const int n = in.read(bytes, blockSize);
       if (n < 0) return ScanResult::IoError;
       if (n == 0) break;
       for (int i = 0; i < n && !done_; ++i, ++offset) {
