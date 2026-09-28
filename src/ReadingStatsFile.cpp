@@ -22,13 +22,30 @@ void emit(Print& out, const char* text, const size_t len) { out.write(reinterpre
 
 void emit(Print& out, const char* text) { emit(out, text, strlen(text)); }
 
+// Emits what snprintf() wrote into `buf`, and nothing when it did not fit: snprintf() returns the
+// length it wanted, and emitting that from a smaller buffer reads past it.
+void emitBounded(Print& out, const char* buf, const int n, const size_t cap) {
+  if (n > 0 && static_cast<size_t>(n) < cap) {
+    emit(out, buf, static_cast<size_t>(n));
+  } else {
+    LOG_ERR("RSF", "formatted field did not fit (%d of %u bytes); left out", n, static_cast<unsigned>(cap));
+  }
+}
+
+// One `,"key":value` field. 48 bytes hold the longest key and any 64-bit value.
+void emitNumber(Print& out, const char* key, const long long value) {
+  char field[48];
+  const int n = snprintf(field, sizeof(field), ",\"%s\":%lld", key, value);
+  emitBounded(out, field, n, sizeof(field));
+}
+
 void emitDays(Print& out, const std::vector<DayBucket>& days) {
   emit(out, "[");
   char pair[32];
   for (size_t i = 0; i < days.size(); ++i) {
     const int n = snprintf(pair, sizeof(pair), "%s[%u,%lu]", i == 0 ? "" : ",", days[i].dayIndex,
                            static_cast<unsigned long>(days[i].seconds));
-    emit(out, pair, static_cast<size_t>(n));
+    emitBounded(out, pair, n, sizeof(pair));
   }
   emit(out, "]");
 }
@@ -63,7 +80,7 @@ void emitString(Print& out, const std::string& text) {
         if (c < 0x20) {
           char escaped[8];
           const int n = snprintf(escaped, sizeof(escaped), "\\u%04x", c);
-          emit(out, escaped, static_cast<size_t>(n));
+          emitBounded(out, escaped, n, sizeof(escaped));
         } else {
           out.write(c);
         }
@@ -464,7 +481,7 @@ class DashboardCopy final : public Scanner {
     const uint32_t eta = ReadingStatsStore::etaSeconds(own > 0.0f ? own : pooledRate_, remaining);
     const int n = snprintf(pending_, sizeof(pending_), "%s\"etaSeconds\":%lu", book.hasFields ? "," : "",
                            static_cast<unsigned long>(eta));
-    pendingLen_ = n > 0 ? static_cast<size_t>(n) : 0;
+    pendingLen_ = n > 0 && static_cast<size_t>(n) < sizeof(pending_) ? static_cast<size_t>(n) : 0;
   }
 
   void onByte(const char c, size_t, const bool inBooks) override {
@@ -565,12 +582,12 @@ void writeDashboard(HalFile& in, const Summary& summary, const uint16_t today, P
                    static_cast<unsigned long>(summary.totalSeconds), static_cast<unsigned long>(summary.totalSessions),
                    static_cast<unsigned long>(summary.totalPagesTurned), static_cast<unsigned long>(summary.bookCount),
                    static_cast<unsigned long>(summary.finishedBookCount), today);
-  emit(out, head, static_cast<size_t>(n));
+  emitBounded(out, head, n, sizeof(head));
   if (today != 0 && !summary.globalDays.empty()) {
     n = snprintf(head, sizeof(head), ",\"currentStreak\":%u,\"longestStreak\":%u",
                  ReadingStatsStore::currentStreakIn(summary.globalDays, today),
                  ReadingStatsStore::longestStreakIn(summary.globalDays, summary.longestStreak));
-    emit(out, head, static_cast<size_t>(n));
+    emitBounded(out, head, n, sizeof(head));
   }
   emit(out, ",\"globalDays\":");
   emitDays(out, summary.globalDays);
@@ -600,16 +617,17 @@ void writeBook(Print& out, const BookReadingStats& book) {
   emitString(out, book.title);
   emit(out, ",\"author\":");
   emitString(out, book.author);
-  char numbers[192];
-  const int n = snprintf(numbers, sizeof(numbers),
-                         ",\"totalSeconds\":%lu,\"pagesTurned\":%lu,\"sessions\":%lu,\"firstReadEpoch\":%lld,"
-                         "\"lastReadEpoch\":%lld,\"progress\":%u,\"finishedCount\":%u,\"lastFinishedEpoch\":%lld,"
-                         "\"finished\":%s,\"days\":",
-                         static_cast<unsigned long>(book.totalSeconds), static_cast<unsigned long>(book.pagesTurned),
-                         static_cast<unsigned long>(book.sessions), static_cast<long long>(book.firstReadEpoch),
-                         static_cast<long long>(book.lastReadEpoch), book.progress, book.finishedCount,
-                         static_cast<long long>(book.lastFinishedEpoch), book.finishedCount > 0 ? "true" : "false");
-  emit(out, numbers, static_cast<size_t>(n));
+  // One field at a time: a finished book on a synced clock with real reading overflowed the single
+  // 192-byte line this used to be, and every write of it then failed its read-back.
+  emitNumber(out, "totalSeconds", book.totalSeconds);
+  emitNumber(out, "pagesTurned", book.pagesTurned);
+  emitNumber(out, "sessions", book.sessions);
+  emitNumber(out, "firstReadEpoch", static_cast<long long>(book.firstReadEpoch));
+  emitNumber(out, "lastReadEpoch", static_cast<long long>(book.lastReadEpoch));
+  emitNumber(out, "progress", book.progress);
+  emitNumber(out, "finishedCount", book.finishedCount);
+  emitNumber(out, "lastFinishedEpoch", static_cast<long long>(book.lastFinishedEpoch));
+  emit(out, book.finishedCount > 0 ? ",\"finished\":true,\"days\":" : ",\"finished\":false,\"days\":");
   emitDays(out, book.days);
   emit(out, "}");
 }
@@ -622,7 +640,7 @@ ScanResult writeRewrite(HalFile* in, const Rewrite& rewrite, Print& out) {
                          static_cast<unsigned long>(rewrite.totals.totalSeconds),
                          static_cast<unsigned long>(rewrite.totals.totalSessions),
                          static_cast<unsigned long>(rewrite.totals.totalPagesTurned), rewrite.totals.longestStreak);
-  emit(out, head, static_cast<size_t>(n));
+  emitBounded(out, head, n, sizeof(head));
   emitDays(out, rewrite.totals.globalDays);
   emit(out, ",\"books\":[");
   RewriteCopy copy(out, rewrite);

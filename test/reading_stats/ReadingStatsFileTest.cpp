@@ -469,3 +469,27 @@ TEST(ReadingStatsFileRewrite, OutputScansBack) {
   EXPECT_EQ(summary.target.totalSeconds, 450u);
   EXPECT_EQ(summary.totalSeconds, 1500u);
 }
+
+TEST(ReadingStatsFileWriteBook, TakesTheLargestValuesEveryFieldCanHold) {
+  // A finished book on a synced clock with the widest counters: every field at its longest.
+  BookReadingStats b;
+  b.docId = "m";
+  b.title = "M";
+  b.totalSeconds = 4294967295u;
+  b.pagesTurned = 4294967295u;
+  b.sessions = 4294967295u;
+  b.firstReadEpoch = 1767225600;
+  b.lastReadEpoch = 1768046400;
+  b.progress = 100;
+  b.finishedCount = 65535;
+  b.lastFinishedEpoch = 1768046400;
+  b.days = {{20463, 4294967295u}};
+  StringPrint out;
+
+  ReadingStatsFile::writeBook(out, b);
+
+  EXPECT_EQ(out.text,
+            R"({"docId":"m","title":"M","author":"","totalSeconds":4294967295,"pagesTurned":4294967295,)"
+            R"("sessions":4294967295,"firstReadEpoch":1767225600,"lastReadEpoch":1768046400,"progress":100,)"
+            R"("finishedCount":65535,"lastFinishedEpoch":1768046400,"finished":true,"days":[[20463,4294967295]]})");
+}

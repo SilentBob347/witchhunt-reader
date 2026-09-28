@@ -323,3 +323,36 @@ TEST_F(StoreTest, WritesKeepTheCacheCurrent) {
   // Only "a" left, at 30 %: its own pace, 1200 s / 30 % = 40 s per percent.
   EXPECT_FLOAT_EQ(store.recentPooledPace(), 40.0f);
 }
+
+TEST_F(StoreTest, MarkFinishedOnABookWithRealReading) {
+  writeFile(R"({"totalSeconds":5400,"totalSessions":4,"totalPagesTurned":90,"longestStreak":1,)"
+            R"("globalDays":[[20463,5400]],"books":[{"docId":"r","title":"Real","author":"A","totalSeconds":5400,)"
+            R"("pagesTurned":90,"sessions":4,"firstReadEpoch":1767225600,"lastReadEpoch":1768046400,"progress":97,)"
+            R"("finishedCount":0,"lastFinishedEpoch":0,"finished":false,"days":[[20463,5400]]}]})");
+  ReadingStatsStore store(path_);
+
+  ASSERT_EQ(store.markFinished("r", "Real", "A", kNoon + kDay), ReadingStatsStore::WriteResult::Done);
+
+  ReadingStatsStore::BookQuery query;
+  ASSERT_EQ(store.queryBook("r", query), ScanResult::Ok);
+  ASSERT_TRUE(query.found);
+  EXPECT_EQ(query.book.finishedCount, 1);
+  EXPECT_EQ(query.book.lastFinishedEpoch, kNoon + kDay);
+}
+
+TEST_F(StoreTest, SessionOnAFinishedBookIsRecorded) {
+  writeFile(R"({"totalSeconds":5400,"totalSessions":4,"totalPagesTurned":90,"longestStreak":1,)"
+            R"("globalDays":[[20463,5400]],"books":[{"docId":"r","title":"Real","author":"A","totalSeconds":5400,)"
+            R"("pagesTurned":90,"sessions":4,"firstReadEpoch":1767225600,"lastReadEpoch":1768046400,"progress":100,)"
+            R"("finishedCount":1,"lastFinishedEpoch":1768046400,"finished":true,"days":[[20463,5400]]}]})");
+  ReadingStatsStore store(path_);
+
+  // A re-read to the end: progress 100 makes the entry's longest line.
+  ASSERT_EQ(store.recordSession("r", "Real", "A", 600, 10, 100, kNoon + kDay), ReadingStatsStore::WriteResult::Done);
+
+  ReadingStatsStore::BookQuery query;
+  ASSERT_EQ(store.queryBook("r", query), ScanResult::Ok);
+  ASSERT_TRUE(query.found);
+  EXPECT_EQ(query.book.totalSeconds, 6000u);
+  EXPECT_EQ(query.book.finishedCount, 1);
+}
