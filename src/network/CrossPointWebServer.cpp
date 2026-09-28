@@ -680,15 +680,16 @@ void CrossPointWebServer::handleStatsRemove() const {
   }
   const std::string docId = req["docId"].as<const char*>();
 
-  switch (READING_STATS.removeBookFromFile(docId)) {
-    case ReadingStatsStore::FileRemoval::Removed:
+  switch (READING_STATS.removeBook(docId)) {
+    case ReadingStatsStore::WriteResult::Done:
       LOG_DBG("WEB", "Removed from reading stats: %s", docId.c_str());
       server->send(200, "application/json", "{\"ok\":true}");
       return;
-    case ReadingStatsStore::FileRemoval::NotFound:
+    case ReadingStatsStore::WriteResult::NotFound:
       server->send(404, "application/json", "{\"error\":\"Book not found\"}");
       return;
-    case ReadingStatsStore::FileRemoval::Failed:
+    case ReadingStatsStore::WriteResult::NoMemory:
+    case ReadingStatsStore::WriteResult::Failed:
       server->send(500, "application/json", "{\"error\":\"Could not update the reading stats\"}");
       return;
   }

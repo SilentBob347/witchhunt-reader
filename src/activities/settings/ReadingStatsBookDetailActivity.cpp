@@ -93,7 +93,7 @@ void ReadingStatsBookDetailActivity::confirmRemove() {
           requestUpdate();
           return;
         }
-        if (READING_STATS.removeBookFromFile(docId) != ReadingStatsStore::FileRemoval::Removed) {
+        if (READING_STATS.removeBook(docId) != ReadingStatsStore::WriteResult::Done) {
           LOG_ERR("RST", "remove failed doc=%s", docId.c_str());
           requestUpdate();
           return;

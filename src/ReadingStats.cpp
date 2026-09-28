@@ -1,9 +1,9 @@
 #include "ReadingStats.h"
 
+#include <Arduino.h>  // millis()
 #include <BufferedPrint.h>
 #include <HalClock.h>
 #include <HalStorage.h>
-#include <JsonSettingsIO.h>
 #include <Logging.h>
 
 #include <algorithm>
@@ -35,15 +35,6 @@ std::string asidePathFor(const std::string& path) {
 std::string parentDirOf(const std::string& path) {
   const size_t slash = path.find_last_of('/');
   return slash == std::string::npos || slash == 0 ? std::string("/") : path.substr(0, slash);
-}
-
-// The streamed removal's safety check: the new file has to parse, must not hold the book, and must
-// still hold every other one.
-bool readsBackWithout(const std::string& path, const std::string& docId, const uint32_t expectedBooks) {
-  FsFile in;
-  if (!Storage.openFileForRead("RST", path.c_str(), in)) return false;
-  ReadingStatsFile::Summary check;
-  return ReadingStatsFile::summarize(in, check, docId) && !check.found && check.bookCount == expectedBooks;
 }
 
 // Add `seconds` to the bucket for `dayIndex` in `days`, inserting in sorted
@@ -126,64 +117,7 @@ uint16_t currentLocalDayIndex() {
 
 ReadingStatsStore ReadingStatsStore::instance;
 
-void ReadingStatsStore::recordSession(const std::string& docId, const std::string& title, const std::string& author,
-                                      uint32_t sessionSeconds, uint32_t sessionPagesTurned, uint8_t progress,
-                                      time_t walltimeEpoch) {
-  if (docId.empty()) {
-    return;
-  }
-
-  auto it = std::find_if(books.begin(), books.end(), [&docId](const BookReadingStats& b) { return b.docId == docId; });
-  if (it == books.end()) {
-    // A book opened and closed without reading is not history: no entry for a zero-second
-    // session (it used to get one, for ever). An existing entry still takes the progress below.
-    if (sessionSeconds == 0) return;
-    if (books.size() >= kMaxBooks) {
-      // Evict the least recently read book. An entry that was never read with the clock set
-      // (lastReadEpoch 0) sorts as the oldest.
-      auto victim =
-          std::min_element(books.begin(), books.end(), [](const BookReadingStats& a, const BookReadingStats& b) {
-            return evictsBefore(a.lastReadEpoch, a.totalSeconds, b.lastReadEpoch, b.totalSeconds);
-          });
-      LOG_INF("RST", "Book cap (%u) reached; dropping the least recently read: %s", static_cast<unsigned>(kMaxBooks),
-              victim->title.c_str());
-      books.erase(victim);
-    }
-    BookReadingStats fresh;
-    fresh.docId = docId;
-    books.push_back(std::move(fresh));
-    it = books.end() - 1;
-  }
-  applySession(*it, totals_, title, author, sessionSeconds, sessionPagesTurned, progress, walltimeEpoch);
-}
-
-void ReadingStatsStore::applySession(BookReadingStats& book, ReadingTotals& totals, const std::string& title,
-                                     const std::string& author, const uint32_t sessionSeconds,
-                                     const uint32_t sessionPagesTurned, const uint8_t progress,
-                                     const time_t walltimeEpoch) {
-  if (!title.empty()) book.title = title;
-  if (!author.empty()) book.author = author;
-  book.totalSeconds += sessionSeconds;
-  book.pagesTurned += sessionPagesTurned;
-  book.progress = progress;
-  if (sessionSeconds > 0) {
-    book.sessions += 1;
-    totals.totalSessions += 1;
-  }
-  if (walltimeEpoch != 0) {
-    if (book.firstReadEpoch == 0) book.firstReadEpoch = walltimeEpoch;
-    book.lastReadEpoch = walltimeEpoch;
-    const uint16_t day = localDayIndexFromEpoch(walltimeEpoch);
-    mergeDay(book.days, day, sessionSeconds, kMaxBookDays);
-    mergeDay(totals.globalDays, day, sessionSeconds, kMaxGlobalDays);
-    // Fold this day's run into the persisted longest streak while the whole run is still in the
-    // window (a run longer than the window is already the record).
-    const uint16_t run = runEndingAt(totals.globalDays, day);
-    if (run > totals.longestStreak) totals.longestStreak = run;
-  }
-  totals.totalSeconds += sessionSeconds;
-  totals.totalPagesTurned += sessionPagesTurned;
-}
+// ---- The arithmetic ---------------------------------------------------------------------------
 
 uint32_t ReadingStatsStore::secondsOn(const std::vector<DayBucket>& days, const uint16_t dayIndex) {
   if (dayIndex == 0) return 0;
@@ -226,68 +160,6 @@ uint16_t ReadingStatsStore::longestStreakIn(const std::vector<DayBucket>& days, 
   return longest;
 }
 
-uint32_t ReadingStatsStore::getSecondsForDay(const uint16_t dayIndex) const {
-  return secondsOn(totals_.globalDays, dayIndex);
-}
-
-uint16_t ReadingStatsStore::computeCurrentStreak(const uint16_t today) const {
-  return currentStreakIn(totals_.globalDays, today);
-}
-
-uint16_t ReadingStatsStore::computeLongestStreak() const {
-  return longestStreakIn(totals_.globalDays, totals_.longestStreak);
-}
-
-void ReadingStatsStore::markFinished(const std::string& docId, const std::string& title, const std::string& author,
-                                     time_t walltimeEpoch) {
-  if (docId.empty()) return;
-  auto it = std::find_if(books.begin(), books.end(), [&docId](const BookReadingStats& b) { return b.docId == docId; });
-  if (it == books.end()) {
-    BookReadingStats fresh;
-    fresh.docId = docId;
-    books.push_back(std::move(fresh));
-    it = books.end() - 1;
-  }
-  applyFinish(*it, title, author, walltimeEpoch);
-}
-
-void ReadingStatsStore::applyFinish(BookReadingStats& book, const std::string& title, const std::string& author,
-                                    const time_t walltimeEpoch) {
-  if (!title.empty()) book.title = title;
-  if (!author.empty()) book.author = author;
-  book.finishedCount += 1;
-  book.progress = 100;
-  if (walltimeEpoch != 0) {
-    book.lastFinishedEpoch = walltimeEpoch;
-    if (book.lastReadEpoch < walltimeEpoch) book.lastReadEpoch = walltimeEpoch;
-  }
-}
-
-void ReadingStatsStore::takeOut(const BookReadingStats& book, ReadingTotals& totals) {
-  totals.totalSeconds -= std::min(totals.totalSeconds, book.totalSeconds);
-  totals.totalSessions -= std::min(totals.totalSessions, book.sessions);
-  totals.totalPagesTurned -= std::min(totals.totalPagesTurned, book.pagesTurned);
-  for (const DayBucket& day : book.days) unmergeDay(totals.globalDays, day.dayIndex, day.seconds);
-}
-
-bool ReadingStatsStore::removeBook(const std::string& docId) {
-  auto it = std::find_if(books.begin(), books.end(), [&docId](const BookReadingStats& b) { return b.docId == docId; });
-  if (it == books.end()) return false;
-  takeOut(*it, totals_);
-  books.erase(it);
-  return true;
-}
-
-size_t ReadingStatsStore::getFinishedBookCount() const {
-  return static_cast<size_t>(
-      std::count_if(books.begin(), books.end(), [](const BookReadingStats& b) { return b.finishedCount > 0; }));
-}
-
-const BookReadingStats* ReadingStatsStore::findBook(const std::string& docId) const {
-  auto it = std::find_if(books.begin(), books.end(), [&docId](const BookReadingStats& b) { return b.docId == docId; });
-  return it == books.end() ? nullptr : &*it;
-}
-
 bool ReadingStatsStore::evictsBefore(const time_t aLastRead, const uint32_t aSeconds, const time_t bLastRead,
                                      const uint32_t bSeconds) {
   if (aLastRead != bLastRead) return aLastRead < bLastRead;
@@ -313,161 +185,6 @@ uint32_t ReadingStatsStore::etaSeconds(const float secondsPerPercent, float rema
   return static_cast<uint32_t>(remainingPercent * secondsPerPercent + 0.5f);
 }
 
-float ReadingStatsStore::globalAvgSecondsPerPercent() const {
-  // Average over books that have actual progress recorded. A book at 0%
-  // contributes time but no progress denominator and would skew the rate
-  // toward infinity. Books with progress >= MIN_BOOK_PROGRESS_FOR_PERSONAL_RATE
-  // are considered "real readings" for the purpose of the global average.
-  uint32_t totalProgressPercents = 0;
-  uint32_t totalSecondsFromCountedBooks = 0;
-  for (const auto& b : books) {
-    if (!countsTowardPace(b.progress)) continue;
-    totalProgressPercents += b.progress;
-    totalSecondsFromCountedBooks += b.totalSeconds;
-  }
-  return pooledSecondsPerPercent(totals_.totalSeconds, totalSecondsFromCountedBooks, totalProgressPercents);
-}
-
-float ReadingStatsStore::avgSecondsPerPercent(const std::string& docId) const {
-  const BookReadingStats* b = findBook(docId);
-  const float own = b ? ownSecondsPerPercent(b->totalSeconds, b->progress) : 0.0f;
-  return own > 0.0f ? own : globalAvgSecondsPerPercent();
-}
-
-uint32_t ReadingStatsStore::estimateRemainingSeconds(const std::string& docId, const float remainingPercent) const {
-  if (remainingPercent <= 0.0f) return 0;
-  return etaSeconds(avgSecondsPerPercent(docId), remainingPercent);
-}
-
-bool ReadingStatsStore::saveToFile() const {
-  if (!loaded_) {
-    LOG_ERR("RST", "saveToFile refused: store not loaded (would erase history)");
-    return false;
-  }
-  Storage.mkdir(parentDirOf(path_).c_str());
-  // Straight into a temporary file (no in-RAM copy of the JSON), then rename over the store's
-  // file: a power loss mid-write leaves the previous history intact.
-  const std::string tmpPath = path_ + ".tmp";
-  {
-    FsFile out;
-    if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return false;
-    const bool ok = JsonSettingsIO::saveReadingStats(*this, out);
-    out.close();
-    if (!ok) {
-      Storage.remove(tmpPath.c_str());
-      return false;
-    }
-  }
-  if (!swapIn(path_, tmpPath)) return false;
-  // Until the writes keep the cache current themselves, a write empties it.
-  const_cast<ReadingStatsStore*>(this)->invalidateRecent();
-  return true;
-}
-
-ReadingStatsStore::FileRemoval ReadingStatsStore::removeBookFromFile(const std::string& docId) {
-  if (loaded_) {
-    if (!removeBook(docId)) return FileRemoval::NotFound;
-    return saveToFile() ? FileRemoval::Removed : FileRemoval::Failed;
-  }
-  if (!Storage.exists(path_.c_str())) return FileRemoval::NotFound;
-  const std::string tmpPath = path_ + ".tmp";
-  uint32_t booksLeft = 0;
-  bool written = false;
-  {
-    FsFile in;
-    if (!Storage.openFileForRead("RST", path_.c_str(), in)) return FileRemoval::Failed;
-    ReadingStatsFile::Summary summary;
-    if (!ReadingStatsFile::summarize(in, summary, docId)) {
-      LOG_ERR("RST", "removeBookFromFile: history file unreadable; left as is");
-      return FileRemoval::Failed;
-    }
-    if (!summary.found) return FileRemoval::NotFound;
-    booksLeft = summary.bookCount - 1;
-    FsFile out;
-    if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return FileRemoval::Failed;
-    // The copy goes out a byte at a time; batch it into few SD calls.
-    BufferedPrint buffered(out, 1024);
-    ReadingStatsFile::writeWithoutTarget(in, summary, buffered);
-    written = buffered.flushBuffer();
-  }
-  if (!written || !readsBackWithout(tmpPath, docId, booksLeft)) {
-    LOG_ERR("RST", "removeBookFromFile: rewritten history did not read back; left as is");
-    Storage.remove(tmpPath.c_str());
-    return FileRemoval::Failed;
-  }
-  if (!swapIn(path_, tmpPath)) return FileRemoval::Failed;
-  invalidateRecent();
-  return FileRemoval::Removed;
-}
-
-bool ReadingStatsStore::loadFromFile() {
-  loaded_ = false;
-  if (!Storage.exists(path_.c_str())) {
-    loaded_ = true;  // an absent file is a legitimately empty history, not a failure to load
-    return true;
-  }
-  FsFile in;
-  if (!Storage.openFileForRead("RST", path_.c_str(), in)) {
-    LOG_ERR("RST", "History file could not be opened; the store stays unloaded (no save will overwrite it)");
-    return false;
-  }
-  if (in.size() == 0) {
-    in.close();
-    loaded_ = true;
-    return true;
-  }
-  const JsonSettingsIO::ReadingStatsLoad result = JsonSettingsIO::loadReadingStats(*this, in);
-  in.close();
-  switch (result) {
-    case JsonSettingsIO::ReadingStatsLoad::Ok:
-      loaded_ = true;
-      return true;
-    case JsonSettingsIO::ReadingStatsLoad::NoMemory:
-      // Transient: the heap could not hold the document. Not loaded, so nothing saves over the
-      // file; the next ScopedLoad tries again.
-      LOG_ERR("RST", "History not loaded (out of memory parsing it); it is kept as is until it loads");
-      return false;
-    case JsonSettingsIO::ReadingStatsLoad::Corrupt:
-    default: {
-      // Permanent: set the file aside for forensics rather than lose it or stall on it for ever,
-      // and start an empty history.
-      const std::string asidePath = asidePathFor(path_);
-      Storage.remove(asidePath.c_str());
-      const bool moved = Storage.rename(path_.c_str(), asidePath.c_str());
-      LOG_ERR("RST", "History file unreadable; %s and starting an empty history",
-              moved ? "set aside as reading-stats.corrupt.json" : "could not even be set aside");
-      loaded_ = moved;  // if it cannot be moved, refuse to save over it
-      return moved;
-    }
-  }
-}
-
-bool ReadingStatsStore::ensureLoaded() {
-  if (loaded_) {
-    return true;
-  }
-  loadFromFile();
-  LOG_DBG("RST", "Store loaded on demand (%zu books, free=%lu contig=%lu)", books.size(),
-          static_cast<unsigned long>(esp_get_free_heap_size()),
-          static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)));
-  return loaded_;
-}
-
-void ReadingStatsStore::replaceLoaded(std::vector<BookReadingStats>&& loadedBooks,
-                                      std::vector<DayBucket>&& loadedGlobalDays, const uint32_t totalSeconds,
-                                      const uint32_t totalSessions, const uint32_t totalPagesTurned,
-                                      const uint16_t longestStreak) {
-  books = std::move(loadedBooks);
-  totals_.globalDays = std::move(loadedGlobalDays);
-  totals_.totalSeconds = totalSeconds;
-  totals_.totalSessions = totalSessions;
-  totals_.totalPagesTurned = totalPagesTurned;
-  totals_.longestStreak = longestStreak;
-  // Files written before the caps existed: trim once here, the next save persists it.
-  for (auto& book : books) trimBookDays(book.days);
-  trimGlobalDays(totals_.globalDays, totals_.longestStreak);
-}
-
 void ReadingStatsStore::trimBookDays(std::vector<DayBucket>& days) {
   if (days.size() > kMaxBookDays)
     days.erase(days.begin(), days.begin() + static_cast<long>(days.size() - kMaxBookDays));
@@ -480,19 +197,210 @@ void ReadingStatsStore::trimGlobalDays(std::vector<DayBucket>& days, uint16_t& r
   days.erase(days.begin(), days.begin() + static_cast<long>(days.size() - kMaxGlobalDays));
 }
 
-void ReadingStatsStore::release() {
-  if (!loaded_) {
-    return;
-  }
-  // clear() keeps capacity, which is the whole cost here — 36 books measured at ~15 KB standing
-  // plus a per-book days vector each. Swap with an empty temporary so the buffers actually go
-  // back to the heap.
-  std::vector<BookReadingStats>().swap(books);
-  totals_ = ReadingTotals{};  // move assignment frees the old buckets
-  loaded_ = false;
-  LOG_DBG("RST", "Store released (free=%lu contig=%lu)", static_cast<unsigned long>(esp_get_free_heap_size()),
-          static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)));
+void ReadingStatsStore::takeOut(const BookReadingStats& book, ReadingTotals& totals) {
+  totals.totalSeconds -= std::min(totals.totalSeconds, book.totalSeconds);
+  totals.totalSessions -= std::min(totals.totalSessions, book.sessions);
+  totals.totalPagesTurned -= std::min(totals.totalPagesTurned, book.pagesTurned);
+  for (const DayBucket& day : book.days) unmergeDay(totals.globalDays, day.dayIndex, day.seconds);
 }
+
+void ReadingStatsStore::applySession(BookReadingStats& book, ReadingTotals& totals, const std::string& title,
+                                     const std::string& author, const uint32_t sessionSeconds,
+                                     const uint32_t sessionPagesTurned, const uint8_t progress,
+                                     const time_t walltimeEpoch) {
+  if (!title.empty()) book.title = title;
+  if (!author.empty()) book.author = author;
+  book.totalSeconds += sessionSeconds;
+  book.pagesTurned += sessionPagesTurned;
+  book.progress = progress;
+  if (sessionSeconds > 0) {
+    book.sessions += 1;
+    totals.totalSessions += 1;
+  }
+  if (walltimeEpoch != 0) {
+    if (book.firstReadEpoch == 0) book.firstReadEpoch = walltimeEpoch;
+    book.lastReadEpoch = walltimeEpoch;
+    const uint16_t day = localDayIndexFromEpoch(walltimeEpoch);
+    mergeDay(book.days, day, sessionSeconds, kMaxBookDays);
+    mergeDay(totals.globalDays, day, sessionSeconds, kMaxGlobalDays);
+    // Fold this day's run into the persisted longest streak while the whole run is still in the
+    // window (a run longer than the window is already the record).
+    const uint16_t run = runEndingAt(totals.globalDays, day);
+    if (run > totals.longestStreak) totals.longestStreak = run;
+  }
+  totals.totalSeconds += sessionSeconds;
+  totals.totalPagesTurned += sessionPagesTurned;
+}
+
+void ReadingStatsStore::applyFinish(BookReadingStats& book, const std::string& title, const std::string& author,
+                                    const time_t walltimeEpoch) {
+  if (!title.empty()) book.title = title;
+  if (!author.empty()) book.author = author;
+  book.finishedCount += 1;
+  book.progress = 100;
+  if (walltimeEpoch != 0) {
+    book.lastFinishedEpoch = walltimeEpoch;
+    if (book.lastReadEpoch < walltimeEpoch) book.lastReadEpoch = walltimeEpoch;
+  }
+}
+
+// ---- Updates ----------------------------------------------------------------------------------
+
+ReadingStatsStore::WriteResult ReadingStatsStore::recordSession(const std::string& docId, const std::string& title,
+                                                                const std::string& author,
+                                                                const uint32_t sessionSeconds,
+                                                                const uint32_t sessionPagesTurned,
+                                                                const uint8_t progress, const time_t walltimeEpoch) {
+  return write(Edit::Session, docId, [&](BookReadingStats& book, ReadingTotals& totals, const bool existed) {
+    if (!existed && sessionSeconds == 0) return false;  // nothing to record
+    applySession(book, totals, title, author, sessionSeconds, sessionPagesTurned, progress, walltimeEpoch);
+    return true;
+  });
+}
+
+ReadingStatsStore::WriteResult ReadingStatsStore::markFinished(const std::string& docId, const std::string& title,
+                                                               const std::string& author, const time_t walltimeEpoch) {
+  return write(Edit::Finish, docId, [&](BookReadingStats& book, ReadingTotals&, bool) {
+    applyFinish(book, title, author, walltimeEpoch);
+    return true;
+  });
+}
+
+ReadingStatsStore::WriteResult ReadingStatsStore::removeBook(const std::string& docId) {
+  return write(Edit::Remove, docId, [](BookReadingStats& book, ReadingTotals& totals, bool) {
+    takeOut(book, totals);
+    return true;
+  });
+}
+
+ReadingStatsStore::WriteResult ReadingStatsStore::write(
+    const Edit edit, const std::string& docId,
+    const std::function<bool(BookReadingStats&, ReadingTotals&, bool)>& apply) {
+  if (docId.empty()) return WriteResult::NotFound;
+  const uint32_t started = millis();
+
+  // 1. Scan: the header, the book, and the cap's victim should the book be new.
+  ReadingStatsFile::ScanRequest request;
+  request.findDocId = docId;
+  request.wantVictim = edit != Edit::Remove;
+  ReadingStatsFile::Summary summary;
+  bool haveInput = Storage.exists(path_.c_str());
+  const auto result = scanFile(request, summary);
+  if (result == ReadingStatsFile::ScanResult::NoMemory) return WriteResult::NoMemory;
+  if (result == ReadingStatsFile::ScanResult::IoError) return WriteResult::Failed;
+  // A removal has nothing to remove from an unreadable file; only a write that adds reading starts
+  // a fresh history over it.
+  if (result == ReadingStatsFile::ScanResult::Malformed && edit == Edit::Remove) return WriteResult::Failed;
+  if (result == ReadingStatsFile::ScanResult::Malformed) {
+    // Permanent: set it aside for forensics rather than lose it or stall on it for ever, and start
+    // a fresh history with this change.
+    const std::string aside = asidePathFor(path_);
+    Storage.remove(aside.c_str());
+    if (!Storage.rename(path_.c_str(), aside.c_str())) {
+      LOG_ERR("RST", "History file unreadable and could not be set aside; left as is");
+      return WriteResult::Failed;
+    }
+    LOG_ERR("RST", "History file unreadable; set aside as %s, starting a fresh history", aside.c_str());
+    summary = ReadingStatsFile::Summary{};
+    haveInput = false;
+  }
+  if (!summary.found && edit == Edit::Remove) return WriteResult::NotFound;
+
+  // 2. Merge the one book in memory.
+  BookReadingStats book = summary.found ? summary.target : BookReadingStats{};
+  if (!summary.found) book.docId = docId;
+  ReadingStatsFile::Rewrite rewrite;
+  rewrite.totals = summary;  // the ReadingTotals part
+  if (!apply(book, rewrite.totals, summary.found)) return WriteResult::Done;
+  uint32_t expectedBooks = summary.bookCount;
+  std::string evicted;
+  if (edit == Edit::Remove) {
+    rewrite.dropAt = summary.targetFirst;
+    --expectedBooks;
+  } else if (summary.found) {
+    rewrite.replaceAt = summary.targetFirst;
+    rewrite.replacement = &book;
+  } else {
+    rewrite.append = &book;
+    ++expectedBooks;
+    if (summary.bookCount >= kMaxBooks && summary.hasVictim) {
+      rewrite.dropAt = summary.victimFirst;
+      evicted = summary.victimDocId;
+      --expectedBooks;
+      LOG_INF("RST", "Book cap (%u) reached; dropping the least recently read: %s", static_cast<unsigned>(kMaxBooks),
+              evicted.c_str());
+    }
+  }
+
+  // 3. Write the temporary file.
+  Storage.mkdir(parentDirOf(path_).c_str());
+  const std::string tmpPath = path_ + ".tmp";
+  bool written = false;
+  {
+    FsFile in;
+    const bool inOpen = haveInput && Storage.openFileForRead("RST", path_.c_str(), in) && in.size() > 0;
+    FsFile out;
+    if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return WriteResult::Failed;
+    // The copy goes out a byte at a time; batch it into few SD calls.
+    BufferedPrint buffered(out, 1024);
+    const auto copied = ReadingStatsFile::writeRewrite(inOpen ? &in : nullptr, rewrite, buffered);
+    written = buffered.flushBuffer() && copied == ReadingStatsFile::ScanResult::Ok;
+  }
+
+  // 4. Read it back; swap it in only if it holds what it should.
+  ReadingStatsFile::Summary check;
+  if (written) {
+    ReadingStatsFile::ScanRequest verify;
+    verify.findDocId = docId;
+    FsFile back;
+    written = Storage.openFileForRead("RST", tmpPath.c_str(), back) &&
+              ReadingStatsFile::scan(back, check, verify) == ReadingStatsFile::ScanResult::Ok &&
+              check.bookCount == expectedBooks &&
+              (edit == Edit::Remove ? !check.found : (check.found && check.target.totalSeconds == book.totalSeconds));
+  }
+  if (!written) {
+    LOG_ERR("RST", "Rewritten history did not read back; left as is");
+    Storage.remove(tmpPath.c_str());
+    return WriteResult::Failed;
+  }
+  if (!swapIn(path_, tmpPath)) return WriteResult::Failed;
+
+  // The cache follows the file without a scan of its own.
+  if (edit == Edit::Remove) {
+    forgetRecent(docId);
+  } else {
+    rememberRecent(book);
+  }
+  if (!evicted.empty()) forgetRecent(evicted);
+  pooledPace_ = pooledSecondsPerPercent(check.totalSeconds, check.paceSeconds, check.pacePercents);
+  paceKnown_ = true;
+  LOG_INF("RST", "write done in %lu ms (%u books, free=%lu contig=%lu)", static_cast<unsigned long>(millis() - started),
+          static_cast<unsigned>(expectedBooks), static_cast<unsigned long>(esp_get_free_heap_size()),
+          static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)));
+  return WriteResult::Done;
+}
+
+void ReadingStatsStore::rememberRecent(const BookReadingStats& book) {
+  ReadingStatsFile::RecentSnapshot snapshot;
+  snapshot.docId = book.docId;
+  snapshot.known = true;
+  snapshot.totalSeconds = book.totalSeconds;
+  snapshot.knownDays = static_cast<uint16_t>(std::min(book.days.size(), kMaxBookDays));
+  snapshot.lastReadEpoch = book.lastReadEpoch;
+  snapshot.progress = book.progress;
+  forgetRecent(book.docId);
+  // The book just read is the likeliest one on Home: it goes to the front, the oldest entry goes.
+  recent_.insert(recent_.begin(), std::move(snapshot));
+  if (recent_.size() > kRecentCacheSize) recent_.pop_back();
+}
+
+void ReadingStatsStore::forgetRecent(const std::string& docId) {
+  recent_.erase(std::remove_if(recent_.begin(), recent_.end(),
+                               [&docId](const ReadingStatsFile::RecentSnapshot& s) { return s.docId == docId; }),
+                recent_.end());
+}
+
+// ---- Queries ----------------------------------------------------------------------------------
 
 ReadingStatsFile::ScanResult ReadingStatsStore::scanFile(const ReadingStatsFile::ScanRequest& request,
                                                          ReadingStatsFile::Summary& summary) const {
@@ -567,9 +475,4 @@ const ReadingStatsFile::RecentSnapshot* ReadingStatsStore::recent(const std::str
     if (snapshot.docId == docId) return &snapshot;
   }
   return nullptr;
-}
-
-void ReadingStatsStore::invalidateRecent() {
-  std::vector<ReadingStatsFile::RecentSnapshot>().swap(recent_);
-  paceKnown_ = false;
 }
