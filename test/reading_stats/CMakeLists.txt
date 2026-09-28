@@ -63,3 +63,27 @@ target_link_libraries(ReadingStatsStoreTest PRIVATE
 )
 
 gtest_discover_tests(ReadingStatsStoreTest)
+
+# The layout of reading-stats.bin against real files in a temporary directory.
+add_executable(ReadingStatsSlotFileTest
+  ReadingStatsSlotFileTest.cpp
+  ${REPO_ROOT}/src/ReadingStatsSlotFile.cpp
+)
+
+target_include_directories(ReadingStatsSlotFileTest PRIVATE
+  ${REPO_ROOT}/src
+  # HalStorage.h over stdio and std::filesystem. Must precede test/shims (no-op HalStorage.h) and
+  # lib/hal (the real one wants SdFat).
+  ${REPO_ROOT}/test/zip_entry_reader
+  ${REPO_ROOT}/test/shims
+  ${REPO_ROOT}/lib/hal
+  ${REPO_ROOT}/lib/Logging
+  ${REPO_ROOT}/lib/Memory
+)
+
+target_link_libraries(ReadingStatsSlotFileTest PRIVATE
+  crosspoint_test_common
+  GTest::gtest_main
+)
+
+gtest_discover_tests(ReadingStatsSlotFileTest)
