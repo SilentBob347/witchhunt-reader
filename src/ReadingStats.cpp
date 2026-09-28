@@ -12,16 +12,29 @@
 #include "ReadingStatsFile.h"
 
 namespace {
-constexpr const char* READING_STATS_FILE = ReadingStatsFile::kPath;
-
 // Puts a finished temporary file in place of the store's file.
-bool swapIn(const std::string& tmpPath) {
-  Storage.remove(READING_STATS_FILE);
-  if (!Storage.rename(tmpPath.c_str(), READING_STATS_FILE)) {
+bool swapIn(const std::string& path, const std::string& tmpPath) {
+  Storage.remove(path.c_str());
+  if (!Storage.rename(tmpPath.c_str(), path.c_str())) {
     LOG_ERR("RST", "Could not rename %s into place", tmpPath.c_str());
     return false;
   }
   return true;
+}
+
+// Where a history that cannot be read is set aside: reading-stats.json -> reading-stats.corrupt.json.
+std::string asidePathFor(const std::string& path) {
+  constexpr char kSuffix[] = ".json";
+  const size_t n = sizeof(kSuffix) - 1;
+  if (path.size() > n && path.compare(path.size() - n, n, kSuffix) == 0) {
+    return path.substr(0, path.size() - n) + ".corrupt.json";
+  }
+  return path + ".corrupt";
+}
+
+std::string parentDirOf(const std::string& path) {
+  const size_t slash = path.find_last_of('/');
+  return slash == std::string::npos || slash == 0 ? std::string("/") : path.substr(0, slash);
 }
 
 // The streamed removal's safety check: the new file has to parse, must not hold the book, and must
@@ -331,10 +344,10 @@ bool ReadingStatsStore::saveToFile() const {
     LOG_ERR("RST", "saveToFile refused: store not loaded (would erase history)");
     return false;
   }
-  Storage.mkdir("/.crosspoint");
+  Storage.mkdir(parentDirOf(path_).c_str());
   // Straight into a temporary file (no in-RAM copy of the JSON), then rename over the store's
   // file: a power loss mid-write leaves the previous history intact.
-  const std::string tmpPath = std::string(READING_STATS_FILE) + ".tmp";
+  const std::string tmpPath = path_ + ".tmp";
   {
     FsFile out;
     if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return false;
@@ -345,7 +358,7 @@ bool ReadingStatsStore::saveToFile() const {
       return false;
     }
   }
-  return swapIn(tmpPath);
+  return swapIn(path_, tmpPath);
 }
 
 ReadingStatsStore::FileRemoval ReadingStatsStore::removeBookFromFile(const std::string& docId) {
@@ -353,13 +366,13 @@ ReadingStatsStore::FileRemoval ReadingStatsStore::removeBookFromFile(const std::
     if (!removeBook(docId)) return FileRemoval::NotFound;
     return saveToFile() ? FileRemoval::Removed : FileRemoval::Failed;
   }
-  if (!Storage.exists(READING_STATS_FILE)) return FileRemoval::NotFound;
-  const std::string tmpPath = std::string(READING_STATS_FILE) + ".tmp";
+  if (!Storage.exists(path_.c_str())) return FileRemoval::NotFound;
+  const std::string tmpPath = path_ + ".tmp";
   uint32_t booksLeft = 0;
   bool written = false;
   {
     FsFile in;
-    if (!Storage.openFileForRead("RST", READING_STATS_FILE, in)) return FileRemoval::Failed;
+    if (!Storage.openFileForRead("RST", path_.c_str(), in)) return FileRemoval::Failed;
     ReadingStatsFile::Summary summary;
     if (!ReadingStatsFile::summarize(in, summary, docId)) {
       LOG_ERR("RST", "removeBookFromFile: history file unreadable; left as is");
@@ -379,17 +392,17 @@ ReadingStatsStore::FileRemoval ReadingStatsStore::removeBookFromFile(const std::
     Storage.remove(tmpPath.c_str());
     return FileRemoval::Failed;
   }
-  return swapIn(tmpPath) ? FileRemoval::Removed : FileRemoval::Failed;
+  return swapIn(path_, tmpPath) ? FileRemoval::Removed : FileRemoval::Failed;
 }
 
 bool ReadingStatsStore::loadFromFile() {
   loaded_ = false;
-  if (!Storage.exists(READING_STATS_FILE)) {
+  if (!Storage.exists(path_.c_str())) {
     loaded_ = true;  // an absent file is a legitimately empty history, not a failure to load
     return true;
   }
   FsFile in;
-  if (!Storage.openFileForRead("RST", READING_STATS_FILE, in)) {
+  if (!Storage.openFileForRead("RST", path_.c_str(), in)) {
     LOG_ERR("RST", "History file could not be opened; the store stays unloaded (no save will overwrite it)");
     return false;
   }
@@ -413,9 +426,9 @@ bool ReadingStatsStore::loadFromFile() {
     default: {
       // Permanent: set the file aside for forensics rather than lose it or stall on it for ever,
       // and start an empty history.
-      const std::string asidePath = "/.crosspoint/reading-stats.corrupt.json";
+      const std::string asidePath = asidePathFor(path_);
       Storage.remove(asidePath.c_str());
-      const bool moved = Storage.rename(READING_STATS_FILE, asidePath.c_str());
+      const bool moved = Storage.rename(path_.c_str(), asidePath.c_str());
       LOG_ERR("RST", "History file unreadable; %s and starting an empty history",
               moved ? "set aside as reading-stats.corrupt.json" : "could not even be set aside");
       loaded_ = moved;  // if it cannot be moved, refuse to save over it
@@ -474,4 +487,84 @@ void ReadingStatsStore::release() {
   loaded_ = false;
   LOG_DBG("RST", "Store released (free=%lu contig=%lu)", static_cast<unsigned long>(esp_get_free_heap_size()),
           static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)));
+}
+
+ReadingStatsFile::ScanResult ReadingStatsStore::scanFile(const ReadingStatsFile::ScanRequest& request,
+                                                         ReadingStatsFile::Summary& summary) const {
+  summary = ReadingStatsFile::Summary{};
+  const auto emptyHistory = [&]() {
+    for (const auto& id : request.recentDocIds) {
+      ReadingStatsFile::RecentSnapshot unknown;
+      unknown.docId = id;
+      summary.recents.push_back(std::move(unknown));
+    }
+    return ReadingStatsFile::ScanResult::Ok;
+  };
+  if (!Storage.exists(path_.c_str())) return emptyHistory();
+  FsFile in;
+  if (!Storage.openFileForRead("RST", path_.c_str(), in)) return ReadingStatsFile::ScanResult::IoError;
+  if (in.size() == 0) return emptyHistory();
+  return ReadingStatsFile::scan(in, summary, request);
+}
+
+ReadingStatsFile::ScanResult ReadingStatsStore::querySummary(ReadingStatsFile::Summary& out,
+                                                             const bool withIndex) const {
+  ReadingStatsFile::ScanRequest request;
+  request.wantIndex = withIndex;
+  return scanFile(request, out);
+}
+
+ReadingStatsFile::ScanResult ReadingStatsStore::queryBook(const std::string& docId, BookQuery& out) const {
+  out = BookQuery{};
+  ReadingStatsFile::ScanRequest request;
+  request.findDocId = docId;
+  ReadingStatsFile::Summary summary;
+  const auto result = scanFile(request, summary);
+  if (result != ReadingStatsFile::ScanResult::Ok) return result;
+  out.found = summary.found;
+  out.book = std::move(summary.target);
+  out.pooledPace = pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents);
+  return result;
+}
+
+ReadingStatsFile::ScanResult ReadingStatsStore::queryBookAt(const uint32_t offset, BookReadingStats& book) const {
+  FsFile in;
+  if (!Storage.openFileForRead("RST", path_.c_str(), in)) return ReadingStatsFile::ScanResult::IoError;
+  return ReadingStatsFile::readBookAt(in, offset, book);
+}
+
+void ReadingStatsStore::prefetchRecent(const std::vector<std::string>& docIds) {
+  ReadingStatsFile::ScanRequest request;
+  for (const auto& id : docIds) {
+    if (!id.empty() && recent(id) == nullptr) request.recentDocIds.push_back(id);
+  }
+  if (request.recentDocIds.empty() && paceKnown_) return;
+  ReadingStatsFile::Summary summary;
+  const auto result = scanFile(request, summary);
+  if (result != ReadingStatsFile::ScanResult::Ok) {
+    LOG_ERR("RST", "prefetchRecent: scan failed (%u); Home draws no history this time", static_cast<unsigned>(result));
+    return;
+  }
+  for (auto& snapshot : summary.recents) recent_.push_back(std::move(snapshot));
+  pooledPace_ = pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents);
+  paceKnown_ = true;
+  for (auto it = recent_.begin(); recent_.size() > kRecentCacheSize && it != recent_.end();) {
+    if (std::find(docIds.begin(), docIds.end(), it->docId) == docIds.end()) {
+      it = recent_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+const ReadingStatsFile::RecentSnapshot* ReadingStatsStore::recent(const std::string& docId) const {
+  for (const auto& snapshot : recent_) {
+    if (snapshot.docId == docId) return &snapshot;
+  }
+  return nullptr;
+}
+
+void ReadingStatsStore::invalidateRecent() {
+  std::vector<ReadingStatsFile::RecentSnapshot>().swap(recent_);
+  paceKnown_ = false;
 }

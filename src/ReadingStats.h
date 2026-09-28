@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "ReadingStatsFile.h"
 #include "ReadingStatsTypes.h"
 
 // Helpers — both return 0 when HalClock is unsynced (caller should skip).
@@ -28,6 +29,31 @@ class ReadingStatsStore {
 
  public:
   static ReadingStatsStore& getInstance() { return instance; }
+
+  explicit ReadingStatsStore(std::string path = ReadingStatsFile::kPath) : path_(std::move(path)) {}
+
+  // ---- Streamed queries -------------------------------------------------------------------------
+  //
+  // Each reads the file once and returns only what was asked for; nothing stays resident. An absent
+  // or empty file is an empty history (Ok). Call from the loop task, never from render().
+  struct BookQuery {
+    bool found = false;
+    BookReadingStats book;
+    float pooledPace = 0.0f;  // the global pace, for a book without one of its own
+  };
+  ReadingStatsFile::ScanResult querySummary(ReadingStatsFile::Summary& out, bool withIndex = false) const;
+  ReadingStatsFile::ScanResult queryBook(const std::string& docId, BookQuery& out) const;
+  ReadingStatsFile::ScanResult queryBookAt(uint32_t offset, BookReadingStats& book) const;
+
+  // ---- Recent-books cache -----------------------------------------------------------------------
+  //
+  // What Home draws for its recent books, so the themes read no file from render(). Home calls
+  // prefetchRecent() on entry; it scans only for books not cached yet (books without history are
+  // cached as unknown). Bounded: the books asked for stay, others go past kRecentCacheSize.
+  static constexpr size_t kRecentCacheSize = 12;
+  void prefetchRecent(const std::vector<std::string>& docIds);
+  const ReadingStatsFile::RecentSnapshot* recent(const std::string& docId) const;
+  float recentPooledPace() const { return pooledPace_; }
 
   // Apply a finished session to the store. Creates a per-book entry on first
   // use. Increments aggregate counters. Updates first/last epoch when
@@ -201,6 +227,14 @@ class ReadingStatsStore {
   };
 
  private:
+  ReadingStatsFile::ScanResult scanFile(const ReadingStatsFile::ScanRequest& request,
+                                        ReadingStatsFile::Summary& summary) const;
+  void invalidateRecent();
+
+  std::string path_;
+  std::vector<ReadingStatsFile::RecentSnapshot> recent_;
+  float pooledPace_ = 0.0f;
+  bool paceKnown_ = false;
   bool loaded_ = false;
 };
 
