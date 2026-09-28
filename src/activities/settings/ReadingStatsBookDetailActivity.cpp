@@ -56,6 +56,12 @@ uint32_t secondsForDayIn(const std::vector<DayBucket>& days, uint16_t dayIndex) 
 
 void ReadingStatsBookDetailActivity::onEnter() {
   Activity::onEnter();
+  ReadingStatsStore::BookQuery query;
+  if (READING_STATS.queryBook(docId, query) != ReadingStatsFile::ScanResult::Ok) query = {};
+  {
+    RenderLock lock(*this);
+    query_ = std::move(query);
+  }
   requestUpdate();
 }
 
@@ -73,14 +79,13 @@ void ReadingStatsBookDetailActivity::loop() {
 // settings reached over an open book): the session lands in the store when the reader closes and
 // would bring the entry straight back.
 bool ReadingStatsBookDetailActivity::canRemove() const {
-  if (!READING_STATS.findBook(docId)) return false;
+  if (!query_.found) return false;
   const auto& tracker = globalReadingSessionTracker();
   return !(tracker.isActive() && tracker.getDocId() == docId);
 }
 
 void ReadingStatsBookDetailActivity::confirmRemove() {
-  const BookReadingStats* book = READING_STATS.findBook(docId);
-  const std::string title = book->title.empty() ? docId : book->title;
+  const std::string title = query_.book.title.empty() ? docId : query_.book.title;
   startActivityForResult(
       std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_READING_STATS_REMOVE_BOOK), title),
       [this](const ActivityResult& res) {
@@ -88,13 +93,10 @@ void ReadingStatsBookDetailActivity::confirmRemove() {
           requestUpdate();
           return;
         }
-        {
-          // render() dereferences this book's entry on the render task.
-          RenderLock lock(*this);
-          READING_STATS.removeBook(docId);
-        }
-        if (!READING_STATS.saveToFile()) {
-          LOG_ERR("RST", "saveToFile failed (remove) doc=%s", docId.c_str());
+        if (READING_STATS.removeBookFromFile(docId) != ReadingStatsStore::FileRemoval::Removed) {
+          LOG_ERR("RST", "remove failed doc=%s", docId.c_str());
+          requestUpdate();
+          return;
         }
         // Nothing left to show; the list underneath rebuilds when it regains the screen.
         finish();
@@ -104,8 +106,7 @@ void ReadingStatsBookDetailActivity::confirmRemove() {
 void ReadingStatsBookDetailActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const Rect contentRect = UITheme::getContentRect(renderer, /*hasBottomHints=*/true, /*hasSideHints=*/false);
-  const auto& store = READING_STATS;
-  const BookReadingStats* book = store.findBook(docId);
+  const BookReadingStats* book = query_.found ? &query_.book : nullptr;
 
   renderer.clearScreen();
 
@@ -163,7 +164,9 @@ void ReadingStatsBookDetailActivity::render(RenderLock&&) {
       // reading the book; the reader's status bar can pick this up live.
       if (book->progress < 100) {
         const float remainingPercent = 100.0f - static_cast<float>(book->progress);
-        const uint32_t etaSeconds = store.estimateRemainingSeconds(book->docId, remainingPercent);
+        const float own = ReadingStatsStore::ownSecondsPerPercent(book->totalSeconds, book->progress);
+        const uint32_t etaSeconds =
+            ReadingStatsStore::etaSeconds(own > 0.0f ? own : query_.pooledPace, remainingPercent);
         b.rowLR(tr(STR_READING_STATS_ETA),
                 etaSeconds > 0 ? formatReadingDuration(etaSeconds) : std::string(tr(STR_READING_STATS_UNKNOWN)));
       }
