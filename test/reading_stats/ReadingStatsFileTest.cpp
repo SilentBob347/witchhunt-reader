@@ -493,3 +493,49 @@ TEST(ReadingStatsFileWriteBook, TakesTheLargestValuesEveryFieldCanHold) {
             R"("sessions":4294967295,"firstReadEpoch":1767225600,"lastReadEpoch":1768046400,"progress":100,)"
             R"("finishedCount":65535,"lastFinishedEpoch":1768046400,"finished":true,"days":[[20463,4294967295]]})");
 }
+
+TEST(ReadingStatsFileWriteBook, AddsTheTimeToFinishBeforeTheClosingBrace) {
+  StringPrint plain;
+  StringPrint withEta;
+
+  ReadingStatsFile::writeBook(plain, bookD());
+  ReadingStatsFile::writeBook(withEta, bookD(), 1980);
+
+  EXPECT_EQ(plain.text, kBookD);
+  EXPECT_EQ(withEta.text, open(kBookD) + R"(,"etaSeconds":1980})");
+}
+
+TEST(ReadingStatsFileHeads, FileHeadAndBooksMakeTheFile) {
+  StringPrint out;
+
+  ReadingStatsFile::writeFileHead(out, totalsOf(1350, 4, 23, {{20463, 950}, {20464, 400}}));
+  out.text += kBookA;
+  ReadingStatsFile::writeBookSeparator(out);
+  out.text += kBookB;
+  ReadingStatsFile::writeBookSeparator(out);
+  out.text += kBookC;
+  ReadingStatsFile::writeTail(out);
+
+  EXPECT_EQ(out.text, kFile);
+}
+
+TEST(ReadingStatsFileHeads, DashboardHeadCarriesCountsAndStreaks) {
+  StringPrint out;
+
+  ReadingStatsFile::writeDashboardHead(out, totalsOf(1350, 4, 23, {{20463, 950}, {20464, 400}}), 3, 1, 20464);
+
+  EXPECT_EQ(out.text,
+            R"({"totalSeconds":1350,"totalSessions":4,"totalPagesTurned":23,"bookCount":3,"finishedBookCount":1,)"
+            R"("todayDayIndex":20464,"currentStreak":2,"longestStreak":2,)"
+            R"("globalDays":[[20463,950],[20464,400]],"books":[)");
+}
+
+TEST(ReadingStatsFileHeads, DashboardHeadLeavesStreaksOutWithoutAClock) {
+  StringPrint out;
+
+  ReadingStatsFile::writeDashboardHead(out, totalsOf(300, 1, 5, {{20463, 300}}), 1, 1, 0);
+
+  EXPECT_EQ(out.text,
+            R"({"totalSeconds":300,"totalSessions":1,"totalPagesTurned":5,"bookCount":1,"finishedBookCount":1,)"
+            R"("todayDayIndex":0,"globalDays":[[20463,300]],"books":[)");
+}

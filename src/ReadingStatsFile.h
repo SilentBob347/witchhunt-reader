@@ -82,7 +82,21 @@ ScanResult readBookAt(HalFile& in, size_t offset, BookReadingStats& book);
 
 // One book as a JSON object, in the field order the device has always written. Strings are
 // escaped the way ArduinoJson does: quote, backslash and control characters; UTF-8 passes through.
-void writeBook(Print& out, const BookReadingStats& book);
+// With `etaSeconds` not negative, the dashboard's `"etaSeconds"` field goes last, before the
+// closing brace, where the web page has always found it.
+void writeBook(Print& out, const BookReadingStats& book, long long etaSeconds = -1);
+
+// The history file's text up to its books, `{"totalSeconds":…,"globalDays":[…],"books":[`. The
+// books follow through writeBook() and writeBookSeparator(), then writeTail().
+void writeFileHead(Print& out, const ReadingTotals& totals);
+
+// The /api/stats payload up to its books: the figures, the counts, today's day index, the streaks
+// when `today` is known and there are days, and the global days.
+void writeDashboardHead(Print& out, const ReadingTotals& totals, uint32_t bookCount, uint32_t finishedBookCount,
+                        uint16_t today);
+
+void writeBookSeparator(Print& out);  // between two books
+void writeTail(Print& out);           // after the last book: closes the books and the object
 
 constexpr size_t kNoEntry = static_cast<size_t>(-1);
 

@@ -574,30 +574,52 @@ ScanResult readBookAt(HalFile& in, const size_t offset, BookReadingStats& book) 
   return pass.run(in, offset);
 }
 
-void writeDashboard(HalFile& in, const Summary& summary, const uint16_t today, Print& out) {
+void writeDashboardHead(Print& out, const ReadingTotals& totals, const uint32_t bookCount,
+                        const uint32_t finishedBookCount, const uint16_t today) {
   char head[192];
   int n = snprintf(head, sizeof(head),
                    "{\"totalSeconds\":%lu,\"totalSessions\":%lu,\"totalPagesTurned\":%lu,\"bookCount\":%lu,"
                    "\"finishedBookCount\":%lu,\"todayDayIndex\":%u",
-                   static_cast<unsigned long>(summary.totalSeconds), static_cast<unsigned long>(summary.totalSessions),
-                   static_cast<unsigned long>(summary.totalPagesTurned), static_cast<unsigned long>(summary.bookCount),
-                   static_cast<unsigned long>(summary.finishedBookCount), today);
+                   static_cast<unsigned long>(totals.totalSeconds), static_cast<unsigned long>(totals.totalSessions),
+                   static_cast<unsigned long>(totals.totalPagesTurned), static_cast<unsigned long>(bookCount),
+                   static_cast<unsigned long>(finishedBookCount), today);
   emitBounded(out, head, n, sizeof(head));
-  if (today != 0 && !summary.globalDays.empty()) {
+  if (today != 0 && !totals.globalDays.empty()) {
     n = snprintf(head, sizeof(head), ",\"currentStreak\":%u,\"longestStreak\":%u",
-                 ReadingStatsStore::currentStreakIn(summary.globalDays, today),
-                 ReadingStatsStore::longestStreakIn(summary.globalDays, summary.longestStreak));
+                 ReadingStatsStore::currentStreakIn(totals.globalDays, today),
+                 ReadingStatsStore::longestStreakIn(totals.globalDays, totals.longestStreak));
     emitBounded(out, head, n, sizeof(head));
   }
   emit(out, ",\"globalDays\":");
-  emitDays(out, summary.globalDays);
+  emitDays(out, totals.globalDays);
   emit(out, ",\"books\":[");
+}
+
+void writeFileHead(Print& out, const ReadingTotals& totals) {
+  char head[160];
+  const int n =
+      snprintf(head, sizeof(head),
+               "{\"totalSeconds\":%lu,\"totalSessions\":%lu,\"totalPagesTurned\":%lu,\"longestStreak\":%u,"
+               "\"globalDays\":",
+               static_cast<unsigned long>(totals.totalSeconds), static_cast<unsigned long>(totals.totalSessions),
+               static_cast<unsigned long>(totals.totalPagesTurned), totals.longestStreak);
+  emitBounded(out, head, n, sizeof(head));
+  emitDays(out, totals.globalDays);
+  emit(out, ",\"books\":[");
+}
+
+void writeBookSeparator(Print& out) { emit(out, ","); }
+
+void writeTail(Print& out) { emit(out, "]}"); }
+
+void writeDashboard(HalFile& in, const Summary& summary, const uint16_t today, Print& out) {
+  writeDashboardHead(out, summary, summary.bookCount, summary.finishedBookCount, today);
   DashboardCopy copy(
       out, ReadingStatsStore::pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents));
   if (copy.run(in) != ScanResult::Ok) {
     LOG_ERR("RSF", "Stats file changed or failed between passes; dashboard truncated");
   }
-  emit(out, "]}");
+  writeTail(out);
 }
 
 void writeWithoutTarget(HalFile& in, const Summary& summary, Print& out) {
@@ -610,7 +632,7 @@ void writeWithoutTarget(HalFile& in, const Summary& summary, Print& out) {
   }
 }
 
-void writeBook(Print& out, const BookReadingStats& book) {
+void writeBook(Print& out, const BookReadingStats& book, const long long etaSeconds) {
   emit(out, "{\"docId\":");
   emitString(out, book.docId);
   emit(out, ",\"title\":");
@@ -629,24 +651,16 @@ void writeBook(Print& out, const BookReadingStats& book) {
   emitNumber(out, "lastFinishedEpoch", static_cast<long long>(book.lastFinishedEpoch));
   emit(out, book.finishedCount > 0 ? ",\"finished\":true,\"days\":" : ",\"finished\":false,\"days\":");
   emitDays(out, book.days);
+  if (etaSeconds >= 0) emitNumber(out, "etaSeconds", etaSeconds);
   emit(out, "}");
 }
 
 ScanResult writeRewrite(HalFile* in, const Rewrite& rewrite, Print& out) {
-  char head[160];
-  const int n = snprintf(head, sizeof(head),
-                         "{\"totalSeconds\":%lu,\"totalSessions\":%lu,\"totalPagesTurned\":%lu,\"longestStreak\":%u,"
-                         "\"globalDays\":",
-                         static_cast<unsigned long>(rewrite.totals.totalSeconds),
-                         static_cast<unsigned long>(rewrite.totals.totalSessions),
-                         static_cast<unsigned long>(rewrite.totals.totalPagesTurned), rewrite.totals.longestStreak);
-  emitBounded(out, head, n, sizeof(head));
-  emitDays(out, rewrite.totals.globalDays);
-  emit(out, ",\"books\":[");
+  writeFileHead(out, rewrite.totals);
   RewriteCopy copy(out, rewrite);
   const ScanResult result = in == nullptr ? ScanResult::Ok : copy.run(*in);
   if (rewrite.append != nullptr) copy.appendAfterLast(*rewrite.append);
-  emit(out, "]}");
+  writeTail(out);
   return result;
 }
 
