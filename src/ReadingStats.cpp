@@ -50,6 +50,27 @@ void recoverInterruptedSwap(const std::string& path) {
   }
 }
 
+// Diagnostics for the "write done" line: time, calls and bytes that reached the card.
+class TimedPrint final : public Print {
+ public:
+  explicit TimedPrint(Print& out) : out_(out) {}
+  size_t write(const uint8_t b) override { return write(&b, 1); }
+  size_t write(const uint8_t* data, const size_t n) override {
+    const unsigned long t = millis();
+    const size_t done = out_.write(data, n);
+    ms += millis() - t;
+    ++calls;
+    bytes += n;
+    return done;
+  }
+  unsigned long ms = 0;
+  uint32_t calls = 0;
+  size_t bytes = 0;
+
+ private:
+  Print& out_;
+};
+
 std::string parentDirOf(const std::string& path) {
   const size_t slash = path.find_last_of('/');
   return slash == std::string::npos || slash == 0 ? std::string("/") : path.substr(0, slash);
@@ -295,7 +316,7 @@ ReadingStatsStore::WriteResult ReadingStatsStore::write(
     const Edit edit, const std::string& docId,
     const std::function<bool(BookReadingStats&, ReadingTotals&, bool)>& apply) {
   if (docId.empty()) return WriteResult::NotFound;
-  const uint32_t started = millis();
+  [[maybe_unused]] const uint32_t started = millis();
 
   // 1. Scan: the header, the book, and the cap's victim should the book be new.
   ReadingStatsFile::ScanRequest request;
@@ -324,6 +345,7 @@ ReadingStatsStore::WriteResult ReadingStatsStore::write(
     haveInput = false;
   }
   if (!summary.found && edit == Edit::Remove) return WriteResult::NotFound;
+  [[maybe_unused]] const uint32_t scanned = millis();
 
   // 2. Merge the one book in memory.
   BookReadingStats book = summary.found ? summary.target : BookReadingStats{};
@@ -355,16 +377,24 @@ ReadingStatsStore::WriteResult ReadingStatsStore::write(
   Storage.mkdir(parentDirOf(path_).c_str());
   const std::string tmpPath = path_ + ".tmp";
   bool written = false;
+  [[maybe_unused]] unsigned long sdMs = 0;
+  [[maybe_unused]] uint32_t sdCalls = 0;
+  [[maybe_unused]] size_t sdBytes = 0;
   {
     FsFile in;
     const bool inOpen = haveInput && Storage.openFileForRead("RST", path_.c_str(), in) && in.size() > 0;
     FsFile out;
     if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return WriteResult::Failed;
     // The copy goes out a byte at a time; batch it into few SD calls.
-    BufferedPrint buffered(out, 1024);
+    TimedPrint timed(out);
+    BufferedPrint buffered(timed, 1024);
     const auto copied = ReadingStatsFile::writeRewrite(inOpen ? &in : nullptr, rewrite, buffered);
     written = buffered.flushBuffer() && copied == ReadingStatsFile::ScanResult::Ok;
+    sdMs = timed.ms;
+    sdCalls = timed.calls;
+    sdBytes = timed.bytes;
   }
+  [[maybe_unused]] const uint32_t copiedAt = millis();
 
   // 4. Read it back; swap it in only if it holds what it should.
   ReadingStatsFile::Summary check;
@@ -377,6 +407,7 @@ ReadingStatsStore::WriteResult ReadingStatsStore::write(
               check.bookCount == expectedBooks &&
               (edit == Edit::Remove ? !check.found : (check.found && check.target.totalSeconds == book.totalSeconds));
   }
+  [[maybe_unused]] const uint32_t verified = millis();
   if (!written) {
     LOG_ERR("RST", "Rewritten history did not read back; left as is");
     Storage.remove(tmpPath.c_str());
@@ -393,8 +424,15 @@ ReadingStatsStore::WriteResult ReadingStatsStore::write(
   if (!evicted.empty()) forgetRecent(evicted);
   pooledPace_ = pooledSecondsPerPercent(check.totalSeconds, check.paceSeconds, check.pacePercents);
   paceKnown_ = true;
-  LOG_INF("RST", "write done in %lu ms (%u books, free=%lu contig=%lu)", static_cast<unsigned long>(millis() - started),
-          static_cast<unsigned>(expectedBooks), static_cast<unsigned long>(esp_get_free_heap_size()),
+  [[maybe_unused]] const uint32_t done = millis();
+  LOG_INF("RST",
+          "write done in %lu ms: scan %lu, copy %lu (sd %lu ms in %u writes, %u B), verify %lu, swap %lu "
+          "(%u books, free=%lu contig=%lu)",
+          static_cast<unsigned long>(done - started), static_cast<unsigned long>(scanned - started),
+          static_cast<unsigned long>(copiedAt - scanned), sdMs, static_cast<unsigned>(sdCalls),
+          static_cast<unsigned>(sdBytes), static_cast<unsigned long>(verified - copiedAt),
+          static_cast<unsigned long>(done - verified), static_cast<unsigned>(expectedBooks),
+          static_cast<unsigned long>(esp_get_free_heap_size()),
           static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)));
   return WriteResult::Done;
 }
