@@ -356,3 +356,40 @@ TEST_F(StoreTest, SessionOnAFinishedBookIsRecorded) {
   EXPECT_EQ(query.book.totalSeconds, 6000u);
   EXPECT_EQ(query.book.finishedCount, 1);
 }
+
+TEST_F(StoreTest, InterruptedSwapIsRecovered) {
+  // Power lost between removing the old file and renaming the verified new one into place: only
+  // the temporary file is left, and it holds the whole history.
+  std::ofstream(path_ + ".tmp", std::ios::binary) << kFile;
+  ReadingStatsStore store(path_);
+
+  ReadingStatsFile::Summary summary;
+  ASSERT_EQ(store.querySummary(summary), ScanResult::Ok);
+
+  EXPECT_EQ(summary.bookCount, 2u);
+  EXPECT_EQ(summary.totalSeconds, 1300u);
+  EXPECT_TRUE(std::filesystem::exists(path_));
+}
+
+TEST_F(StoreTest, SessionAfterAnInterruptedSwapKeepsTheHistory) {
+  std::ofstream(path_ + ".tmp", std::ios::binary) << kFile;
+  ReadingStatsStore store(path_);
+
+  ASSERT_EQ(store.recordSession("a", "Book A", "X", 200, 2, 30, kNoon), ReadingStatsStore::WriteResult::Done);
+
+  ReadingStatsFile::Summary summary;
+  ASSERT_EQ(store.querySummary(summary), ScanResult::Ok);
+  EXPECT_EQ(summary.bookCount, 2u);
+  EXPECT_EQ(summary.totalSeconds, 1500u);
+}
+
+TEST_F(StoreTest, ACutShortTemporaryFileIsNotTakenForTheHistory) {
+  std::ofstream(path_ + ".tmp", std::ios::binary) << kFile.substr(0, kFile.size() / 2);
+  ReadingStatsStore store(path_);
+
+  ReadingStatsFile::Summary summary;
+  ASSERT_EQ(store.querySummary(summary), ScanResult::Ok);
+
+  EXPECT_EQ(summary.bookCount, 0u);
+  EXPECT_FALSE(std::filesystem::exists(path_));
+}

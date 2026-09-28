@@ -32,6 +32,24 @@ std::string asidePathFor(const std::string& path) {
   return path + ".corrupt";
 }
 
+// A swap interrupted between removing the old file and renaming the verified new one into place
+// (power lost at the session end) leaves only the temporary file, and it holds the whole history.
+// Put it back before anything reads the history, or the next write would start an empty one over
+// it. A temporary file that does not read back is a write cut short, never taken for the history.
+void recoverInterruptedSwap(const std::string& path) {
+  const std::string tmpPath = path + ".tmp";
+  if (Storage.exists(path.c_str()) || !Storage.exists(tmpPath.c_str())) return;
+  {
+    FsFile in;
+    if (!Storage.openFileForRead("RST", tmpPath.c_str(), in)) return;
+    ReadingStatsFile::Summary check;
+    if (ReadingStatsFile::scan(in, check, ReadingStatsFile::ScanRequest{}) != ReadingStatsFile::ScanResult::Ok) return;
+  }
+  if (Storage.rename(tmpPath.c_str(), path.c_str())) {
+    LOG_ERR("RST", "Recovered the history from %s after an interrupted swap", tmpPath.c_str());
+  }
+}
+
 std::string parentDirOf(const std::string& path) {
   const size_t slash = path.find_last_of('/');
   return slash == std::string::npos || slash == 0 ? std::string("/") : path.substr(0, slash);
@@ -284,8 +302,9 @@ ReadingStatsStore::WriteResult ReadingStatsStore::write(
   request.findDocId = docId;
   request.wantVictim = edit != Edit::Remove;
   ReadingStatsFile::Summary summary;
-  bool haveInput = Storage.exists(path_.c_str());
   const auto result = scanFile(request, summary);
+  // After the scan: it may have recovered the file from an interrupted swap.
+  bool haveInput = Storage.exists(path_.c_str());
   if (result == ReadingStatsFile::ScanResult::NoMemory) return WriteResult::NoMemory;
   if (result == ReadingStatsFile::ScanResult::IoError) return WriteResult::Failed;
   // A removal has nothing to remove from an unreadable file; only a write that adds reading starts
@@ -405,6 +424,7 @@ void ReadingStatsStore::forgetRecent(const std::string& docId) {
 ReadingStatsFile::ScanResult ReadingStatsStore::scanFile(const ReadingStatsFile::ScanRequest& request,
                                                          ReadingStatsFile::Summary& summary) const {
   summary = ReadingStatsFile::Summary{};
+  recoverInterruptedSwap(path_);
   const auto emptyHistory = [&]() {
     for (const auto& id : request.recentDocIds) {
       ReadingStatsFile::RecentSnapshot unknown;
