@@ -358,7 +358,10 @@ bool ReadingStatsStore::saveToFile() const {
       return false;
     }
   }
-  return swapIn(path_, tmpPath);
+  if (!swapIn(path_, tmpPath)) return false;
+  // Until the writes keep the cache current themselves, a write empties it.
+  const_cast<ReadingStatsStore*>(this)->invalidateRecent();
+  return true;
 }
 
 ReadingStatsStore::FileRemoval ReadingStatsStore::removeBookFromFile(const std::string& docId) {
@@ -392,7 +395,9 @@ ReadingStatsStore::FileRemoval ReadingStatsStore::removeBookFromFile(const std::
     Storage.remove(tmpPath.c_str());
     return FileRemoval::Failed;
   }
-  return swapIn(path_, tmpPath) ? FileRemoval::Removed : FileRemoval::Failed;
+  if (!swapIn(path_, tmpPath)) return FileRemoval::Failed;
+  invalidateRecent();
+  return FileRemoval::Removed;
 }
 
 bool ReadingStatsStore::loadFromFile() {

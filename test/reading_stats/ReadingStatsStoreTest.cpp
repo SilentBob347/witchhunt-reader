@@ -152,3 +152,14 @@ TEST_F(StoreTest, CacheIsBounded) {
   for (const auto& id : many) cached += store.recent(id) != nullptr ? 1 : 0;
   EXPECT_LE(cached + 1, ReadingStatsStore::kRecentCacheSize);
 }
+
+TEST_F(StoreTest, ARemovalDropsTheCachedFigures) {
+  writeFile(kFile);
+  ReadingStatsStore store(path_);
+  store.prefetchRecent({"a"});
+  ASSERT_NE(store.recent("a"), nullptr);
+
+  ASSERT_EQ(store.removeBookFromFile("a"), ReadingStatsStore::FileRemoval::Removed);
+
+  EXPECT_EQ(store.recent("a"), nullptr);
+}
