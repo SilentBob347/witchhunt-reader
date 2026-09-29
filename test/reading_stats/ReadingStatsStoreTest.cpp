@@ -63,6 +63,28 @@ uint32_t seqOfCopy(const std::string& bytes, const size_t copy) {
   return p[0] | p[1] << 8 | p[2] << 16 | static_cast<uint32_t>(p[3]) << 24;
 }
 
+// A history as older firmware wrote it: byte for byte what the device's JSON writer produces, so an
+// import followed by an export gives it back.
+std::string legacyBookA() {
+  return R"({"docId":")" + id(1) +
+         R"(","title":"Book A","author":"X","totalSeconds":1000,"pagesTurned":17,"sessions":2,)"
+         R"("firstReadEpoch":0,"lastReadEpoch":0,"progress":25,"finishedCount":0,"lastFinishedEpoch":0,)"
+         R"("finished":false,"days":[[20463,600],[20464,400]]})";
+}
+
+std::string legacyBookB() {
+  return R"({"docId":")" + id(2) +
+         R"(","title":"B","author":"","totalSeconds":300,"pagesTurned":5,"sessions":1,"firstReadEpoch":0,)"
+         R"("lastReadEpoch":0,"progress":40,"finishedCount":1,"lastFinishedEpoch":0,"finished":true,)"
+         R"("days":[[20463,300]]})";
+}
+
+std::string legacyFile() {
+  return R"({"totalSeconds":1300,"totalSessions":3,"totalPagesTurned":22,"longestStreak":2,)"
+         R"("globalDays":[[20463,900],[20464,400]],"books":[)" +
+         legacyBookA() + "," + legacyBookB() + "]}";
+}
+
 class StoreTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -465,16 +487,6 @@ TEST_F(StoreTest, StaleTemporaryFileIsDiscarded) {
   EXPECT_EQ(summaryOf(store).bookCount, 1u);
 }
 
-TEST_F(StoreTest, LegacyHistoryIsLeftAloneUntilImported) {
-  writeBytes(legacy_, "{}");
-  ReadingStatsStore store(path_, legacy_);
-
-  EXPECT_EQ(store.recordSession(id(1), "A", "", 60, 1, 1, kNoon), WriteResult::Failed);
-
-  EXPECT_FALSE(std::filesystem::exists(path_));
-  EXPECT_EQ(readBytes(legacy_), "{}");
-}
-
 TEST_F(StoreTest, DashboardGivesEveryBookItsTimeToFinish) {
   ReadingStatsStore store(path_, legacy_);
   ASSERT_NO_FATAL_FAILURE(twoBooks(store));
@@ -521,4 +533,138 @@ TEST_F(StoreTest, ExportOfNoHistoryIsAnEmptyFile) {
 
   EXPECT_EQ(out.text, R"({"totalSeconds":0,"totalSessions":0,"totalPagesTurned":0,"longestStreak":0,)"
                       R"("globalDays":[],"books":[]})");
+}
+
+TEST_F(StoreTest, ImportsTheLegacyHistoryOnFirstUse) {
+  writeBytes(legacy_, legacyFile());
+  ReadingStatsStore store(path_, legacy_);
+
+  const auto summary = summaryOf(store);
+
+  EXPECT_EQ(summary.bookCount, 2u);
+  EXPECT_EQ(summary.totalSeconds, 1300u);
+  EXPECT_EQ(summary.totalSessions, 3u);
+  EXPECT_EQ(summary.longestStreak, 2);
+  EXPECT_EQ(summary.globalDays.size(), 2u);
+  EXPECT_EQ(summary.finishedBookCount, 1u);
+  const auto a = bookOf(store, id(1));
+  ASSERT_TRUE(a.found);
+  EXPECT_EQ(a.book.title, "Book A");
+  EXPECT_EQ(a.book.days.size(), 2u);
+  EXPECT_TRUE(std::filesystem::exists(path_));
+  EXPECT_FALSE(std::filesystem::exists(legacy_));
+  EXPECT_EQ(readBytes(legacy_ + ".imported"), legacyFile());
+}
+
+TEST_F(StoreTest, ImportThenExportGivesTheFileBack) {
+  writeBytes(legacy_, legacyFile());
+  ReadingStatsStore store(path_, legacy_);
+  StringPrint out;
+
+  ASSERT_EQ(store.writeExport(out), ReadResult::Ok);
+
+  EXPECT_EQ(out.text, legacyFile());
+}
+
+TEST_F(StoreTest, FirstSessionAfterTheUpdateImportsFirst) {
+  writeBytes(legacy_, legacyFile());
+  ReadingStatsStore store(path_, legacy_);
+
+  ASSERT_EQ(store.recordSession(id(2), "B", "", 150, 3, 50, kNoon), WriteResult::Done);
+
+  const auto summary = summaryOf(store);
+  EXPECT_EQ(summary.bookCount, 2u);
+  EXPECT_EQ(summary.totalSeconds, 1450u);
+  EXPECT_EQ(bookOf(store, id(2)).book.totalSeconds, 450u);
+  EXPECT_EQ(bookOf(store, id(1)).book.totalSeconds, 1000u);
+}
+
+TEST_F(StoreTest, ImportSkipsBadAndDuplicateDocIds) {
+  const std::string bad = R"({"docId":"a","title":"Bad","totalSeconds":5,"days":[]})";
+  const std::string again = R"({"docId":")" + id(1) + R"(","title":"Again","totalSeconds":999,"days":[]})";
+  writeBytes(legacy_,
+             R"({"totalSeconds":2004,"totalSessions":4,"books":[)" + bad + "," + legacyBookA() + "," + again + "]}");
+  ReadingStatsStore store(path_, legacy_);
+
+  const auto summary = summaryOf(store);
+
+  EXPECT_EQ(summary.bookCount, 1u);
+  EXPECT_EQ(summary.totalSeconds, 2004u);  // the header's figures stand, as with an eviction
+  const auto a = bookOf(store, id(1));
+  EXPECT_EQ(a.book.title, "Book A");
+  EXPECT_EQ(a.book.totalSeconds, 1000u);
+}
+
+TEST_F(StoreTest, ImportKeepsTheBooksTheCapWouldKeep) {
+  std::string books;
+  for (unsigned i = 0; i <= ReadingStatsStore::kMaxBooks; ++i) {
+    if (i > 0) books += ",";
+    const long long lastRead = i == 7 ? 5 : 1000 + static_cast<long long>(i);
+    books += R"({"docId":")" + id(i) + R"(","totalSeconds":60,"lastReadEpoch":)" + std::to_string(lastRead) +
+             R"(,"days":[]})";
+  }
+  writeBytes(legacy_, R"({"totalSeconds":6060,"books":[)" + books + "]}");
+  ReadingStatsStore store(path_, legacy_);
+
+  const auto summary = summaryOf(store);
+
+  EXPECT_EQ(summary.bookCount, ReadingStatsStore::kMaxBooks);
+  EXPECT_FALSE(bookOf(store, id(7)).found);
+  EXPECT_TRUE(bookOf(store, id(ReadingStatsStore::kMaxBooks)).found);
+}
+
+TEST_F(StoreTest, MalformedLegacyIsSetAsideAndAFreshHistoryStarts) {
+  const std::string broken = R"({"totalSeconds":12,"books":[{"docId":)";
+  writeBytes(legacy_, broken);
+  ReadingStatsStore store(path_, legacy_);
+
+  EXPECT_EQ(summaryOf(store).bookCount, 0u);
+  EXPECT_EQ(readBytes((dir_ / "reading-stats.corrupt.json").generic_string()), broken);
+
+  ASSERT_EQ(store.recordSession(id(1), "A", "", 60, 1, 1, kNoon), WriteResult::Done);
+  EXPECT_EQ(summaryOf(store).bookCount, 1u);
+}
+
+TEST_F(StoreTest, InterruptedImportIsRedone) {
+  writeBytes(legacy_, legacyFile());
+  writeBytes(path_ + ".tmp", "half an import");
+  ReadingStatsStore store(path_, legacy_);
+
+  EXPECT_EQ(summaryOf(store).bookCount, 2u);
+
+  EXPECT_FALSE(std::filesystem::exists(path_ + ".tmp"));
+}
+
+TEST_F(StoreTest, ZeroByteLegacyIsAnEmptyHistory) {
+  writeBytes(legacy_, "");
+  ReadingStatsStore store(path_, legacy_);
+
+  EXPECT_EQ(summaryOf(store).bookCount, 0u);
+
+  ASSERT_EQ(store.recordSession(id(1), "A", "", 60, 1, 1, kNoon), WriteResult::Done);
+  EXPECT_EQ(summaryOf(store).bookCount, 1u);
+}
+
+TEST_F(StoreTest, LegacyBesideAHistoryFileIsIgnored) {
+  {
+    ReadingStatsStore first(path_, legacy_);
+    ASSERT_EQ(first.recordSession(id(5), "E", "", 60, 1, 1, kNoon), WriteResult::Done);
+  }
+  writeBytes(legacy_, legacyFile());
+  ReadingStatsStore store(path_, legacy_);
+
+  const auto summary = summaryOf(store);
+
+  EXPECT_EQ(summary.bookCount, 1u);
+  EXPECT_TRUE(bookOf(store, id(5)).found);
+  EXPECT_EQ(readBytes(legacy_), legacyFile());
+}
+
+TEST_F(StoreTest, LongLegacyTitleIsCut) {
+  const std::string book =
+      R"({"docId":")" + id(1) + R"(","title":")" + std::string(400, 'x') + R"(","totalSeconds":60,"days":[]})";
+  writeBytes(legacy_, R"({"totalSeconds":60,"books":[)" + book + "]}");
+  ReadingStatsStore store(path_, legacy_);
+
+  EXPECT_EQ(bookOf(store, id(1)).book.title, std::string(ReadingStatsSlotFile::kTitleMax, 'x'));
 }

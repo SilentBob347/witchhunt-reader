@@ -185,6 +185,12 @@ class ReadingStatsStore {
   // A new, empty history file, written as a temporary file and renamed into place, so a card never
   // holds half of one. Leaves `meta` as written: empty, seq 1, in copy A.
   bool createFresh(ReadingStatsSlotFile::Meta& meta);
+  // The reading-stats.json of older firmware, into a new history file: once, on the first call
+  // that finds no history file beside it. The JSON is only read, then renamed *.imported.
+  ReadResult importLegacy();
+  // Writes the legacy books into a new file at `tmpPath`, one slot each in file order, then the
+  // meta into copy A, and reads the meta back.
+  ReadResult writeImport(FsFile& in, ReadingStatsFile::Summary& legacy, const std::string& tmpPath, size_t& imported);
   // Both web payloads: the head from the meta, then every book from its slot.
   ReadResult writeJson(Print& out, uint16_t today, bool dashboard);
 

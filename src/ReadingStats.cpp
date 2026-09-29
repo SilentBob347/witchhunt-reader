@@ -333,6 +333,35 @@ size_t victimOf(const Meta& meta) {
   return victim;
 }
 
+// More books than the cap (only a hand-made file has them): keep the ones the cap would keep.
+ReadingStatsStore::ReadResult keepTheCapsBooks(FsFile& in, std::vector<ReadingStatsFile::IndexEntry>& entries) {
+  struct Key {
+    time_t lastRead;
+    uint32_t seconds;
+    uint32_t offset;
+  };
+  std::vector<Key> keys;
+  keys.reserve(entries.size());
+  for (const auto& at : entries) {
+    BookReadingStats book;
+    if (ReadingStatsFile::readBookAt(in, at.offset, book) != ReadingStatsFile::ScanResult::Ok) {
+      return ReadingStatsStore::ReadResult::IoError;
+    }
+    keys.push_back({book.lastReadEpoch, book.totalSeconds, at.offset});
+  }
+  std::stable_sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) {
+    return ReadingStatsStore::evictsBefore(a.lastRead, a.seconds, b.lastRead, b.seconds);
+  });
+  std::vector<uint32_t> gone;
+  for (size_t i = 0; i + ReadingStatsStore::kMaxBooks < keys.size(); ++i) gone.push_back(keys[i].offset);
+  entries.erase(std::remove_if(entries.begin(), entries.end(),
+                               [&gone](const ReadingStatsFile::IndexEntry& e) {
+                                 return std::find(gone.begin(), gone.end(), e.offset) != gone.end();
+                               }),
+                entries.end());
+  return ReadingStatsStore::ReadResult::Ok;
+}
+
 }  // namespace
 
 // ---- Updates ----------------------------------------------------------------------------------
@@ -478,10 +507,8 @@ ReadingStatsStore::ReadResult ReadingStatsStore::prepare() {
   const std::string tmpPath = path_ + ".tmp";
   if (Storage.exists(tmpPath.c_str())) Storage.remove(tmpPath.c_str());
   if (!Storage.exists(path_.c_str()) && Storage.exists(legacyPath_.c_str())) {
-    // Not imported yet (the import comes with the next task): nothing may start a history beside
-    // the old one, or the import would never run.
-    LOG_ERR("RST", "%s is not imported yet; the history is left as is", legacyPath_.c_str());
-    return ReadResult::IoError;
+    const ReadResult imported = importLegacy();
+    if (imported != ReadResult::Ok) return imported;
   }
   prepared_ = true;
   return ReadResult::Ok;
@@ -522,6 +549,101 @@ bool ReadingStatsStore::createFresh(Meta& meta) {
     return false;
   }
   return true;
+}
+
+ReadingStatsStore::ReadResult ReadingStatsStore::importLegacy() {
+  [[maybe_unused]] const uint32_t started = millis();
+  const std::string tmpPath = path_ + ".tmp";
+  bool malformed = false;
+  size_t imported = 0;
+  {
+    FsFile in;
+    if (!Storage.openFileForRead("RST", legacyPath_.c_str(), in)) return ReadResult::IoError;
+    ReadingStatsFile::Summary legacy;
+    if (in.size() > 0) {  // a zero-byte file is an empty history, as it always was
+      ReadingStatsFile::ScanRequest request;
+      request.wantIndex = true;
+      const auto scanned = ReadingStatsFile::scan(in, legacy, request);
+      if (scanned == ReadingStatsFile::ScanResult::NoMemory) return ReadResult::NoMemory;
+      if (scanned == ReadingStatsFile::ScanResult::IoError) return ReadResult::IoError;
+      malformed = scanned == ReadingStatsFile::ScanResult::Malformed;
+    }
+    if (!malformed) {
+      const ReadResult written = writeImport(in, legacy, tmpPath, imported);
+      if (written != ReadResult::Ok) {
+        Storage.remove(tmpPath.c_str());
+        return written;
+      }
+    }
+  }
+  if (malformed) {
+    // As the JSON loader always did: set it aside, and the history starts afresh.
+    return setAside(legacyPath_) ? ReadResult::Ok : ReadResult::IoError;
+  }
+  if (!Storage.rename(tmpPath.c_str(), path_.c_str())) {
+    Storage.remove(tmpPath.c_str());
+    return ReadResult::IoError;
+  }
+  const std::string done = legacyPath_ + ".imported";
+  Storage.remove(done.c_str());
+  if (!Storage.rename(legacyPath_.c_str(), done.c_str())) {
+    LOG_ERR("RST", "Imported, but %s could not be renamed; it is ignored from now on", legacyPath_.c_str());
+  }
+  LOG_INF("RST", "Imported %u books from %s in %lu ms", static_cast<unsigned>(imported), legacyPath_.c_str(),
+          static_cast<unsigned long>(millis() - started));
+  return ReadResult::Ok;
+}
+
+ReadingStatsStore::ReadResult ReadingStatsStore::writeImport(FsFile& in, ReadingStatsFile::Summary& legacy,
+                                                             const std::string& tmpPath, size_t& imported) {
+  imported = 0;
+  // File order, not time order: an import followed by an export gives the file back.
+  std::stable_sort(
+      legacy.byTime.begin(), legacy.byTime.end(),
+      [](const ReadingStatsFile::IndexEntry& a, const ReadingStatsFile::IndexEntry& b) { return a.offset < b.offset; });
+  if (legacy.byTime.size() > kMaxBooks) {
+    const ReadResult kept = keepTheCapsBooks(in, legacy.byTime);
+    if (kept != ReadResult::Ok) return kept;
+  }
+  auto meta = Meta::create();
+  auto image = makeUniqueNoThrow<uint8_t[]>(kSlotSize);
+  if (!meta || !image) return ReadResult::NoMemory;
+  if (!meta->writeTotals(legacy)) return ReadResult::IoError;  // the scan trimmed the days to the cap
+  Storage.mkdir(parentDirOf(path_).c_str());
+  if (!ReadingStatsSlotFile::createZeroed(tmpPath.c_str())) return ReadResult::IoError;
+  FsFile out;
+  if (!Storage.openFileForUpdate("RST", tmpPath.c_str(), out)) return ReadResult::IoError;
+  for (const auto& at : legacy.byTime) {
+    if (imported == kEntryCount) break;
+    BookReadingStats book;
+    const auto read = ReadingStatsFile::readBookAt(in, at.offset, book);
+    if (read == ReadingStatsFile::ScanResult::NoMemory) return ReadResult::NoMemory;
+    if (read != ReadingStatsFile::ScanResult::Ok) return ReadResult::IoError;
+    DocKey key{};
+    if (!ReadingStatsSlotFile::parseDocId(book.docId, key)) {
+      LOG_ERR("RST", "Import: '%s' is not a document id; skipped", book.docId.c_str());
+      continue;
+    }
+    if (meta->find(key) != kEntryCount) {
+      LOG_ERR("RST", "Import: %s appears twice; the first kept", book.docId.c_str());
+      continue;
+    }
+    const auto slot = static_cast<uint8_t>(imported);
+    ReadingStatsSlotFile::encodeSlot(key, book, image.get());
+    if (!ReadingStatsSlotFile::writeSlot(out, slot, image.get())) return ReadResult::IoError;
+    meta->setEntry(imported, ReadingStatsSlotFile::entryFor(key, book, slot));
+    ++imported;
+  }
+  meta->setSeq(1);
+  meta->seal();
+  if (!ReadingStatsSlotFile::writeMeta(out, *meta, 0)) return ReadResult::IoError;
+  out.flush();
+  uint8_t live = kNoCopy;
+  if (ReadingStatsSlotFile::loadMeta(out, *meta, live) != Load::Ok || meta->bookCount() != imported) {
+    LOG_ERR("RST", "Import did not read back; %s left as is", legacyPath_.c_str());
+    return ReadResult::IoError;
+  }
+  return ReadResult::Ok;
 }
 
 // ---- Queries ----------------------------------------------------------------------------------
