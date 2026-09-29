@@ -253,6 +253,9 @@ class EpubReaderActivity final : public Activity {
   // on the loop task without the render lock, so a turn arriving mid-render advances
   // currentPage before the summary is emitted and the render gets labelled with the page it is
   // about to be replaced by — which reads as the same page rendering twice.
+  // The spine completes the identity for the Background-A re-arm, which may only retry the
+  // pre-render of the page on screen (see stepBackgroundSectionBuild).
+  int lastRenderedSpineIndex_ = -1;
   int lastRenderedPageIndex_ = 0;
   int lastRenderedPageCount_ = 0;
   // True when secondary display buffer allocation failed; while set we prefer
