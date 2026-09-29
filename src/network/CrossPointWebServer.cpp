@@ -676,7 +676,8 @@ void CrossPointWebServer::handleStatsApi() const {
 }
 
 // Body: {"docId": "..."}. Same removal as the device's per-book stats screen: the book's entry goes
-// and its time comes back out of the totals. Streamed through the file like the dashboard.
+// and its time comes back out of the totals: the store frees its directory entry and rewrites the
+// global figures, copy-on-write.
 void CrossPointWebServer::handleStatsRemove() const {
   if (rejectIfLowMemory(server.get())) return;
   JsonDocument req;
