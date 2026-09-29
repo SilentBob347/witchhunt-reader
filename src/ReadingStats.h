@@ -84,6 +84,21 @@ class ReadingStatsStore {
   void markFinished(const std::string& docId, const std::string& title, const std::string& author,
                     time_t walltimeEpoch);
 
+  // Forget one book: its entry goes, and its time, sessions, pages and day buckets come back out of
+  // the global aggregates, so the stats read as if it had never been read. Exact for everything
+  // the screens show — a book keeps its newest kMaxBookDays buckets, which always cover the 30-day
+  // sparkline and the current streak. The persisted longest-streak record stays: it is a number,
+  // not something the book can be subtracted from. Returns false for an unknown docId. Caller
+  // saves.
+  bool removeBook(const std::string& docId);
+
+  // removeBook() + saveToFile() for a caller that cannot afford to load the history: the web server,
+  // running next to Wi-Fi. Streams the file instead (ReadingStatsFile), and swaps the result in only
+  // once it reads back as the same history less that one book. Works on the store itself when it is
+  // loaded, so the two can never disagree.
+  enum class FileRemoval : uint8_t { Removed, NotFound, Failed };
+  FileRemoval removeBookFromFile(const std::string& docId);
+
   // Lookup by document hash; returns nullptr if unknown.
   const BookReadingStats* findBook(const std::string& docId) const;
 
@@ -107,6 +122,29 @@ class ReadingStatsStore {
   // Uses the per-book rate when available, else the global average. Returns
   // 0 when no rate is available or when remainingPercent <= 0.
   uint32_t estimateRemainingSeconds(const std::string& docId, float remainingPercent) const;
+
+  // ---- The arithmetic behind the methods, on plain data -----------------------
+  //
+  // Shared with ReadingStatsFile, which streams the file for the web server instead of loading it,
+  // so the dashboard and the device agree on every figure.
+  static uint32_t secondsOn(const std::vector<DayBucket>& days, uint16_t dayIndex);
+  static uint16_t currentStreakIn(const std::vector<DayBucket>& days, uint16_t today);
+  // The longest run in `days`, or the persisted `record` when that is longer.
+  static uint16_t longestStreakIn(const std::vector<DayBucket>& days, uint16_t record);
+  static bool countsTowardPace(const uint8_t progress) { return progress >= MIN_BOOK_PROGRESS_FOR_PERSONAL_RATE; }
+  // The global pace from the sums over the books that count toward it; 0 below
+  // MIN_GLOBAL_SECONDS_FOR_RATE of reading overall.
+  static float pooledSecondsPerPercent(uint32_t globalTotalSeconds, uint32_t countedSeconds, uint32_t countedPercents);
+  // A book's own pace, or 0 when it has not covered enough ground to have one.
+  static float ownSecondsPerPercent(uint32_t totalSeconds, uint8_t progress);
+  static uint32_t etaSeconds(float secondsPerPercent, float remainingPercent);
+  // Past the caps, the oldest buckets go; the global trim first folds the streak they held into
+  // `record`, since the record may live in them.
+  static void trimGlobalDays(std::vector<DayBucket>& days, uint16_t& record);
+  static void trimBookDays(std::vector<DayBucket>& days);
+  // Takes one book's contribution back out of the global aggregates (removeBook()'s arithmetic).
+  static void takeOut(const BookReadingStats& book, uint32_t& totalSeconds, uint32_t& totalSessions,
+                      uint32_t& totalPagesTurned, std::vector<DayBucket>& globalDays);
 
   const std::vector<BookReadingStats>& getBooks() const { return books; }
   // Bounds (memory audit 2026-09, R8). The store used to grow without limit -- an entry per

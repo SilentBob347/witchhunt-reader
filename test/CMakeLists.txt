@@ -174,3 +174,4 @@ add_subdirectory(gray8_writer)
 add_subdirectory(glyph_fallback)
 # After zip_entry_reader: reuses its inflate_reader_host target and HalStorage shim.
 add_subdirectory(dictionary)
+add_subdirectory(reading_stats)

@@ -1,5 +1,6 @@
 #include "ReadingStats.h"
 
+#include <BufferedPrint.h>
 #include <HalClock.h>
 #include <HalStorage.h>
 #include <JsonSettingsIO.h>
@@ -8,8 +9,29 @@
 #include <algorithm>
 #include <ctime>
 
+#include "ReadingStatsFile.h"
+
 namespace {
-constexpr char READING_STATS_FILE[] = "/.crosspoint/reading-stats.json";
+constexpr const char* READING_STATS_FILE = ReadingStatsFile::kPath;
+
+// Puts a finished temporary file in place of the store's file.
+bool swapIn(const std::string& tmpPath) {
+  Storage.remove(READING_STATS_FILE);
+  if (!Storage.rename(tmpPath.c_str(), READING_STATS_FILE)) {
+    LOG_ERR("RST", "Could not rename %s into place", tmpPath.c_str());
+    return false;
+  }
+  return true;
+}
+
+// The streamed removal's safety check: the new file has to parse, must not hold the book, and must
+// still hold every other one.
+bool readsBackWithout(const std::string& path, const std::string& docId, const uint32_t expectedBooks) {
+  FsFile in;
+  if (!Storage.openFileForRead("RST", path.c_str(), in)) return false;
+  ReadingStatsFile::Summary check;
+  return ReadingStatsFile::summarize(in, check, docId) && !check.found && check.bookCount == expectedBooks;
+}
 
 // Add `seconds` to the bucket for `dayIndex` in `days`, inserting in sorted
 // position if absent. dayIndex == 0 ("unknown day") is silently skipped here —
@@ -26,6 +48,19 @@ void mergeDay(std::vector<DayBucket>& days, uint16_t dayIndex, uint32_t seconds,
   }
   // Sorted ascending, so the oldest buckets are at the front.
   if (days.size() > maxDays) days.erase(days.begin(), days.begin() + static_cast<long>(days.size() - maxDays));
+}
+
+// Take `seconds` back out of the bucket for `dayIndex`, dropping the bucket once it is empty: an
+// empty bucket would still count as a reading day in the longest-streak walk.
+void unmergeDay(std::vector<DayBucket>& days, const uint16_t dayIndex, const uint32_t seconds) {
+  auto it = std::lower_bound(days.begin(), days.end(), dayIndex,
+                             [](const DayBucket& b, uint16_t v) { return b.dayIndex < v; });
+  if (it == days.end() || it->dayIndex != dayIndex) return;
+  if (it->seconds > seconds) {
+    it->seconds -= seconds;
+  } else {
+    days.erase(it);
+  }
 }
 
 // Length of the run of consecutive reading days that ends on `day`, from a sorted day map.
@@ -136,25 +171,25 @@ void ReadingStatsStore::recordSession(const std::string& docId, const std::strin
   globalTotalPagesTurned += sessionPagesTurned;
 }
 
-uint32_t ReadingStatsStore::getSecondsForDay(uint16_t dayIndex) const {
+uint32_t ReadingStatsStore::secondsOn(const std::vector<DayBucket>& days, const uint16_t dayIndex) {
   if (dayIndex == 0) return 0;
-  auto it = std::lower_bound(globalDays.begin(), globalDays.end(), dayIndex,
+  auto it = std::lower_bound(days.begin(), days.end(), dayIndex,
                              [](const DayBucket& b, uint16_t v) { return b.dayIndex < v; });
-  if (it != globalDays.end() && it->dayIndex == dayIndex) return it->seconds;
+  if (it != days.end() && it->dayIndex == dayIndex) return it->seconds;
   return 0;
 }
 
-uint16_t ReadingStatsStore::computeCurrentStreak(uint16_t today) const {
-  if (today == 0 || globalDays.empty()) return 0;
+uint16_t ReadingStatsStore::currentStreakIn(const std::vector<DayBucket>& days, const uint16_t today) {
+  if (today == 0 || days.empty()) return 0;
   // 1-day grace: if there's no reading today, the streak may still end at
   // yesterday. After that the chain is broken.
   uint16_t anchor = today;
-  if (getSecondsForDay(anchor) == 0) {
+  if (secondsOn(days, anchor) == 0) {
     anchor -= 1;
-    if (getSecondsForDay(anchor) == 0) return 0;
+    if (secondsOn(days, anchor) == 0) return 0;
   }
   uint16_t streak = 0;
-  while (anchor > 0 && getSecondsForDay(anchor) > 0) {
+  while (anchor > 0 && secondsOn(days, anchor) > 0) {
     streak += 1;
     if (anchor == 1) break;
     anchor -= 1;
@@ -162,12 +197,12 @@ uint16_t ReadingStatsStore::computeCurrentStreak(uint16_t today) const {
   return streak;
 }
 
-uint16_t ReadingStatsStore::computeLongestStreak() const {
-  if (globalDays.empty()) return longestStreak_;
-  uint16_t longest = std::max<uint16_t>(1, longestStreak_);
+uint16_t ReadingStatsStore::longestStreakIn(const std::vector<DayBucket>& days, const uint16_t record) {
+  if (days.empty()) return record;
+  uint16_t longest = std::max<uint16_t>(1, record);
   uint16_t run = 1;
-  for (size_t i = 1; i < globalDays.size(); ++i) {
-    if (globalDays[i].dayIndex == globalDays[i - 1].dayIndex + 1) {
+  for (size_t i = 1; i < days.size(); ++i) {
+    if (days[i].dayIndex == days[i - 1].dayIndex + 1) {
       run += 1;
       if (run > longest) longest = run;
     } else {
@@ -176,6 +211,14 @@ uint16_t ReadingStatsStore::computeLongestStreak() const {
   }
   return longest;
 }
+
+uint32_t ReadingStatsStore::getSecondsForDay(const uint16_t dayIndex) const { return secondsOn(globalDays, dayIndex); }
+
+uint16_t ReadingStatsStore::computeCurrentStreak(const uint16_t today) const {
+  return currentStreakIn(globalDays, today);
+}
+
+uint16_t ReadingStatsStore::computeLongestStreak() const { return longestStreakIn(globalDays, longestStreak_); }
 
 void ReadingStatsStore::markFinished(const std::string& docId, const std::string& title, const std::string& author,
                                      time_t walltimeEpoch) {
@@ -200,6 +243,22 @@ void ReadingStatsStore::markFinished(const std::string& docId, const std::string
   }
 }
 
+void ReadingStatsStore::takeOut(const BookReadingStats& book, uint32_t& totalSeconds, uint32_t& totalSessions,
+                                uint32_t& totalPagesTurned, std::vector<DayBucket>& globalDays) {
+  totalSeconds -= std::min(totalSeconds, book.totalSeconds);
+  totalSessions -= std::min(totalSessions, book.sessions);
+  totalPagesTurned -= std::min(totalPagesTurned, book.pagesTurned);
+  for (const DayBucket& day : book.days) unmergeDay(globalDays, day.dayIndex, day.seconds);
+}
+
+bool ReadingStatsStore::removeBook(const std::string& docId) {
+  auto it = std::find_if(books.begin(), books.end(), [&docId](const BookReadingStats& b) { return b.docId == docId; });
+  if (it == books.end()) return false;
+  takeOut(*it, globalTotalSeconds, globalTotalSessions, globalTotalPagesTurned, globalDays);
+  books.erase(it);
+  return true;
+}
+
 size_t ReadingStatsStore::getFinishedBookCount() const {
   return static_cast<size_t>(
       std::count_if(books.begin(), books.end(), [](const BookReadingStats& b) { return b.finishedCount > 0; }));
@@ -210,8 +269,26 @@ const BookReadingStats* ReadingStatsStore::findBook(const std::string& docId) co
   return it == books.end() ? nullptr : &*it;
 }
 
-float ReadingStatsStore::globalAvgSecondsPerPercent() const {
+float ReadingStatsStore::pooledSecondsPerPercent(const uint32_t globalTotalSeconds, const uint32_t countedSeconds,
+                                                 const uint32_t countedPercents) {
   if (globalTotalSeconds < MIN_GLOBAL_SECONDS_FOR_RATE) return 0.0f;
+  if (countedPercents == 0 || countedSeconds == 0) return 0.0f;
+  return static_cast<float>(countedSeconds) / static_cast<float>(countedPercents);
+}
+
+float ReadingStatsStore::ownSecondsPerPercent(const uint32_t totalSeconds, const uint8_t progress) {
+  if (!countsTowardPace(progress) || totalSeconds == 0) return 0.0f;
+  return static_cast<float>(totalSeconds) / static_cast<float>(progress);
+}
+
+uint32_t ReadingStatsStore::etaSeconds(const float secondsPerPercent, float remainingPercent) {
+  if (remainingPercent <= 0.0f) return 0;
+  if (remainingPercent > 100.0f) remainingPercent = 100.0f;
+  if (secondsPerPercent <= 0.0f) return 0;
+  return static_cast<uint32_t>(remainingPercent * secondsPerPercent + 0.5f);
+}
+
+float ReadingStatsStore::globalAvgSecondsPerPercent() const {
   // Average over books that have actual progress recorded. A book at 0%
   // contributes time but no progress denominator and would skew the rate
   // toward infinity. Books with progress >= MIN_BOOK_PROGRESS_FOR_PERSONAL_RATE
@@ -219,28 +296,22 @@ float ReadingStatsStore::globalAvgSecondsPerPercent() const {
   uint32_t totalProgressPercents = 0;
   uint32_t totalSecondsFromCountedBooks = 0;
   for (const auto& b : books) {
-    if (b.progress < MIN_BOOK_PROGRESS_FOR_PERSONAL_RATE) continue;
+    if (!countsTowardPace(b.progress)) continue;
     totalProgressPercents += b.progress;
     totalSecondsFromCountedBooks += b.totalSeconds;
   }
-  if (totalProgressPercents == 0 || totalSecondsFromCountedBooks == 0) return 0.0f;
-  return static_cast<float>(totalSecondsFromCountedBooks) / static_cast<float>(totalProgressPercents);
+  return pooledSecondsPerPercent(globalTotalSeconds, totalSecondsFromCountedBooks, totalProgressPercents);
 }
 
 float ReadingStatsStore::avgSecondsPerPercent(const std::string& docId) const {
   const BookReadingStats* b = findBook(docId);
-  if (b && b->progress >= MIN_BOOK_PROGRESS_FOR_PERSONAL_RATE && b->totalSeconds > 0) {
-    return static_cast<float>(b->totalSeconds) / static_cast<float>(b->progress);
-  }
-  return globalAvgSecondsPerPercent();
+  const float own = b ? ownSecondsPerPercent(b->totalSeconds, b->progress) : 0.0f;
+  return own > 0.0f ? own : globalAvgSecondsPerPercent();
 }
 
-uint32_t ReadingStatsStore::estimateRemainingSeconds(const std::string& docId, float remainingPercent) const {
+uint32_t ReadingStatsStore::estimateRemainingSeconds(const std::string& docId, const float remainingPercent) const {
   if (remainingPercent <= 0.0f) return 0;
-  if (remainingPercent > 100.0f) remainingPercent = 100.0f;
-  const float rate = avgSecondsPerPercent(docId);
-  if (rate <= 0.0f) return 0;
-  return static_cast<uint32_t>(remainingPercent * rate + 0.5f);
+  return etaSeconds(avgSecondsPerPercent(docId), remainingPercent);
 }
 
 bool ReadingStatsStore::saveToFile() const {
@@ -262,12 +333,41 @@ bool ReadingStatsStore::saveToFile() const {
       return false;
     }
   }
-  Storage.remove(READING_STATS_FILE);
-  if (!Storage.rename(tmpPath.c_str(), READING_STATS_FILE)) {
-    LOG_ERR("RST", "saveToFile: could not rename %s into place", tmpPath.c_str());
-    return false;
+  return swapIn(tmpPath);
+}
+
+ReadingStatsStore::FileRemoval ReadingStatsStore::removeBookFromFile(const std::string& docId) {
+  if (loaded_) {
+    if (!removeBook(docId)) return FileRemoval::NotFound;
+    return saveToFile() ? FileRemoval::Removed : FileRemoval::Failed;
   }
-  return true;
+  if (!Storage.exists(READING_STATS_FILE)) return FileRemoval::NotFound;
+  const std::string tmpPath = std::string(READING_STATS_FILE) + ".tmp";
+  uint32_t booksLeft = 0;
+  bool written = false;
+  {
+    FsFile in;
+    if (!Storage.openFileForRead("RST", READING_STATS_FILE, in)) return FileRemoval::Failed;
+    ReadingStatsFile::Summary summary;
+    if (!ReadingStatsFile::summarize(in, summary, docId)) {
+      LOG_ERR("RST", "removeBookFromFile: history file unreadable; left as is");
+      return FileRemoval::Failed;
+    }
+    if (!summary.found) return FileRemoval::NotFound;
+    booksLeft = summary.bookCount - 1;
+    FsFile out;
+    if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return FileRemoval::Failed;
+    // The copy goes out a byte at a time; batch it into few SD calls.
+    BufferedPrint buffered(out, 1024);
+    ReadingStatsFile::writeWithoutTarget(in, summary, buffered);
+    written = buffered.flushBuffer();
+  }
+  if (!written || !readsBackWithout(tmpPath, docId, booksLeft)) {
+    LOG_ERR("RST", "removeBookFromFile: rewritten history did not read back; left as is");
+    Storage.remove(tmpPath.c_str());
+    return FileRemoval::Failed;
+  }
+  return swapIn(tmpPath) ? FileRemoval::Removed : FileRemoval::Failed;
 }
 
 bool ReadingStatsStore::loadFromFile() {
@@ -334,16 +434,20 @@ void ReadingStatsStore::replaceLoaded(std::vector<BookReadingStats>&& loadedBook
   globalTotalPagesTurned = totalPagesTurned;
   longestStreak_ = longestStreak;
   // Files written before the caps existed: trim once here, the next save persists it.
-  for (auto& book : books) {
-    if (book.days.size() > kMaxBookDays)
-      book.days.erase(book.days.begin(), book.days.begin() + static_cast<long>(book.days.size() - kMaxBookDays));
-  }
-  if (globalDays.size() > kMaxGlobalDays) {
-    // The record streak may live in the buckets about to go: measure before trimming.
-    const uint16_t scanned = computeLongestStreak();
-    if (scanned > longestStreak_) longestStreak_ = scanned;
-    globalDays.erase(globalDays.begin(), globalDays.begin() + static_cast<long>(globalDays.size() - kMaxGlobalDays));
-  }
+  for (auto& book : books) trimBookDays(book.days);
+  trimGlobalDays(globalDays, longestStreak_);
+}
+
+void ReadingStatsStore::trimBookDays(std::vector<DayBucket>& days) {
+  if (days.size() > kMaxBookDays)
+    days.erase(days.begin(), days.begin() + static_cast<long>(days.size() - kMaxBookDays));
+}
+
+void ReadingStatsStore::trimGlobalDays(std::vector<DayBucket>& days, uint16_t& record) {
+  if (days.size() <= kMaxGlobalDays) return;
+  // The record streak may live in the buckets about to go: measure before trimming.
+  record = longestStreakIn(days, record);
+  days.erase(days.begin(), days.begin() + static_cast<long>(days.size() - kMaxGlobalDays));
 }
 
 void ReadingStatsStore::release() {

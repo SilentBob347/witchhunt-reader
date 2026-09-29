@@ -9,6 +9,8 @@
 // that book's own day buckets. Constructed with the docId of the book to
 // display; resolved against ReadingStatsStore on each render so a session
 // that finishes while this screen is open updates the next time we redraw.
+// Confirm removes the book from the history (after a confirmation) and closes
+// the screen.
 class ReadingStatsBookDetailActivity final : public Activity {
  public:
   ReadingStatsBookDetailActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string docId)
@@ -23,4 +25,7 @@ class ReadingStatsBookDetailActivity final : public Activity {
   ReadingStatsStore::ScopedLoad statsLoad_;
 
   std::string docId;
+
+  bool canRemove() const;
+  void confirmRemove();
 };
