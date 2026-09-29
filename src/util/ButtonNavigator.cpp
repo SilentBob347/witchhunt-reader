@@ -347,6 +347,9 @@ void ButtonNavigator::onListNav(const Buttons& buttons, const bool forward, int&
   const bool resumed = press.count < lastSeenPressCount;  // drain() zeroed the log under us
   const uint16_t newPresses = resumed ? press.count : static_cast<uint16_t>(press.count - lastSeenPressCount);
   lastSeenPressCount = press.count;
+  // A drain with nothing pressed since is a resync, not a press. Without this, the first tick back
+  // on a list after a child activity closed stepped the selection once on its own (#342).
+  if (newPresses == 0) return;
 
   // Long press already fired: skip the press navigation — the jump-to-end already happened.
   if (longPressFired) return;
