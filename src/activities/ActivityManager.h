@@ -205,7 +205,11 @@ class ActivityManager {
   // True while the current activity owns the raw SD card (USB Drive). main.cpp
   // consults this to suspend its own loop work — see Activity::requiresExclusiveStorageLoop().
   bool requiresExclusiveStorageLoop() const;
+  // True while a reader is anywhere on the stack -- including under its own menu or TOC.
   bool isReaderActivity() const;
+  // True only while the reader itself is on top: the one case dispatchButtonAction() delivers a
+  // configured action. A list opened from the reader answers false here but true above.
+  bool currentIsReaderActivity() const;
   bool skipLoopDelay() const;
 
   // True while the current activity owns the raw serial input stream (see
