@@ -35,7 +35,7 @@ std::string formatEtaShort(uint32_t totalSeconds) {
 
 // The cached figures for a recent book (HomeActivity::onEnter() prefetched them), or null when the
 // book has no history. Never reads the card: this runs from the themes' render().
-const ReadingStatsFile::RecentSnapshot* historyOf(const RecentBook& book) {
+const ReadingStatsStore::RecentSnapshot* historyOf(const RecentBook& book) {
   const auto* snapshot = READING_STATS.recent(KOReaderDocumentId::calculateFromFilename(book.path));
   return snapshot != nullptr && snapshot->known ? snapshot : nullptr;
 }

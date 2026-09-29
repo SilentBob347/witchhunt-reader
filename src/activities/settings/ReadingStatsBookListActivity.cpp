@@ -35,12 +35,13 @@ std::string formatDuration(uint32_t totalSeconds) {
 }  // namespace
 
 void ReadingStatsBookListActivity::rebuildIndex() {
-  ReadingStatsFile::Summary summary;
-  if (READING_STATS.querySummary(summary, /*withIndex=*/true) != ReadingStatsFile::ScanResult::Ok) {
+  ReadingStatsStore::Summary summary;
+  if (READING_STATS.querySummary(summary, /*withIndex=*/true) != ReadingStatsStore::ReadResult::Ok) {
     summary.byTime.clear();
   }
   RenderLock lock(*this);
   index_ = std::move(summary.byTime);
+  indexSeq_ = summary.seq;
   rows_.clear();
   rowsFirst_ = 0;
   selectedIndex = std::min(selectedIndex, std::max(0, static_cast<int>(index_.size()) - 1));
@@ -56,21 +57,28 @@ int ReadingStatsBookListActivity::pageItems() const {
   return std::max(1, std::min(contentHeight / metrics.listWithSubtitleRowHeight, ListTouchBand::kMaxRows));
 }
 
+bool ReadingStatsBookListActivity::readRows(const int first, const int page,
+                                            std::vector<BookReadingStats>& rows) const {
+  const int last = std::min(first + page, static_cast<int>(index_.size()));
+  const auto count = static_cast<size_t>(std::max(0, last - first));
+  const auto result = READING_STATS.queryBooksAt(index_, static_cast<size_t>(first), count, indexSeq_, rows);
+  if (result == ReadingStatsStore::ReadResult::Stale) return false;
+  if (result != ReadingStatsStore::ReadResult::Ok) rows.assign(count, BookReadingStats{});
+  for (BookReadingStats& row : rows) row.days.clear();  // a row shows title, author, time and the finished mark
+  return true;
+}
+
 void ReadingStatsBookListActivity::ensureRowsFor(const int index) {
   if (index_.empty()) return;
   const int page = pageItems();
-  const int first = index / page * page;
+  int first = index / page * page;
   if (first == rowsFirst_ && !rows_.empty()) return;
-  const int last = std::min(first + page, static_cast<int>(index_.size()));
   std::vector<BookReadingStats> rows;
-  rows.reserve(static_cast<size_t>(last - first));
-  for (int i = first; i < last; ++i) {
-    BookReadingStats row;
-    if (READING_STATS.queryBookAt(index_[i].offset, row) != ReadingStatsFile::ScanResult::Ok) {
-      row = BookReadingStats{};
-    }
-    row.days.clear();  // a row shows title, author, time and the finished mark
-    rows.push_back(std::move(row));
+  if (!readRows(first, page, rows)) {
+    // The history changed under the list. Take the order again, once.
+    rebuildIndex();
+    first = selectedIndex / page * page;
+    if (!readRows(first, page, rows)) rows.clear();
   }
   RenderLock lock(*this);
   rows_ = std::move(rows);

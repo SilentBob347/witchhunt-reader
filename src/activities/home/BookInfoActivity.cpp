@@ -157,7 +157,7 @@ void BookInfoActivity::loadData() {
   if (loadSucceeded) {
     const std::string docId = KOReaderDocumentId::calculateFromFilename(filePath);
     ReadingStatsStore::BookQuery stats;
-    if (READING_STATS.queryBook(docId, stats) == ReadingStatsFile::ScanResult::Ok && stats.found) {
+    if (READING_STATS.queryBook(docId, stats) == ReadingStatsStore::ReadResult::Ok && stats.found) {
       hasReadingStats = stats.book.totalSeconds > 0 || stats.book.sessions > 0;
       statTotalSeconds = stats.book.totalSeconds;
       statProgress = stats.book.progress;

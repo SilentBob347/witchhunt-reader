@@ -23,7 +23,6 @@
 #include "HttpFileStreamer.h"
 #include "OpdsServerStore.h"
 #include "ReadingStats.h"
-#include "ReadingStatsFile.h"
 #include "SdCardFontGlobals.h"
 #include "SdCardFontRegistry.h"
 #include "SettingsList.h"
@@ -645,26 +644,24 @@ void CrossPointWebServer::handleStatsApi() const {
   // browser doesn't have to recreate the day-index math; the day arrays go across untouched so it
   // can render the sparkline.
   //
-  // Streamed from the file, never loaded: the store's full load plus a JSON document of the whole
-  // payload does not fit next to Wi-Fi once the history grows. ReadingStatsFile holds a parser and
-  // the global day buckets, and the books go through to the chunked response as stored.
-  FsFile file;
-  if (!Storage.exists(ReadingStatsFile::kPath) || !Storage.openFileForRead("WEB", ReadingStatsFile::kPath, file) ||
-      file.size() == 0) {
-    // No history yet (an absent or empty file, as for the loader).
-    server->send(200, "application/json", "{\"totalSeconds\":0,\"books\":[]}");
+  // Generated from the history file one book at a time, never loaded whole: the meta and one slot,
+  // whatever the history holds.
+  ReadingStatsStore::Summary summary;
+  if (READING_STATS.querySummary(summary) != ReadingStatsStore::ReadResult::Ok) {
+    server->send(500, "application/json", "{\"error\":\"Reading stats could not be read\"}");
     return;
   }
-  ReadingStatsFile::Summary summary;
-  if (!ReadingStatsFile::summarize(file, summary)) {
-    server->send(500, "application/json", "{\"error\":\"Reading stats could not be read\"}");
+  if (summary.bookCount == 0 && summary.totalSeconds == 0) {
+    server->send(200, "application/json", "{\"totalSeconds\":0,\"books\":[]}");  // no history yet
     return;
   }
   server->setContentLength(CONTENT_LENGTH_UNKNOWN);
   server->send(200, "application/json", "");
   ChunkedResponse response(server.get());
   ChunkedPrint out(response);
-  ReadingStatsFile::writeDashboard(file, summary, currentLocalDayIndex(), out);
+  if (READING_STATS.writeDashboard(out, currentLocalDayIndex()) != ReadingStatsStore::ReadResult::Ok) {
+    LOG_ERR("WEB", "Reading stats failed mid-response; dashboard truncated");
+  }
   response.finish();
   LOG_WEB_MEM("stats_api_exit");
 }
@@ -696,25 +693,27 @@ void CrossPointWebServer::handleStatsRemove() const {
 }
 
 void CrossPointWebServer::handleStatsExport() const {
-  // The raw stats file, streamed from SD -- the same shape the device writes and reads, so it
-  // round-trips cleanly through external tooling without a second schema.
-  FsFile file;
-  if (!Storage.exists(ReadingStatsFile::kPath)) {
-    server->send(404, "application/json", "{}");
-    return;
-  }
-  if (!Storage.openFileForRead("WEB", ReadingStatsFile::kPath, file)) {
+  if (rejectIfLowMemory(server.get())) return;
+  // The reading-stats.json format older firmware reads, generated from the history file: the
+  // backup, and the way back after a downgrade.
+  ReadingStatsStore::Summary summary;
+  if (READING_STATS.querySummary(summary) != ReadingStatsStore::ReadResult::Ok) {
     server->send(500, "application/json", "{}");
     return;
   }
-  server->setContentLength(file.size());
+  if (summary.bookCount == 0 && summary.totalSeconds == 0) {
+    server->send(404, "application/json", "{}");
+    return;
+  }
+  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
   server->sendHeader("Content-Disposition", "attachment; filename=\"reading-stats.json\"");
   server->send(200, "application/json", "");
-  NetworkClient client = server->client();
-  if (!HttpFileStreamer::streamFileToClient(file, client)) {
-    LOG_DBG("WEB", "Stats export interrupted while streaming");
+  ChunkedResponse response(server.get());
+  ChunkedPrint out(response);
+  if (READING_STATS.writeExport(out) != ReadingStatsStore::ReadResult::Ok) {
+    LOG_ERR("WEB", "Reading stats failed mid-export; file truncated");
   }
-  client.clear();
+  response.finish();
 }
 
 void CrossPointWebServer::handleJszip() const {

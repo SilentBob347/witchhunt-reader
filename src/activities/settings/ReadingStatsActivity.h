@@ -20,7 +20,7 @@ class ReadingStatsActivity final : public Activity {
  private:
   // What the screen draws, read once on entry (and again when the list may have removed books).
   // Written on the loop task under RenderLock; read by render().
-  ReadingStatsFile::Summary summary_;
+  ReadingStatsStore::Summary summary_;
   std::vector<BookReadingStats> topBooks_;  // up to three, most time first
   void loadSummary();
 

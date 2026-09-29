@@ -78,7 +78,7 @@ void ReadingSessionTracker::end() {
           pagesTurnedThisSession, lastKnownProgress, (long long)walltime);
 
   if (!docId.empty()) {
-    // A streamed rewrite of the history file: a few KB of heap whatever its size.
+    // One book and the global figures, written in place copy-on-write: ~10 KB of heap whatever the history holds.
     const auto result = READING_STATS.recordSession(docId, title, author, seconds, pagesTurnedThisSession,
                                                     lastKnownProgress, static_cast<time_t>(walltime));
     if (result != ReadingStatsStore::WriteResult::Done) {

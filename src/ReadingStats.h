@@ -6,21 +6,21 @@
 #include <vector>
 
 #include "ReadingStatsFile.h"
+#include "ReadingStatsSlotFile.h"
 #include "ReadingStatsTypes.h"
 
 // Helpers — both return 0 when HalClock is unsynced (caller should skip).
 uint16_t localDayIndexFromEpoch(time_t epoch);
 uint16_t currentLocalDayIndex();
 
-// The reading history: one file, /.crosspoint/reading-stats.json (ReadingStatsFile::kPath), all
-// books and the global figures.
+// The reading history: /.crosspoint/reading-stats.bin (ReadingStatsSlotFile), one file with a fixed
+// place for every book. An update writes that book and the global figures, copy-on-write, never
+// the whole history: rewriting the old single JSON file took 2.7 s at a worst-case session end on
+// the X3. A reading-stats.json left by older firmware is imported into it once (prepare()).
 //
-// The store holds no history. Every query streams the file (ReadingStatsFile) and returns only
-// what was asked for; every update is a streamed rewrite — scan, merge the one book, write a
-// temporary file, read it back, swap it in — so memory does not grow with the number of books.
-// Loading the whole history used to cost ~1.5 KB a book at load and failed at the session end at
-// roughly 25-30 books, losing that session (memory audit 2026-09, F8). The only resident state is
-// the recent-books cache, which every update keeps current.
+// The store holds no history: each call reads what it needs (the ~6 KB meta, a slot or two) and
+// lets it go. The only resident state is Home's snapshots (prefetchRecent). Call from the loop task,
+// never from render().
 //
 // Deleting a book from the card never touches its history: only removeBook() takes a book out.
 class ReadingStatsStore {
@@ -29,7 +29,9 @@ class ReadingStatsStore {
  public:
   static ReadingStatsStore& getInstance() { return instance; }
 
-  explicit ReadingStatsStore(std::string path = ReadingStatsFile::kPath) : path_(std::move(path)) {}
+  explicit ReadingStatsStore(std::string path = ReadingStatsSlotFile::kPath,
+                             std::string legacyPath = ReadingStatsFile::kPath)
+      : path_(std::move(path)), legacyPath_(std::move(legacyPath)) {}
 
   // ---- Updates ----------------------------------------------------------------------------------
   enum class WriteResult : uint8_t { Done, NotFound, NoMemory, Failed };
@@ -51,28 +53,73 @@ class ReadingStatsStore {
   // and the current streak. The persisted longest-streak record stays.
   WriteResult removeBook(const std::string& docId);
 
-  // ---- Streamed queries -------------------------------------------------------------------------
+  // ---- Queries ----------------------------------------------------------------------------------
   //
-  // Each reads the file once and returns only what was asked for; nothing stays resident. An absent
-  // or empty file is an empty history (Ok). Call from the loop task, never from render().
+  // Each reads the history and returns only what was asked for; nothing stays resident. No history
+  // file is an empty history (Ok). Corrupt: the file is unreadable; the next update sets it aside
+  // and starts a fresh history.
+  enum class ReadResult : uint8_t { Ok, NoMemory, IoError, Corrupt, Stale };
+
+  // A book in the time order.
+  struct IndexEntry {
+    uint32_t totalSeconds = 0;
+    ReadingStatsSlotFile::DocKey key{};
+  };
+
+  struct Summary : ReadingTotals {
+    uint32_t bookCount = 0;
+    uint32_t finishedBookCount = 0;
+    // Over the books far enough in to count toward the global pace.
+    uint32_t paceSeconds = 0;
+    uint32_t pacePercents = 0;
+    // The history's generation when read (0: no history). Every update raises it; queryBooksAt()
+    // compares it to tell that the index went stale.
+    uint32_t seq = 0;
+    // withIndex only: descending by time; equal times in directory order.
+    std::vector<IndexEntry> byTime;
+  };
+
   struct BookQuery {
     bool found = false;
     BookReadingStats book;
     float pooledPace = 0.0f;  // the global pace, for a book without one of its own
   };
-  ReadingStatsFile::ScanResult querySummary(ReadingStatsFile::Summary& out, bool withIndex = false) const;
-  ReadingStatsFile::ScanResult queryBook(const std::string& docId, BookQuery& out) const;
-  ReadingStatsFile::ScanResult queryBookAt(uint32_t offset, BookReadingStats& book) const;
 
-  // ---- Recent-books cache -----------------------------------------------------------------------
+  // What Home draws for one recent book.
+  struct RecentSnapshot {
+    std::string docId;
+    bool known = false;  // false: the history holds no entry for this book
+    uint32_t totalSeconds = 0;
+    uint16_t knownDays = 0;  // dated reading days the book keeps (at most kMaxBookDays)
+    time_t lastReadEpoch = 0;
+    uint8_t progress = 0;
+  };
+
+  ReadResult querySummary(Summary& out, bool withIndex = false);
+  ReadResult queryBook(const std::string& docId, BookQuery& out);
+  // The books index[first, first + count) names, read with one load of the meta. Stale when the
+  // history changed since the index was taken (`seq`, from its Summary): take the index again.
+  // A book gone in between comes back empty.
+  ReadResult queryBooksAt(const std::vector<IndexEntry>& index, size_t first, size_t count, uint32_t seq,
+                          std::vector<BookReadingStats>& books);
+
+  // ---- Home -------------------------------------------------------------------------------------
   //
-  // What Home draws for its recent books, so the themes read no file from render(). Home calls
-  // prefetchRecent() on entry; it scans only for books not cached yet (books without history are
-  // cached as unknown). Bounded: the books asked for stay, others go past kRecentCacheSize.
-  static constexpr size_t kRecentCacheSize = 12;
+  // Home calls prefetchRecent() on entry: one read of the meta gives a snapshot for each book asked
+  // for (known or not) and the global pace, so the themes read no file from render(). They stay
+  // until the next prefetch.
   void prefetchRecent(const std::vector<std::string>& docIds);
-  const ReadingStatsFile::RecentSnapshot* recent(const std::string& docId) const;
+  const RecentSnapshot* recent(const std::string& docId) const;
   float recentPooledPace() const { return pooledPace_; }
+
+  // ---- The web ----------------------------------------------------------------------------------
+  //
+  // Generated one book at a time: the meta and one slot, whatever the history holds.
+  // The /api/stats payload: the figures, streaks when `today` is known, every book with its
+  // time-to-finish estimate (etaSeconds).
+  ReadResult writeDashboard(Print& out, uint16_t today);
+  // The history in the reading-stats.json format, which older firmware reads.
+  ReadResult writeExport(Print& out);
 
   // ---- Reading speed / time-to-finish -----------------------------------------------------------
   //
@@ -84,8 +131,8 @@ class ReadingStatsStore {
 
   // ---- The arithmetic, on plain data ------------------------------------------------------------
   //
-  // Shared by the streamed writes, the screens and ReadingStatsFile, so the device screens and the
-  // web dashboard agree on every figure.
+  // Shared by the writes, the screens and the web, so the device screens and the web dashboard
+  // agree on every figure.
   static uint32_t secondsOn(const std::vector<DayBucket>& days, uint16_t dayIndex);
   static uint16_t currentStreakIn(const std::vector<DayBucket>& days, uint16_t today);
   // The longest run in `days`, or the persisted `record` when that is longer.
@@ -118,26 +165,39 @@ class ReadingStatsStore {
 
   // Bounds (memory audit 2026-09, R8). Past these caps the least recently read book goes, and the
   // oldest day buckets go; the sparkline needs 30 days and the streak walk needs the current run,
-  // both well inside the global window, and the longest streak is kept as a number.
+  // both well inside the global window, and the longest streak is kept as a number. The file's
+  // layout holds exactly these (static_asserts below).
   static constexpr size_t kMaxBooks = 100;
   static constexpr size_t kMaxBookDays = 60;
   static constexpr size_t kMaxGlobalDays = 400;
 
  private:
   enum class Edit : uint8_t { Session, Finish, Remove };
-  // The streamed update shared by the three writes. `apply` changes the book and the totals and
-  // returns false when there is nothing to write.
+  // The update shared by the three writes. `apply` changes the book and the totals and returns
+  // false when there is nothing to write.
   WriteResult write(Edit edit, const std::string& docId,
                     const std::function<bool(BookReadingStats& book, ReadingTotals& totals, bool existed)>& apply);
-  void rememberRecent(const BookReadingStats& book);
-  void forgetRecent(const std::string& docId);
-  ReadingStatsFile::ScanResult scanFile(const ReadingStatsFile::ScanRequest& request,
-                                        ReadingStatsFile::Summary& summary) const;
+  // Before anything reads the history: a create or an import cut short is discarded, and the
+  // legacy JSON imported once. Ok from its first success on.
+  ReadResult prepare();
+  // The history file open for reading with its meta loaded; `exists` false when there is none.
+  ReadResult open(FsFile& file, ReadingStatsSlotFile::Meta& meta, bool& exists);
+  // A new, empty history file, written as a temporary file and renamed into place, so a card never
+  // holds half of one. Leaves `meta` as written: empty, seq 1, in copy A.
+  bool createFresh(ReadingStatsSlotFile::Meta& meta);
+  // Both web payloads: the head from the meta, then every book from its slot.
+  ReadResult writeJson(Print& out, uint16_t today, bool dashboard);
 
   std::string path_;
-  std::vector<ReadingStatsFile::RecentSnapshot> recent_;
+  std::string legacyPath_;
+  bool prepared_ = false;
+  std::vector<RecentSnapshot> recent_;
   float pooledPace_ = 0.0f;
-  bool paceKnown_ = false;
 };
+
+static_assert(ReadingStatsStore::kMaxBooks == ReadingStatsSlotFile::kEntryCount, "the directory holds the cap");
+static_assert(ReadingStatsStore::kMaxBookDays == ReadingStatsSlotFile::kBookDayCapacity, "a slot holds the day cap");
+static_assert(ReadingStatsStore::kMaxGlobalDays == ReadingStatsSlotFile::kGlobalDayCapacity,
+              "the meta holds the global day cap");
 
 #define READING_STATS ReadingStatsStore::getInstance()

@@ -1,81 +1,26 @@
 #include "ReadingStats.h"
 
 #include <Arduino.h>  // millis()
-#include <BufferedPrint.h>
 #include <HalClock.h>
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Memory.h>
 
 #include <algorithm>
 #include <ctime>
 
 #include "ReadingStatsFile.h"
+#include "ReadingStatsSlotFile.h"
 
 namespace {
-// Puts a finished temporary file in place of the store's file.
-bool swapIn(const std::string& path, const std::string& tmpPath) {
-  Storage.remove(path.c_str());
-  if (!Storage.rename(tmpPath.c_str(), path.c_str())) {
-    LOG_ERR("RST", "Could not rename %s into place", tmpPath.c_str());
-    return false;
-  }
-  return true;
-}
-
-// Where a history that cannot be read is set aside: reading-stats.json -> reading-stats.corrupt.json.
+// Where a history that cannot be read is set aside: reading-stats.bin -> reading-stats.corrupt.bin,
+// reading-stats.json -> reading-stats.corrupt.json.
 std::string asidePathFor(const std::string& path) {
-  constexpr char kSuffix[] = ".json";
-  const size_t n = sizeof(kSuffix) - 1;
-  if (path.size() > n && path.compare(path.size() - n, n, kSuffix) == 0) {
-    return path.substr(0, path.size() - n) + ".corrupt.json";
-  }
-  return path + ".corrupt";
+  const size_t slash = path.find_last_of('/');
+  const size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return path + ".corrupt";
+  return path.substr(0, dot) + ".corrupt" + path.substr(dot);
 }
-
-// A swap interrupted between removing the old file and renaming the verified new one into place
-// (power lost at the session end) leaves only the temporary file, and it holds the whole history.
-// Put it back before anything reads the history, or the next write would start an empty one over
-// it. A temporary file that does not read back is a write cut short, never taken for the history.
-void recoverInterruptedSwap(const std::string& path) {
-  const std::string tmpPath = path + ".tmp";
-  if (Storage.exists(path.c_str()) || !Storage.exists(tmpPath.c_str())) return;
-  {
-    FsFile in;
-    if (!Storage.openFileForRead("RST", tmpPath.c_str(), in)) return;
-    ReadingStatsFile::Summary check;
-    if (ReadingStatsFile::scan(in, check, ReadingStatsFile::ScanRequest{}) != ReadingStatsFile::ScanResult::Ok) return;
-  }
-  if (Storage.rename(tmpPath.c_str(), path.c_str())) {
-    LOG_ERR("RST", "Recovered the history from %s after an interrupted swap", tmpPath.c_str());
-  }
-}
-
-// The copy's write buffer. Its size does not matter to the card: measured on the X3 with a 108 KB
-// history, 107 writes of 1 KB and 14 writes of 8 KB both cost ~1.9 s -- the card takes ~17.7 ms per
-// KB written, however it is split. What matters is that there is one: without its buffer a
-// BufferedPrint passes each byte through as its own file call, minutes for a full history.
-constexpr size_t kWriteChunk = 1024;
-
-// Diagnostics for the "write done" line: time, calls and bytes that reached the card.
-class TimedPrint final : public Print {
- public:
-  explicit TimedPrint(Print& out) : out_(out) {}
-  size_t write(const uint8_t b) override { return write(&b, 1); }
-  size_t write(const uint8_t* data, const size_t n) override {
-    const unsigned long t = millis();
-    const size_t done = out_.write(data, n);
-    ms += millis() - t;
-    ++calls;
-    bytes += n;
-    return done;
-  }
-  unsigned long ms = 0;
-  uint32_t calls = 0;
-  size_t bytes = 0;
-
- private:
-  Print& out_;
-};
 
 std::string parentDirOf(const std::string& path) {
   const size_t slash = path.find_last_of('/');
@@ -289,6 +234,107 @@ void ReadingStatsStore::applyFinish(BookReadingStats& book, const std::string& t
   }
 }
 
+namespace {
+
+using ReadingStatsSlotFile::DocKey;
+using ReadingStatsSlotFile::Entry;
+using ReadingStatsSlotFile::kEntryCount;
+using ReadingStatsSlotFile::kNoCopy;
+using ReadingStatsSlotFile::kNoSlot;
+using ReadingStatsSlotFile::kSlotSize;
+using ReadingStatsSlotFile::Load;
+using ReadingStatsSlotFile::Meta;
+
+// Sets an unreadable file aside for forensics, rather than lose it or stall on it for ever.
+bool setAside(const std::string& path) {
+  const std::string aside = asidePathFor(path);
+  Storage.remove(aside.c_str());
+  if (!Storage.rename(path.c_str(), aside.c_str())) {
+    LOG_ERR("RST", "%s unreadable and could not be set aside; left as is", path.c_str());
+    return false;
+  }
+  LOG_ERR("RST", "%s unreadable; set aside as %s", path.c_str(), aside.c_str());
+  return true;
+}
+
+// What survives of a book whose slot fails its check: the directory's figures. The title, author and
+// days are lost; the book's next update writes a whole slot again.
+BookReadingStats bookFromEntry(const Entry& entry) {
+  BookReadingStats book;
+  book.docId = ReadingStatsSlotFile::formatDocId(entry.key);
+  book.totalSeconds = entry.totalSeconds;
+  book.progress = entry.progress;
+  book.finishedCount = entry.finishedCount;
+  book.lastReadEpoch = static_cast<time_t>(entry.lastReadEpoch);
+  return book;
+}
+
+// The book an entry names: from its slot, or from the directory when the slot is damaged.
+void readBook(FsFile& file, const Entry& entry, uint8_t* image, BookReadingStats& book) {
+  DocKey key{};
+  if (ReadingStatsSlotFile::readSlot(file, entry.slot, image) && ReadingStatsSlotFile::decodeSlot(image, key, book) &&
+      key == entry.key) {
+    return;
+  }
+  LOG_ERR("RST", "Slot %u fails its check; %s keeps only its directory figures", static_cast<unsigned>(entry.slot),
+          ReadingStatsSlotFile::formatDocId(entry.key).c_str());
+  book = bookFromEntry(entry);
+}
+
+// The global pace from the directory alone.
+float pooledPaceOf(const Meta& meta) {
+  uint32_t seconds = 0;
+  uint32_t percents = 0;
+  for (size_t i = 0; i < kEntryCount; ++i) {
+    const Entry entry = meta.entry(i);
+    if (entry.used() && ReadingStatsStore::countsTowardPace(entry.progress)) {
+      seconds += entry.totalSeconds;
+      percents += entry.progress;
+    }
+  }
+  return ReadingStatsStore::pooledSecondsPerPercent(meta.totalSeconds(), seconds, percents);
+}
+
+void summarize(const Meta& meta, ReadingStatsStore::Summary& out, const bool withIndex) {
+  meta.readTotals(out);
+  out.seq = meta.seq();
+  if (withIndex) out.byTime.reserve(meta.bookCount());
+  for (size_t i = 0; i < kEntryCount; ++i) {
+    const Entry entry = meta.entry(i);
+    if (!entry.used()) continue;
+    ++out.bookCount;
+    if (entry.finishedCount > 0) ++out.finishedBookCount;
+    if (ReadingStatsStore::countsTowardPace(entry.progress)) {
+      out.paceSeconds += entry.totalSeconds;
+      out.pacePercents += entry.progress;
+    }
+    if (withIndex) out.byTime.push_back({entry.totalSeconds, entry.key});
+  }
+  std::stable_sort(out.byTime.begin(), out.byTime.end(),
+                   [](const ReadingStatsStore::IndexEntry& a, const ReadingStatsStore::IndexEntry& b) {
+                     return a.totalSeconds > b.totalSeconds;
+                   });
+}
+
+// The entry the book cap evicts: the least recently read, ties to less time; the first of equals.
+size_t victimOf(const Meta& meta) {
+  size_t victim = kEntryCount;
+  Entry worst;
+  for (size_t i = 0; i < kEntryCount; ++i) {
+    const Entry entry = meta.entry(i);
+    if (!entry.used()) continue;
+    if (victim == kEntryCount ||
+        ReadingStatsStore::evictsBefore(static_cast<time_t>(entry.lastReadEpoch), entry.totalSeconds,
+                                        static_cast<time_t>(worst.lastReadEpoch), worst.totalSeconds)) {
+      victim = i;
+      worst = entry;
+    }
+  }
+  return victim;
+}
+
+}  // namespace
+
 // ---- Updates ----------------------------------------------------------------------------------
 
 ReadingStatsStore::WriteResult ReadingStatsStore::recordSession(const std::string& docId, const std::string& title,
@@ -321,226 +367,315 @@ ReadingStatsStore::WriteResult ReadingStatsStore::removeBook(const std::string& 
 ReadingStatsStore::WriteResult ReadingStatsStore::write(
     const Edit edit, const std::string& docId,
     const std::function<bool(BookReadingStats&, ReadingTotals&, bool)>& apply) {
-  if (docId.empty()) return WriteResult::NotFound;
-  [[maybe_unused]] const uint32_t started = millis();
-
-  // 1. Scan: the header, the book, and the cap's victim should the book be new.
-  ReadingStatsFile::ScanRequest request;
-  request.findDocId = docId;
-  request.wantVictim = edit != Edit::Remove;
-  ReadingStatsFile::Summary summary;
-  const auto result = scanFile(request, summary);
-  // After the scan: it may have recovered the file from an interrupted swap.
-  bool haveInput = Storage.exists(path_.c_str());
-  if (result == ReadingStatsFile::ScanResult::NoMemory) return WriteResult::NoMemory;
-  if (result == ReadingStatsFile::ScanResult::IoError) return WriteResult::Failed;
-  // A removal has nothing to remove from an unreadable file; only a write that adds reading starts
-  // a fresh history over it.
-  if (result == ReadingStatsFile::ScanResult::Malformed && edit == Edit::Remove) return WriteResult::Failed;
-  if (result == ReadingStatsFile::ScanResult::Malformed) {
-    // Permanent: set it aside for forensics rather than lose it or stall on it for ever, and start
-    // a fresh history with this change.
-    const std::string aside = asidePathFor(path_);
-    Storage.remove(aside.c_str());
-    if (!Storage.rename(path_.c_str(), aside.c_str())) {
-      LOG_ERR("RST", "History file unreadable and could not be set aside; left as is");
-      return WriteResult::Failed;
-    }
-    LOG_ERR("RST", "History file unreadable; set aside as %s, starting a fresh history", aside.c_str());
-    summary = ReadingStatsFile::Summary{};
-    haveInput = false;
+  DocKey key{};
+  if (!ReadingStatsSlotFile::parseDocId(docId, key)) {
+    // KOReaderDocumentId always gives 32 hex characters; anything else is no book of ours.
+    LOG_ERR("RST", "Not a document id: '%s'", docId.c_str());
+    return edit == Edit::Remove ? WriteResult::NotFound : WriteResult::Failed;
   }
-  if (!summary.found && edit == Edit::Remove) return WriteResult::NotFound;
-  [[maybe_unused]] const uint32_t scanned = millis();
+  [[maybe_unused]] const uint32_t started = millis();
+  const ReadResult prepared = prepare();
+  if (prepared == ReadResult::NoMemory) return WriteResult::NoMemory;
+  if (prepared != ReadResult::Ok) return WriteResult::Failed;
+  auto meta = Meta::create();
+  auto image = makeUniqueNoThrow<uint8_t[]>(kSlotSize);
+  if (!meta || !image) {
+    LOG_ERR("RST", "OOM: no room for the meta and a slot; history left as is");
+    return WriteResult::NoMemory;
+  }
+
+  // 1. The history as it stands, and the book in it.
+  uint8_t live = kNoCopy;
+  bool fresh = true;  // no readable history: a write that adds reading starts one
+  size_t index = kEntryCount;
+  BookReadingStats book;
+  if (Storage.exists(path_.c_str())) {
+    FsFile file;
+    if (!Storage.openFileForRead("RST", path_.c_str(), file)) return WriteResult::Failed;
+    switch (ReadingStatsSlotFile::loadMeta(file, *meta, live)) {
+      case Load::IoError:
+        return WriteResult::Failed;
+      case Load::Corrupt:
+        // A removal has nothing to remove from an unreadable file; only a write that adds reading
+        // starts a fresh history over it.
+        if (edit == Edit::Remove) return WriteResult::Failed;
+        break;
+      case Load::Ok:
+        fresh = false;
+        index = meta->find(key);
+        if (index != kEntryCount) readBook(file, meta->entry(index), image.get(), book);
+        break;
+    }
+  }
+  if (fresh) meta->clear();
+  const bool existed = index != kEntryCount;
+  if (!existed && edit == Edit::Remove) return WriteResult::NotFound;
+  if (!existed) book.docId = docId;
 
   // 2. Merge the one book in memory.
-  BookReadingStats book = summary.found ? summary.target : BookReadingStats{};
-  if (!summary.found) book.docId = docId;
-  ReadingStatsFile::Rewrite rewrite;
-  rewrite.totals = summary;  // the ReadingTotals part
-  if (!apply(book, rewrite.totals, summary.found)) return WriteResult::Done;
-  uint32_t expectedBooks = summary.bookCount;
-  std::string evicted;
+  ReadingTotals totals;
+  meta->readTotals(totals);
+  if (!apply(book, totals, existed)) return WriteResult::Done;
+
+  // 3. A history file to write into.
+  if (fresh) {
+    if (Storage.exists(path_.c_str()) && !setAside(path_)) return WriteResult::Failed;
+    if (!createFresh(*meta)) return WriteResult::Failed;
+    live = 0;
+  }
+  FsFile file;
+  if (!Storage.openFileForUpdate("RST", path_.c_str(), file)) return WriteResult::Failed;
+  [[maybe_unused]] const uint32_t loaded = millis();
+
+  // 4. Copy-on-write: the book into a slot no entry refers to, then the meta into the copy that is
+  // not the live one. Power lost before the meta is whole leaves the live copy, which never
+  // referred to that slot: the update is lost, the history is not.
   if (edit == Edit::Remove) {
-    rewrite.dropAt = summary.targetFirst;
-    --expectedBooks;
-  } else if (summary.found) {
-    rewrite.replaceAt = summary.targetFirst;
-    rewrite.replacement = &book;
+    meta->setEntry(index, Entry{});
   } else {
-    rewrite.append = &book;
-    ++expectedBooks;
-    if (summary.bookCount >= kMaxBooks && summary.hasVictim) {
-      rewrite.dropAt = summary.victimFirst;
-      evicted = summary.victimDocId;
-      --expectedBooks;
-      LOG_INF("RST", "Book cap (%u) reached; dropping the least recently read: %s", static_cast<unsigned>(kMaxBooks),
-              evicted.c_str());
+    // Chosen while the book's old slot, and the cap's victim's, are still referred to.
+    const uint8_t slot = meta->freeSlot();
+    if (slot == kNoSlot) {
+      LOG_ERR("RST", "No free slot; history left as is");
+      return WriteResult::Failed;
     }
-  }
-
-  // 3. Write the temporary file.
-  Storage.mkdir(parentDirOf(path_).c_str());
-  const std::string tmpPath = path_ + ".tmp";
-  bool written = false;
-  [[maybe_unused]] unsigned long sdMs = 0;
-  [[maybe_unused]] uint32_t sdCalls = 0;
-  [[maybe_unused]] size_t sdBytes = 0;
-  {
-    FsFile in;
-    const bool inOpen = haveInput && Storage.openFileForRead("RST", path_.c_str(), in) && in.size() > 0;
-    FsFile out;
-    // The copy goes out a byte at a time; batch it (see kWriteChunk).
-    TimedPrint timed(out);
-    BufferedPrint buffered(timed, kWriteChunk);
-    if (buffered.capacity() == 0) {
-      LOG_ERR("RST", "OOM: no %u-byte write buffer; history left as is", static_cast<unsigned>(kWriteChunk));
-      return WriteResult::NoMemory;
+    if (!existed) {
+      index = meta->freeEntry();
+      if (index == kEntryCount) {
+        index = victimOf(*meta);
+        LOG_INF("RST", "Book cap (%u) reached; dropping the least recently read: %s", static_cast<unsigned>(kMaxBooks),
+                ReadingStatsSlotFile::formatDocId(meta->entry(index).key).c_str());
+      }
     }
-    if (!Storage.openFileForWrite("RST", tmpPath.c_str(), out)) return WriteResult::Failed;
-    const auto copied = ReadingStatsFile::writeRewrite(inOpen ? &in : nullptr, rewrite, buffered);
-    written = buffered.flushBuffer() && copied == ReadingStatsFile::ScanResult::Ok;
-    sdMs = timed.ms;
-    sdCalls = timed.calls;
-    sdBytes = timed.bytes;
+    ReadingStatsSlotFile::encodeSlot(key, book, image.get());
+    if (!ReadingStatsSlotFile::writeSlot(file, slot, image.get())) return WriteResult::Failed;
+    file.flush();  // on the card before any meta refers to it
+    meta->setEntry(index, ReadingStatsSlotFile::entryFor(key, book, slot));
   }
-  [[maybe_unused]] const uint32_t copiedAt = millis();
-
-  // 4. Read it back; swap it in only if it holds what it should.
-  ReadingStatsFile::Summary check;
-  if (written) {
-    ReadingStatsFile::ScanRequest verify;
-    verify.findDocId = docId;
-    FsFile back;
-    written = Storage.openFileForRead("RST", tmpPath.c_str(), back) &&
-              ReadingStatsFile::scan(back, check, verify) == ReadingStatsFile::ScanResult::Ok &&
-              check.bookCount == expectedBooks &&
-              (edit == Edit::Remove ? !check.found : (check.found && check.target.totalSeconds == book.totalSeconds));
-  }
-  [[maybe_unused]] const uint32_t verified = millis();
-  if (!written) {
-    LOG_ERR("RST", "Rewritten history did not read back; left as is");
-    Storage.remove(tmpPath.c_str());
+  [[maybe_unused]] const uint32_t slotted = millis();
+  if (!meta->writeTotals(totals)) {
+    LOG_ERR("RST", "More global days than the file holds; history left as is");
     return WriteResult::Failed;
   }
-  if (!swapIn(path_, tmpPath)) return WriteResult::Failed;
-
-  // The cache follows the file without a scan of its own.
-  if (edit == Edit::Remove) {
-    forgetRecent(docId);
-  } else {
-    rememberRecent(book);
-  }
-  if (!evicted.empty()) forgetRecent(evicted);
-  pooledPace_ = pooledSecondsPerPercent(check.totalSeconds, check.paceSeconds, check.pacePercents);
-  paceKnown_ = true;
+  meta->setSeq(meta->seq() + 1);
+  meta->seal();
+  if (!ReadingStatsSlotFile::writeMeta(file, *meta, live == 0 ? 1 : 0)) return WriteResult::Failed;
+  file.flush();
   [[maybe_unused]] const uint32_t done = millis();
-  LOG_INF("RST",
-          "write done in %lu ms: scan %lu, copy %lu (sd %lu ms in %u writes, %u B), verify %lu, swap %lu "
-          "(%u books, free=%lu contig=%lu)",
-          static_cast<unsigned long>(done - started), static_cast<unsigned long>(scanned - started),
-          static_cast<unsigned long>(copiedAt - scanned), sdMs, static_cast<unsigned>(sdCalls),
-          static_cast<unsigned>(sdBytes), static_cast<unsigned long>(verified - copiedAt),
-          static_cast<unsigned long>(done - verified), static_cast<unsigned>(expectedBooks),
-          static_cast<unsigned long>(esp_get_free_heap_size()),
+  LOG_INF("RST", "write done in %lu ms: load %lu, slot %lu, meta %lu (%u books, free=%lu contig=%lu)",
+          static_cast<unsigned long>(done - started), static_cast<unsigned long>(loaded - started),
+          static_cast<unsigned long>(slotted - loaded), static_cast<unsigned long>(done - slotted),
+          static_cast<unsigned>(meta->bookCount()), static_cast<unsigned long>(esp_get_free_heap_size()),
           static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT)));
   return WriteResult::Done;
 }
 
-void ReadingStatsStore::rememberRecent(const BookReadingStats& book) {
-  ReadingStatsFile::RecentSnapshot snapshot;
-  snapshot.docId = book.docId;
-  snapshot.known = true;
-  snapshot.totalSeconds = book.totalSeconds;
-  snapshot.knownDays = static_cast<uint16_t>(std::min(book.days.size(), kMaxBookDays));
-  snapshot.lastReadEpoch = book.lastReadEpoch;
-  snapshot.progress = book.progress;
-  forgetRecent(book.docId);
-  // The book just read is the likeliest one on Home: it goes to the front, the oldest entry goes.
-  recent_.insert(recent_.begin(), std::move(snapshot));
-  if (recent_.size() > kRecentCacheSize) recent_.pop_back();
+// ---- The history file -------------------------------------------------------------------------
+
+ReadingStatsStore::ReadResult ReadingStatsStore::prepare() {
+  if (prepared_) return ReadResult::Ok;
+  // A create or an import cut short leaves only its temporary file, never half a history.
+  const std::string tmpPath = path_ + ".tmp";
+  if (Storage.exists(tmpPath.c_str())) Storage.remove(tmpPath.c_str());
+  if (!Storage.exists(path_.c_str()) && Storage.exists(legacyPath_.c_str())) {
+    // Not imported yet (the import comes with the next task): nothing may start a history beside
+    // the old one, or the import would never run.
+    LOG_ERR("RST", "%s is not imported yet; the history is left as is", legacyPath_.c_str());
+    return ReadResult::IoError;
+  }
+  prepared_ = true;
+  return ReadResult::Ok;
 }
 
-void ReadingStatsStore::forgetRecent(const std::string& docId) {
-  recent_.erase(std::remove_if(recent_.begin(), recent_.end(),
-                               [&docId](const ReadingStatsFile::RecentSnapshot& s) { return s.docId == docId; }),
-                recent_.end());
+ReadingStatsStore::ReadResult ReadingStatsStore::open(FsFile& file, Meta& meta, bool& exists) {
+  exists = false;
+  if (!Storage.exists(path_.c_str())) return ReadResult::Ok;  // no history yet
+  if (!Storage.openFileForRead("RST", path_.c_str(), file)) return ReadResult::IoError;
+  uint8_t live = kNoCopy;
+  switch (ReadingStatsSlotFile::loadMeta(file, meta, live)) {
+    case Load::Ok:
+      exists = true;
+      return ReadResult::Ok;
+    case Load::Corrupt:
+      return ReadResult::Corrupt;
+    case Load::IoError:
+      break;
+  }
+  return ReadResult::IoError;
+}
+
+bool ReadingStatsStore::createFresh(Meta& meta) {
+  Storage.mkdir(parentDirOf(path_).c_str());
+  const std::string tmpPath = path_ + ".tmp";
+  meta.clear();
+  meta.setSeq(1);
+  meta.seal();
+  bool written = ReadingStatsSlotFile::createZeroed(tmpPath.c_str());
+  if (written) {
+    FsFile file;
+    written = Storage.openFileForUpdate("RST", tmpPath.c_str(), file) && ReadingStatsSlotFile::writeMeta(file, meta, 0);
+    if (written) file.flush();
+  }
+  if (!written || !Storage.rename(tmpPath.c_str(), path_.c_str())) {
+    LOG_ERR("RST", "Could not create %s", path_.c_str());
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+  return true;
 }
 
 // ---- Queries ----------------------------------------------------------------------------------
 
-ReadingStatsFile::ScanResult ReadingStatsStore::scanFile(const ReadingStatsFile::ScanRequest& request,
-                                                         ReadingStatsFile::Summary& summary) const {
-  summary = ReadingStatsFile::Summary{};
-  recoverInterruptedSwap(path_);
-  const auto emptyHistory = [&]() {
-    for (const auto& id : request.recentDocIds) {
-      ReadingStatsFile::RecentSnapshot unknown;
-      unknown.docId = id;
-      summary.recents.push_back(std::move(unknown));
-    }
-    return ReadingStatsFile::ScanResult::Ok;
-  };
-  if (!Storage.exists(path_.c_str())) return emptyHistory();
-  FsFile in;
-  if (!Storage.openFileForRead("RST", path_.c_str(), in)) return ReadingStatsFile::ScanResult::IoError;
-  if (in.size() == 0) return emptyHistory();
-  return ReadingStatsFile::scan(in, summary, request);
-}
-
-ReadingStatsFile::ScanResult ReadingStatsStore::querySummary(ReadingStatsFile::Summary& out,
-                                                             const bool withIndex) const {
-  ReadingStatsFile::ScanRequest request;
-  request.wantIndex = withIndex;
-  return scanFile(request, out);
-}
-
-ReadingStatsFile::ScanResult ReadingStatsStore::queryBook(const std::string& docId, BookQuery& out) const {
-  out = BookQuery{};
-  ReadingStatsFile::ScanRequest request;
-  request.findDocId = docId;
-  ReadingStatsFile::Summary summary;
-  const auto result = scanFile(request, summary);
-  if (result != ReadingStatsFile::ScanResult::Ok) return result;
-  out.found = summary.found;
-  out.book = std::move(summary.target);
-  out.pooledPace = pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents);
+ReadingStatsStore::ReadResult ReadingStatsStore::querySummary(Summary& out, const bool withIndex) {
+  out = Summary{};
+  const ReadResult prepared = prepare();
+  if (prepared != ReadResult::Ok) return prepared;
+  auto meta = Meta::create();
+  if (!meta) return ReadResult::NoMemory;
+  FsFile file;
+  bool exists = false;
+  const ReadResult result = open(file, *meta, exists);
+  if (result == ReadResult::Ok && exists) summarize(*meta, out, withIndex);
   return result;
 }
 
-ReadingStatsFile::ScanResult ReadingStatsStore::queryBookAt(const uint32_t offset, BookReadingStats& book) const {
-  FsFile in;
-  if (!Storage.openFileForRead("RST", path_.c_str(), in)) return ReadingStatsFile::ScanResult::IoError;
-  return ReadingStatsFile::readBookAt(in, offset, book);
+ReadingStatsStore::ReadResult ReadingStatsStore::queryBook(const std::string& docId, BookQuery& out) {
+  out = BookQuery{};
+  DocKey key{};
+  if (!ReadingStatsSlotFile::parseDocId(docId, key)) return ReadResult::Ok;  // no book of ours
+  const ReadResult prepared = prepare();
+  if (prepared != ReadResult::Ok) return prepared;
+  auto meta = Meta::create();
+  auto image = makeUniqueNoThrow<uint8_t[]>(kSlotSize);
+  if (!meta || !image) return ReadResult::NoMemory;
+  FsFile file;
+  bool exists = false;
+  const ReadResult result = open(file, *meta, exists);
+  if (result != ReadResult::Ok || !exists) return result;
+  out.pooledPace = pooledPaceOf(*meta);
+  const size_t index = meta->find(key);
+  if (index == kEntryCount) return ReadResult::Ok;
+  readBook(file, meta->entry(index), image.get(), out.book);
+  out.found = true;
+  return ReadResult::Ok;
 }
+
+ReadingStatsStore::ReadResult ReadingStatsStore::queryBooksAt(const std::vector<IndexEntry>& index, const size_t first,
+                                                              const size_t count, const uint32_t seq,
+                                                              std::vector<BookReadingStats>& books) {
+  books.clear();
+  const size_t last = std::min(index.size(), first + count);
+  // The rows outlive this call: on the heap before the meta's transient 6 KB (see prefetchRecent).
+  books.reserve(last > first ? last - first : 0);
+  const ReadResult prepared = prepare();
+  if (prepared != ReadResult::Ok) return prepared;
+  auto meta = Meta::create();
+  auto image = makeUniqueNoThrow<uint8_t[]>(kSlotSize);
+  if (!meta || !image) return ReadResult::NoMemory;
+  FsFile file;
+  bool exists = false;
+  const ReadResult result = open(file, *meta, exists);
+  if (result != ReadResult::Ok) return result;
+  // A book's old slot keeps a valid copy of it after the book moves, so only the generation can
+  // tell the index is old.
+  if ((exists ? meta->seq() : 0) != seq) return ReadResult::Stale;
+  for (size_t i = first; i < last; ++i) {
+    BookReadingStats book;
+    const size_t at = meta->find(index[i].key);
+    if (at != kEntryCount) readBook(file, meta->entry(at), image.get(), book);
+    books.push_back(std::move(book));
+  }
+  return ReadResult::Ok;
+}
+
+// ---- Home -------------------------------------------------------------------------------------
 
 void ReadingStatsStore::prefetchRecent(const std::vector<std::string>& docIds) {
-  ReadingStatsFile::ScanRequest request;
-  for (const auto& id : docIds) {
-    if (!id.empty() && recent(id) == nullptr) request.recentDocIds.push_back(id);
-  }
-  if (request.recentDocIds.empty() && paceKnown_) return;
-  ReadingStatsFile::Summary summary;
-  const auto result = scanFile(request, summary);
-  if (result != ReadingStatsFile::ScanResult::Ok) {
-    LOG_ERR("RST", "prefetchRecent: scan failed (%u); Home draws no history this time", static_cast<unsigned>(result));
-    return;
-  }
-  for (auto& snapshot : summary.recents) recent_.push_back(std::move(snapshot));
-  pooledPace_ = pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents);
-  paceKnown_ = true;
-  for (auto it = recent_.begin(); recent_.size() > kRecentCacheSize && it != recent_.end();) {
-    if (std::find(docIds.begin(), docIds.end(), it->docId) == docIds.end()) {
-      it = recent_.erase(it);
-    } else {
-      ++it;
+  // The snapshots outlive this call, so they go on the heap before the meta's transient 6 KB: a
+  // long-lived block placed after a freed one splits the free space it leaves.
+  std::vector<RecentSnapshot> snapshots(docIds.size());
+  for (size_t i = 0; i < docIds.size(); ++i) snapshots[i].docId = docIds[i];
+  float pace = 0.0f;
+  ReadResult result = prepare();
+  if (result == ReadResult::Ok) {
+    auto meta = Meta::create();
+    FsFile file;
+    bool exists = false;
+    result = meta ? open(file, *meta, exists) : ReadResult::NoMemory;
+    if (result == ReadResult::Ok && exists) {
+      for (RecentSnapshot& snapshot : snapshots) {
+        DocKey key{};
+        if (!ReadingStatsSlotFile::parseDocId(snapshot.docId, key)) continue;
+        const size_t index = meta->find(key);
+        if (index == kEntryCount) continue;
+        const Entry entry = meta->entry(index);
+        snapshot.known = true;
+        snapshot.totalSeconds = entry.totalSeconds;
+        snapshot.knownDays = entry.dayCount;
+        snapshot.lastReadEpoch = static_cast<time_t>(entry.lastReadEpoch);
+        snapshot.progress = entry.progress;
+      }
+      pace = pooledPaceOf(*meta);
     }
   }
+  if (result != ReadResult::Ok) {
+    LOG_ERR("RST", "prefetchRecent: history not read (%u); Home draws none this time", static_cast<unsigned>(result));
+  }
+  recent_ = std::move(snapshots);
+  pooledPace_ = pace;
 }
 
-const ReadingStatsFile::RecentSnapshot* ReadingStatsStore::recent(const std::string& docId) const {
+const ReadingStatsStore::RecentSnapshot* ReadingStatsStore::recent(const std::string& docId) const {
   for (const auto& snapshot : recent_) {
     if (snapshot.docId == docId) return &snapshot;
   }
   return nullptr;
+}
+
+// ---- The web ----------------------------------------------------------------------------------
+
+ReadingStatsStore::ReadResult ReadingStatsStore::writeDashboard(Print& out, const uint16_t today) {
+  return writeJson(out, today, /*dashboard=*/true);
+}
+
+ReadingStatsStore::ReadResult ReadingStatsStore::writeExport(Print& out) {
+  return writeJson(out, 0, /*dashboard=*/false);
+}
+
+ReadingStatsStore::ReadResult ReadingStatsStore::writeJson(Print& out, const uint16_t today, const bool dashboard) {
+  const ReadResult prepared = prepare();
+  if (prepared != ReadResult::Ok) return prepared;
+  auto meta = Meta::create();
+  auto image = makeUniqueNoThrow<uint8_t[]>(kSlotSize);
+  if (!meta || !image) return ReadResult::NoMemory;
+  FsFile file;
+  bool exists = false;
+  const ReadResult result = open(file, *meta, exists);
+  if (result != ReadResult::Ok) return result;
+  Summary summary;
+  if (exists) summarize(*meta, summary, /*withIndex=*/false);
+  if (dashboard) {
+    ReadingStatsFile::writeDashboardHead(out, summary, summary.bookCount, summary.finishedBookCount, today);
+  } else {
+    ReadingStatsFile::writeFileHead(out, summary);
+  }
+  const float pooled = pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents);
+  bool first = true;
+  for (size_t i = 0; exists && i < kEntryCount; ++i) {
+    const Entry entry = meta->entry(i);
+    if (!entry.used()) continue;
+    BookReadingStats book;
+    readBook(file, entry, image.get(), book);
+    if (!first) ReadingStatsFile::writeBookSeparator(out);
+    first = false;
+    if (dashboard) {
+      const float own = ownSecondsPerPercent(book.totalSeconds, book.progress);
+      const float remaining = book.progress < 100 ? 100.0f - static_cast<float>(book.progress) : 0.0f;
+      ReadingStatsFile::writeBook(out, book, etaSeconds(own > 0.0f ? own : pooled, remaining));
+    } else {
+      ReadingStatsFile::writeBook(out, book);
+    }
+  }
+  ReadingStatsFile::writeTail(out);
+  return ReadResult::Ok;
 }

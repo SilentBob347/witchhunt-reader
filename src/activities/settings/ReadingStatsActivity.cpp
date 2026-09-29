@@ -42,20 +42,16 @@ std::string formatPagesPerMin(uint32_t pages, uint32_t seconds) {
 }  // namespace
 
 void ReadingStatsActivity::loadSummary() {
-  ReadingStatsFile::Summary summary;
+  ReadingStatsStore::Summary summary;
   std::vector<BookReadingStats> top;
-  const bool ok = READING_STATS.querySummary(summary, /*withIndex=*/true) == ReadingStatsFile::ScanResult::Ok;
+  const bool ok = READING_STATS.querySummary(summary, /*withIndex=*/true) == ReadingStatsStore::ReadResult::Ok;
   if (ok) {
     const size_t shown = std::min<size_t>(summary.byTime.size(), 3);
-    top.reserve(shown);
-    for (size_t i = 0; i < shown; ++i) {
-      BookReadingStats book;
-      if (READING_STATS.queryBookAt(summary.byTime[i].offset, book) == ReadingStatsFile::ScanResult::Ok) {
-        book.days.clear();  // the card shows title and time only
-        top.push_back(std::move(book));
-      }
+    if (READING_STATS.queryBooksAt(summary.byTime, 0, shown, summary.seq, top) != ReadingStatsStore::ReadResult::Ok) {
+      top.clear();
     }
-    std::vector<ReadingStatsFile::IndexEntry>().swap(summary.byTime);
+    for (BookReadingStats& book : top) book.days.clear();  // the card shows title and time only
+    std::vector<ReadingStatsStore::IndexEntry>().swap(summary.byTime);
   }
   RenderLock lock(*this);
   summary_ = std::move(summary);

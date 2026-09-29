@@ -57,7 +57,7 @@ uint32_t secondsForDayIn(const std::vector<DayBucket>& days, uint16_t dayIndex) 
 void ReadingStatsBookDetailActivity::onEnter() {
   Activity::onEnter();
   ReadingStatsStore::BookQuery query;
-  if (READING_STATS.queryBook(docId, query) != ReadingStatsFile::ScanResult::Ok) query = {};
+  if (READING_STATS.queryBook(docId, query) != ReadingStatsStore::ReadResult::Ok) query = {};
   {
     RenderLock lock(*this);
     query_ = std::move(query);

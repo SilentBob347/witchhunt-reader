@@ -3,6 +3,7 @@ add_executable(ReadingStatsTest
   ReadingStatsFileTest.cpp
   ${REPO_ROOT}/src/ReadingStats.cpp
   ${REPO_ROOT}/src/ReadingStatsFile.cpp
+  ${REPO_ROOT}/src/ReadingStatsSlotFile.cpp
   ${REPO_ROOT}/lib/JsonParser/StreamingJsonParser.cpp
 )
 
@@ -37,6 +38,7 @@ add_executable(ReadingStatsStoreTest
   ReadingStatsStoreTest.cpp
   ${REPO_ROOT}/src/ReadingStats.cpp
   ${REPO_ROOT}/src/ReadingStatsFile.cpp
+  ${REPO_ROOT}/src/ReadingStatsSlotFile.cpp
   ${REPO_ROOT}/lib/JsonParser/StreamingJsonParser.cpp
 )
 

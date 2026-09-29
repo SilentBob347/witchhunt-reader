@@ -23,7 +23,8 @@ class ReadingStatsBookListActivity final : public Activity {
 
  private:
   // Rows are decoded on the loop task and swapped in under RenderLock; render() only reads them.
-  std::vector<ReadingStatsFile::IndexEntry> index_;
+  std::vector<ReadingStatsStore::IndexEntry> index_;
+  uint32_t indexSeq_ = 0;  // the history's generation index_ was taken at
   std::vector<BookReadingStats> rows_;
   int rowsFirst_ = 0;
   ButtonNavigator buttonNavigator;
@@ -31,6 +32,8 @@ class ReadingStatsBookListActivity final : public Activity {
 
   void rebuildIndex();
   void ensureRowsFor(int index);
+  // Rows [first, first + page) of the index; false when the history changed since it was taken.
+  bool readRows(int first, int page, std::vector<BookReadingStats>& rows) const;
   int pageItems() const;
   const BookReadingStats* rowAt(int index) const;
 };
