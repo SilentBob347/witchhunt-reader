@@ -6680,24 +6680,24 @@ void EpubReaderActivity::onButtonAction(const CrossPointSettings::BUTTON_ACTION 
         openQuickOverrides();
       }
       break;
-    case BA::BTN_FORCE_REFRESH:
-    case BA::BTN_FORCE_FAST_REFRESH:
-      // Re-display the CURRENT page to clear ghosting — do NOT raw displayBuffer() (the
-      // framebuffer may hold a Background-A pre-render of the *next* page, which would look
-      // like a page turn). Clear the pre-render flags so classifyRenderPass() picks a Normal
-      // render of the current page, request the forced mode for that render, and re-render.
-      {
-        RenderLock lock(*this);
-        pendingPreRender = false;
-        usePreRenderedBuffer = false;
-        preRenderedPage.ready = false;
-        preRenderedPlanesStaged_ = false;
-        forceRefreshModeNextRender_ = static_cast<int8_t>(
-            action == BA::BTN_FORCE_FAST_REFRESH ? HalDisplay::FAST_REFRESH : HalDisplay::HALF_REFRESH);
-      }
-      requestUpdate();
-      break;
     default:
       break;
   }
+}
+
+bool EpubReaderActivity::handleForcedRefresh(const HalDisplay::RefreshMode mode) {
+  // Re-display the CURRENT page to clear ghosting — do NOT raw displayBuffer() (the
+  // framebuffer may hold a Background-A pre-render of the *next* page, which would look
+  // like a page turn). Clear the pre-render flags so classifyRenderPass() picks a Normal
+  // render of the current page, request the forced mode for that render, and re-render.
+  {
+    RenderLock lock(*this);
+    pendingPreRender = false;
+    usePreRenderedBuffer = false;
+    preRenderedPage.ready = false;
+    preRenderedPlanesStaged_ = false;
+    forceRefreshModeNextRender_ = static_cast<int8_t>(mode);
+  }
+  requestUpdate();
+  return true;
 }
