@@ -4,11 +4,12 @@
 // keyboard opens on.
 //
 // Ported from crosspoint-reader (PR #2858 by winst0niuss, with Uri Tauber).
-// Reworked here without the persisted layout mask and its settings screen: the
-// set is the UI language's layout plus English, so a reader whose interface is
-// in Russian gets ЙЦУКЕН and QWERTY, and one in English gets QWERTY alone (and
-// no language key, since there is nowhere to switch to). The upstream API is
-// kept so the settings screen can be added later without touching the keyboard.
+//
+// The set is SETTINGS.keyboardLayouts, chosen on the Keyboard Layouts screen.
+// Until that is configured it is the UI language's layout plus English, so a
+// reader whose interface is in Russian gets ЙЦУКЕН and QWERTY without visiting
+// the screen, and one reading Russian books under an English interface switches
+// ЙЦУКЕН on there.
 //
 // Only the layouts our UI fonts can draw are listed. The SDK also has Hebrew and
 // Arabic, but Inter UI carries neither script and the UI text path does no bidi
@@ -40,11 +41,16 @@ inline constexpr LayoutInfo ALL[] = {
 inline constexpr uint8_t COUNT = sizeof(ALL) / sizeof(ALL[0]);
 static_assert(COUNT <= 16, "the enabled-layout mask is uint16_t");
 
-// Bit i set: ALL[i] is reachable. Always includes English, which is what URL
-// and password fields need whatever the UI language is.
+inline constexpr uint16_t bitAt(const uint8_t i) { return static_cast<uint16_t>(1u << i); }
+// The layouts that can type a URL or a Wi-Fi password. One of them is always enabled.
+inline constexpr uint16_t LATIN_BITS = bitAt(0) | bitAt(1) | bitAt(2) | bitAt(3);
+
+// Bit i set: ALL[i] is reachable. Always includes a Latin layout, which is what
+// URL and password fields need whatever else is chosen.
 uint16_t enabled();
 
-// The UI language's layout (English when the language has none).
+// The UI language's layout (English when the language has none), or the next
+// enabled one when that has been switched off.
 freeink::ui::KeyboardLayoutId startingLayout();
 
 // The enabled layout after `current`, wrapping; `current` when it is the only one.

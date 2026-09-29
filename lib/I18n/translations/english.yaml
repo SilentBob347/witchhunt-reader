@@ -220,6 +220,7 @@ STR_INCLUDE_BETA_UPDATES: "Include beta updates"
 STR_SKIP_HTTPS_VALIDATION: "Skip HTTPS validation (risky)"
 
 STR_LANGUAGE: "Language"
+STR_KEYBOARD_LAYOUTS: "Keyboard Layouts"
 STR_CLEAR_READING_CACHE: "Clear Reading Cache"
 STR_USERNAME: "Username"
 STR_PASSWORD: "Password"

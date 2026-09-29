@@ -9,13 +9,19 @@ add_executable(KeyboardLayoutSetTest
   ${I18N_GENERATED_STRINGS}
 )
 
-# I18n.h (for Language and the singleton the test stubs) and the SDK keyboard
-# header (for KeyboardLayoutId). The test defines the two I18n members
-# KeyboardLayoutSet reaches; nothing here draws a key.
+# I18n.h (for Language and the singleton the test stubs), CrossPointSettings.h
+# with the stdio-backed shims it pulls in (the same set HomeMenuTest uses), and
+# the SDK keyboard header (for KeyboardLayoutId). The test defines the I18n
+# members and the settings instance KeyboardLayoutSet reaches; nothing here
+# draws a key.
 target_include_directories(KeyboardLayoutSetTest PRIVATE
   ${REPO_ROOT}/src
   ${REPO_ROOT}/lib/I18n
   ${I18N_GENERATED_DIR}
+  ${REPO_ROOT}/lib
+  ${REPO_ROOT}/test/epub_pipeline
+  ${REPO_ROOT}/test/zip_entry_reader
+  ${REPO_ROOT}/test/shims
   ${REPO_ROOT}/freeink-sdk/libs/ui/FreeInkUI/include
 )
 

@@ -1,9 +1,11 @@
 #include "KeyboardLayoutSet.h"
 
+#include "CrossPointSettings.h"
+
 namespace keyboard_layouts {
 namespace {
 
-constexpr uint16_t bitAt(const uint8_t i) { return static_cast<uint16_t>(1u << i); }
+constexpr uint16_t ALL_BITS = static_cast<uint16_t>((uint32_t{1} << COUNT) - 1);
 
 uint8_t indexOf(const freeink::ui::KeyboardLayoutId id) {
   for (uint8_t i = 0; i < COUNT; ++i) {
@@ -27,12 +29,26 @@ uint16_t layoutBit(const freeink::ui::KeyboardLayoutId id) {
 }  // namespace
 
 uint16_t enabled() {
-  // An English UI collapses to one layout, and the language key disappears.
+  // Drop bits naming no layout: the mask comes from a hand-editable file and
+  // survives downgrades, so it can carry bits this build does not have. Left in,
+  // such a mask would read as "configured" while enabling nothing.
+  const uint16_t configured = static_cast<uint16_t>(SETTINGS.keyboardLayouts & ALL_BITS);
+  if (configured != 0) {
+    if (configured & LATIN_BITS) return configured;
+    return static_cast<uint16_t>(configured | layoutBit(freeink::ui::KeyboardLayoutId::QwertyEn));
+  }
+  // Unconfigured: the UI language's layout plus English. An English UI collapses
+  // to one layout, and the language key disappears -- there is nowhere to go.
   return static_cast<uint16_t>(layoutBit(forLanguage(I18N.getLanguage())) |
                                layoutBit(freeink::ui::KeyboardLayoutId::QwertyEn));
 }
 
-freeink::ui::KeyboardLayoutId startingLayout() { return forLanguage(I18N.getLanguage()); }
+freeink::ui::KeyboardLayoutId startingLayout() {
+  const freeink::ui::KeyboardLayoutId preferred = forLanguage(I18N.getLanguage());
+  if (enabled() & layoutBit(preferred)) return preferred;
+  // Switched off: opening on it anyway would ignore a deliberate choice.
+  return next(preferred);
+}
 
 freeink::ui::KeyboardLayoutId next(const freeink::ui::KeyboardLayoutId current) {
   const uint16_t mask = enabled();
