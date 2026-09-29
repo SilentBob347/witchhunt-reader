@@ -512,11 +512,11 @@ TEST_F(StoreTest, ExportIsTheJsonFileFormat) {
   ASSERT_NO_FATAL_FAILURE(twoBooks(store));
   const auto summary = summaryOf(store);
   StringPrint expected;
-  ReadingStatsFile::writeFileHead(expected, summary);
-  ReadingStatsFile::writeBook(expected, bookOf(store, id(1)).book);
-  ReadingStatsFile::writeBookSeparator(expected);
-  ReadingStatsFile::writeBook(expected, bookOf(store, id(2)).book);
-  ReadingStatsFile::writeTail(expected);
+  ReadingStatsJson::writeFileHead(expected, summary);
+  ReadingStatsJson::writeBook(expected, bookOf(store, id(1)).book);
+  ReadingStatsJson::writeBookSeparator(expected);
+  ReadingStatsJson::writeBook(expected, bookOf(store, id(2)).book);
+  ReadingStatsJson::writeTail(expected);
   StringPrint out;
 
   ASSERT_EQ(store.writeExport(out), ReadResult::Ok);

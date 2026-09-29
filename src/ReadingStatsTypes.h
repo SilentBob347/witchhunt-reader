@@ -5,8 +5,9 @@
 #include <string>
 #include <vector>
 
-// The reading history's plain data, shared by the store (ReadingStats.h) and the file layer
-// (ReadingStatsFile.h) without either header including the other's.
+// The reading history's plain data, shared by the store (ReadingStats.h), the slot file
+// (ReadingStatsSlotFile.h) and the JSON codec (ReadingStatsJson.h) without any of them including
+// another's.
 
 // Day buckets are keyed by an ordinal day count (days since 1970-01-01 in
 // LOCAL time, computed by localDayIndex() below). A "reading day" is the

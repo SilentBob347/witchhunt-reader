@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <ctime>
 
-#include "ReadingStatsFile.h"
+#include "ReadingStatsJson.h"
 #include "ReadingStatsSlotFile.h"
 
 namespace {
@@ -334,7 +334,7 @@ size_t victimOf(const Meta& meta) {
 }
 
 // More books than the cap (only a hand-made file has them): keep the ones the cap would keep.
-ReadingStatsStore::ReadResult keepTheCapsBooks(FsFile& in, std::vector<ReadingStatsFile::IndexEntry>& entries) {
+ReadingStatsStore::ReadResult keepTheCapsBooks(FsFile& in, std::vector<ReadingStatsJson::IndexEntry>& entries) {
   struct Key {
     time_t lastRead;
     uint32_t seconds;
@@ -344,7 +344,7 @@ ReadingStatsStore::ReadResult keepTheCapsBooks(FsFile& in, std::vector<ReadingSt
   keys.reserve(entries.size());
   for (const auto& at : entries) {
     BookReadingStats book;
-    if (ReadingStatsFile::readBookAt(in, at.offset, book) != ReadingStatsFile::ScanResult::Ok) {
+    if (ReadingStatsJson::readBookAt(in, at.offset, book) != ReadingStatsJson::ScanResult::Ok) {
       return ReadingStatsStore::ReadResult::IoError;
     }
     keys.push_back({book.lastReadEpoch, book.totalSeconds, at.offset});
@@ -355,7 +355,7 @@ ReadingStatsStore::ReadResult keepTheCapsBooks(FsFile& in, std::vector<ReadingSt
   std::vector<uint32_t> gone;
   for (size_t i = 0; i + ReadingStatsStore::kMaxBooks < keys.size(); ++i) gone.push_back(keys[i].offset);
   entries.erase(std::remove_if(entries.begin(), entries.end(),
-                               [&gone](const ReadingStatsFile::IndexEntry& e) {
+                               [&gone](const ReadingStatsJson::IndexEntry& e) {
                                  return std::find(gone.begin(), gone.end(), e.offset) != gone.end();
                                }),
                 entries.end());
@@ -559,14 +559,14 @@ ReadingStatsStore::ReadResult ReadingStatsStore::importLegacy() {
   {
     FsFile in;
     if (!Storage.openFileForRead("RST", legacyPath_.c_str(), in)) return ReadResult::IoError;
-    ReadingStatsFile::Summary legacy;
+    ReadingStatsJson::Summary legacy;
     if (in.size() > 0) {  // a zero-byte file is an empty history, as it always was
-      ReadingStatsFile::ScanRequest request;
+      ReadingStatsJson::ScanRequest request;
       request.wantIndex = true;
-      const auto scanned = ReadingStatsFile::scan(in, legacy, request);
-      if (scanned == ReadingStatsFile::ScanResult::NoMemory) return ReadResult::NoMemory;
-      if (scanned == ReadingStatsFile::ScanResult::IoError) return ReadResult::IoError;
-      malformed = scanned == ReadingStatsFile::ScanResult::Malformed;
+      const auto scanned = ReadingStatsJson::scan(in, legacy, request);
+      if (scanned == ReadingStatsJson::ScanResult::NoMemory) return ReadResult::NoMemory;
+      if (scanned == ReadingStatsJson::ScanResult::IoError) return ReadResult::IoError;
+      malformed = scanned == ReadingStatsJson::ScanResult::Malformed;
     }
     if (!malformed) {
       const ReadResult written = writeImport(in, legacy, tmpPath, imported);
@@ -594,13 +594,13 @@ ReadingStatsStore::ReadResult ReadingStatsStore::importLegacy() {
   return ReadResult::Ok;
 }
 
-ReadingStatsStore::ReadResult ReadingStatsStore::writeImport(FsFile& in, ReadingStatsFile::Summary& legacy,
+ReadingStatsStore::ReadResult ReadingStatsStore::writeImport(FsFile& in, ReadingStatsJson::Summary& legacy,
                                                              const std::string& tmpPath, size_t& imported) {
   imported = 0;
   // File order, not time order: an import followed by an export gives the file back.
   std::stable_sort(
       legacy.byTime.begin(), legacy.byTime.end(),
-      [](const ReadingStatsFile::IndexEntry& a, const ReadingStatsFile::IndexEntry& b) { return a.offset < b.offset; });
+      [](const ReadingStatsJson::IndexEntry& a, const ReadingStatsJson::IndexEntry& b) { return a.offset < b.offset; });
   if (legacy.byTime.size() > kMaxBooks) {
     const ReadResult kept = keepTheCapsBooks(in, legacy.byTime);
     if (kept != ReadResult::Ok) return kept;
@@ -616,9 +616,9 @@ ReadingStatsStore::ReadResult ReadingStatsStore::writeImport(FsFile& in, Reading
   for (const auto& at : legacy.byTime) {
     if (imported == kEntryCount) break;
     BookReadingStats book;
-    const auto read = ReadingStatsFile::readBookAt(in, at.offset, book);
-    if (read == ReadingStatsFile::ScanResult::NoMemory) return ReadResult::NoMemory;
-    if (read != ReadingStatsFile::ScanResult::Ok) return ReadResult::IoError;
+    const auto read = ReadingStatsJson::readBookAt(in, at.offset, book);
+    if (read == ReadingStatsJson::ScanResult::NoMemory) return ReadResult::NoMemory;
+    if (read != ReadingStatsJson::ScanResult::Ok) return ReadResult::IoError;
     DocKey key{};
     if (!ReadingStatsSlotFile::parseDocId(book.docId, key)) {
       LOG_ERR("RST", "Import: '%s' is not a document id; skipped", book.docId.c_str());
@@ -777,9 +777,9 @@ ReadingStatsStore::ReadResult ReadingStatsStore::writeJson(Print& out, const uin
   Summary summary;
   if (exists) summarize(*meta, summary, /*withIndex=*/false);
   if (dashboard) {
-    ReadingStatsFile::writeDashboardHead(out, summary, summary.bookCount, summary.finishedBookCount, today);
+    ReadingStatsJson::writeDashboardHead(out, summary, summary.bookCount, summary.finishedBookCount, today);
   } else {
-    ReadingStatsFile::writeFileHead(out, summary);
+    ReadingStatsJson::writeFileHead(out, summary);
   }
   const float pooled = pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents);
   bool first = true;
@@ -788,16 +788,16 @@ ReadingStatsStore::ReadResult ReadingStatsStore::writeJson(Print& out, const uin
     if (!entry.used()) continue;
     BookReadingStats book;
     readBook(file, entry, image.get(), book);
-    if (!first) ReadingStatsFile::writeBookSeparator(out);
+    if (!first) ReadingStatsJson::writeBookSeparator(out);
     first = false;
     if (dashboard) {
       const float own = ownSecondsPerPercent(book.totalSeconds, book.progress);
       const float remaining = book.progress < 100 ? 100.0f - static_cast<float>(book.progress) : 0.0f;
-      ReadingStatsFile::writeBook(out, book, etaSeconds(own > 0.0f ? own : pooled, remaining));
+      ReadingStatsJson::writeBook(out, book, etaSeconds(own > 0.0f ? own : pooled, remaining));
     } else {
-      ReadingStatsFile::writeBook(out, book);
+      ReadingStatsJson::writeBook(out, book);
     }
   }
-  ReadingStatsFile::writeTail(out);
+  ReadingStatsJson::writeTail(out);
   return ReadResult::Ok;
 }

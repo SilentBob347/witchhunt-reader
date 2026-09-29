@@ -1,8 +1,8 @@
 add_executable(ReadingStatsTest
   ReadingStatsTest.cpp
-  ReadingStatsFileTest.cpp
+  ReadingStatsJsonTest.cpp
   ${REPO_ROOT}/src/ReadingStats.cpp
-  ${REPO_ROOT}/src/ReadingStatsFile.cpp
+  ${REPO_ROOT}/src/ReadingStatsJson.cpp
   ${REPO_ROOT}/src/ReadingStatsSlotFile.cpp
   ${REPO_ROOT}/lib/JsonParser/StreamingJsonParser.cpp
 )
@@ -17,8 +17,6 @@ target_include_directories(ReadingStatsTest PRIVATE
   ${REPO_ROOT}/lib/Logging
   ${REPO_ROOT}/lib/JsonParser
   ${REPO_ROOT}/lib/Memory
-  # BufferedPrint.h
-  ${REPO_ROOT}/lib/Serialization
 )
 
 # localDayIndexFromEpoch() calls localtime_r, which MinGW's <time.h> declares only on request.
@@ -37,7 +35,7 @@ gtest_discover_tests(ReadingStatsTest)
 add_executable(ReadingStatsStoreTest
   ReadingStatsStoreTest.cpp
   ${REPO_ROOT}/src/ReadingStats.cpp
-  ${REPO_ROOT}/src/ReadingStatsFile.cpp
+  ${REPO_ROOT}/src/ReadingStatsJson.cpp
   ${REPO_ROOT}/src/ReadingStatsSlotFile.cpp
   ${REPO_ROOT}/lib/JsonParser/StreamingJsonParser.cpp
 )
@@ -52,7 +50,6 @@ target_include_directories(ReadingStatsStoreTest PRIVATE
   ${REPO_ROOT}/lib/Logging
   ${REPO_ROOT}/lib/JsonParser
   ${REPO_ROOT}/lib/Memory
-  ${REPO_ROOT}/lib/Serialization
 )
 
 if(MINGW)

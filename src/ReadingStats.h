@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "ReadingStatsFile.h"
+#include "ReadingStatsJson.h"
 #include "ReadingStatsSlotFile.h"
 #include "ReadingStatsTypes.h"
 
@@ -30,7 +30,7 @@ class ReadingStatsStore {
   static ReadingStatsStore& getInstance() { return instance; }
 
   explicit ReadingStatsStore(std::string path = ReadingStatsSlotFile::kPath,
-                             std::string legacyPath = ReadingStatsFile::kPath)
+                             std::string legacyPath = ReadingStatsJson::kPath)
       : path_(std::move(path)), legacyPath_(std::move(legacyPath)) {}
 
   // ---- Updates ----------------------------------------------------------------------------------
@@ -190,7 +190,7 @@ class ReadingStatsStore {
   ReadResult importLegacy();
   // Writes the legacy books into a new file at `tmpPath`, one slot each in file order, then the
   // meta into copy A, and reads the meta back.
-  ReadResult writeImport(FsFile& in, ReadingStatsFile::Summary& legacy, const std::string& tmpPath, size_t& imported);
+  ReadResult writeImport(FsFile& in, ReadingStatsJson::Summary& legacy, const std::string& tmpPath, size_t& imported);
   // Both web payloads: the head from the meta, then every book from its slot.
   ReadResult writeJson(Print& out, uint16_t today, bool dashboard);
 

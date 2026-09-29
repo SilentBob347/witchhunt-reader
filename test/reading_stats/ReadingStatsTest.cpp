@@ -1,6 +1,6 @@
 // ReadingStatsStore's arithmetic on plain data: the eviction order, a session and a finish applied
 // to one book and the global figures, and a book taken back out of them. The streamed file layer
-// (ReadingStatsFileTest) and the store on real files (ReadingStatsStoreTest) build on these.
+// (ReadingStatsJsonTest) and the store on real files (ReadingStatsStoreTest) build on these.
 #include <gtest/gtest.h>
 
 #include <vector>

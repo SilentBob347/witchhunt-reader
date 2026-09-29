@@ -1,4 +1,4 @@
-#include "ReadingStatsFile.h"
+#include "ReadingStatsJson.h"
 
 #include <Logging.h>
 #include <Memory.h>
@@ -12,10 +12,9 @@
 
 #include "ReadingStats.h"
 
-namespace ReadingStatsFile {
+namespace ReadingStatsJson {
 namespace {
 
-constexpr size_t kNone = std::numeric_limits<size_t>::max();
 // Reads in blocks, not bytes. Larger blocks buy little: on the X3 a 108 KB history scans in 241 ms
 // with 1 KB blocks and 228 ms with 4 KB ones.
 constexpr size_t kReadBlock = 1024;
@@ -106,7 +105,7 @@ time_t toEpoch(const char* text) {
 // Walks the file with the SAX parser, keeping track of where it is in the stats layout, and hands
 // the subclasses what they need: the top-level counters, the global day buckets, and each book
 // with the offsets of its braces. Fed a byte at a time so that every event knows the offset of the
-// byte that caused it, and onByte() sees each byte after the parser has.
+// byte that caused it.
 //
 //   { "totalSeconds": n, ..., "globalDays": [[d, s], ...], "books": [ { ..., "days": [[d, s]] } ] }
 //   depth 1                   2            3              2          3            4  5
@@ -175,7 +174,6 @@ class Scanner {
       for (int i = 0; i < n && !done_; ++i, ++offset) {
         offset_ = offset;
         parser->feed(&bytes[i], 1);
-        onByte(bytes[i], offset, insideBooks(offset));
       }
     }
     const bool complete = singleBook_ ? done_ : (rootClosed_ && depth_ == 0);
@@ -187,11 +185,8 @@ class Scanner {
 
   virtual void onCounter(Top, uint32_t) {}
   virtual void onGlobalDay(uint16_t, uint32_t) {}
-  virtual void onBookStart(size_t) {}
-  // While the parser takes in the book's closing brace, before onByte() sees it.
+  // While the parser takes in the book's closing brace.
   virtual void onBookEnd(const Book&, size_t) {}
-  // `inBooks`: strictly between the brackets of the books array.
-  virtual void onByte(char, size_t, bool) {}
 
  private:
   enum class Field : uint8_t {
@@ -244,10 +239,6 @@ class Scanner {
   bool atBookDayPair() const { return inBookScope() && field_ == Field::Days && depth_ == bookDepth() + 2; }
   bool atGlobalDayPair() const { return !singleBook_ && top_ == Top::GlobalDays && depth_ == 3; }
 
-  bool insideBooks(const size_t offset) const {
-    return booksOpen_ != kNone && offset > booksOpen_ && (booksClose_ == kNone || offset < booksClose_);
-  }
-
   void objectStart() {
     ++depth_;
     if (!singleBook_ && depth_ == 1) rootSeen_ = true;
@@ -255,7 +246,6 @@ class Scanner {
       book_ = Book{};
       book_.first = offset_;
       field_ = Field::Other;
-      onBookStart(offset_);
     }
   }
 
@@ -270,7 +260,6 @@ class Scanner {
 
   void arrayStart() {
     ++depth_;
-    if (!singleBook_ && depth_ == 2 && top_ == Top::Books && booksOpen_ == kNone) booksOpen_ = offset_;
     if (atGlobalDayPair() || atBookDayPair()) {
       pairIndex_ = 0;
       pairDay_ = 0;
@@ -287,7 +276,6 @@ class Scanner {
         book_.days.push_back({pairDay_, pairSeconds_});
       }
     }
-    if (!singleBook_ && depth_ == 2 && top_ == Top::Books && booksClose_ == kNone) booksClose_ = offset_;
     if (depth_ > 0) --depth_;
   }
 
@@ -373,8 +361,6 @@ class Scanner {
   bool done_ = false;
   Top top_ = Top::Other;
   Field field_ = Field::Other;
-  size_t booksOpen_ = kNone;
-  size_t booksClose_ = kNone;
   uint8_t pairIndex_ = 0;
   uint16_t pairDay_ = 0;
   uint32_t pairSeconds_ = 0;
@@ -383,10 +369,7 @@ class Scanner {
 
 class SummaryScan final : public Scanner {
  public:
-  SummaryScan(Summary& summary, const ScanRequest& request) : summary_(summary), request_(request) {
-    summary_.recents.resize(request.recentDocIds.size());
-    for (size_t i = 0; i < request.recentDocIds.size(); ++i) summary_.recents[i].docId = request.recentDocIds[i];
-  }
+  SummaryScan(Summary& summary, const ScanRequest& request) : summary_(summary), request_(request) {}
 
   // After the pass: the index in time order.
   void settle() {
@@ -428,34 +411,10 @@ class SummaryScan final : public Scanner {
       summary_.pacePercents += book.progress;
     }
     if (request_.wantIndex) summary_.byTime.push_back({book.totalSeconds, static_cast<uint32_t>(book.first)});
-    if (request_.wantVictim &&
-        (!summary_.hasVictim ||
-         ReadingStatsStore::evictsBefore(book.lastReadEpoch, book.totalSeconds, victimLastRead_, victimSeconds_))) {
-      summary_.hasVictim = true;
-      summary_.victimDocId = book.docId;
-      summary_.victimFirst = book.first;
-      victimLastRead_ = book.lastReadEpoch;
-      victimSeconds_ = book.totalSeconds;
-    }
-    for (RecentSnapshot& recent : summary_.recents) {
-      if (recent.known || recent.docId != book.docId) continue;
-      recent.known = true;
-      recent.totalSeconds = book.totalSeconds;
-      recent.knownDays = static_cast<uint16_t>(std::min(book.days.size(), ReadingStatsStore::kMaxBookDays));
-      recent.lastReadEpoch = book.lastReadEpoch;
-      recent.progress = book.progress;
-    }
-    if (!summary_.found && !request_.findDocId.empty() && book.docId == request_.findDocId) {
-      summary_.found = true;
-      summary_.target = book.toStats();
-      summary_.targetFirst = book.first;
-    }
   }
 
   Summary& summary_;
   const ScanRequest& request_;
-  time_t victimLastRead_ = 0;
-  uint32_t victimSeconds_ = 0;
 };
 
 class BookAt final : public Scanner {
@@ -466,87 +425,6 @@ class BookAt final : public Scanner {
   void onBookEnd(const Book& book, size_t) override { out_ = book.toStats(); }
 
   BookReadingStats& out_;
-};
-
-// Copies the books array's contents through, adding each book's time-to-finish before its closing
-// brace.
-class DashboardCopy final : public Scanner {
- public:
-  DashboardCopy(Print& out, const float pooledRate) : out_(out), pooledRate_(pooledRate) {}
-
- private:
-  void onBookEnd(const Book& book, size_t) override {
-    const float own = ReadingStatsStore::ownSecondsPerPercent(book.totalSeconds, book.progress);
-    const float remaining = book.progress < 100 ? 100.0f - static_cast<float>(book.progress) : 0.0f;
-    const uint32_t eta = ReadingStatsStore::etaSeconds(own > 0.0f ? own : pooledRate_, remaining);
-    const int n = snprintf(pending_, sizeof(pending_), "%s\"etaSeconds\":%lu", book.hasFields ? "," : "",
-                           static_cast<unsigned long>(eta));
-    pendingLen_ = n > 0 && static_cast<size_t>(n) < sizeof(pending_) ? static_cast<size_t>(n) : 0;
-  }
-
-  void onByte(const char c, size_t, const bool inBooks) override {
-    if (!inBooks) return;
-    if (pendingLen_ > 0) {
-      // This is the brace that closed the book.
-      emit(out_, pending_, pendingLen_);
-      pendingLen_ = 0;
-    }
-    out_.write(static_cast<uint8_t>(c));
-  }
-
-  Print& out_;
-  const float pooledRate_;
-  char pending_[32] = {};
-  size_t pendingLen_ = 0;
-};
-
-// Copies the entries through one by one, re-emitting the separators, with the rewrite's edits.
-class RewriteCopy final : public Scanner {
- public:
-  RewriteCopy(Print& out, const Rewrite& rewrite) : out_(out), rewrite_(rewrite) {}
-
-  void appendAfterLast(const BookReadingStats& book) {
-    separate();
-    writeBook(out_, book);
-  }
-
- private:
-  enum class Mode : uint8_t { Between, Copy, Skip };
-
-  void onBookStart(const size_t first) override {
-    if (first == rewrite_.dropAt) {
-      mode_ = Mode::Skip;
-      return;
-    }
-    separate();
-    if (first == rewrite_.replaceAt && rewrite_.replacement != nullptr) {
-      writeBook(out_, *rewrite_.replacement);
-      mode_ = Mode::Skip;
-      return;
-    }
-    mode_ = Mode::Copy;
-  }
-
-  void onBookEnd(const Book&, size_t) override { ending_ = true; }
-
-  void onByte(const char c, size_t, bool) override {
-    if (mode_ == Mode::Copy) out_.write(static_cast<uint8_t>(c));
-    if (ending_) {
-      mode_ = Mode::Between;
-      ending_ = false;
-    }
-  }
-
-  void separate() {
-    if (wroteAny_) emit(out_, ",");
-    wroteAny_ = true;
-  }
-
-  Print& out_;
-  const Rewrite& rewrite_;
-  Mode mode_ = Mode::Between;
-  bool ending_ = false;
-  bool wroteAny_ = false;
 };
 
 }  // namespace
@@ -560,12 +438,6 @@ ScanResult scan(HalFile& in, Summary& summary, const ScanRequest& request) {
   ReadingStatsStore::trimGlobalDays(summary.globalDays, summary.longestStreak);
   pass.settle();
   return ScanResult::Ok;
-}
-
-bool summarize(HalFile& in, Summary& summary, const std::string& findDocId) {
-  ScanRequest request;
-  request.findDocId = findDocId;
-  return scan(in, summary, request) == ScanResult::Ok;
 }
 
 ScanResult readBookAt(HalFile& in, const size_t offset, BookReadingStats& book) {
@@ -612,26 +484,6 @@ void writeBookSeparator(Print& out) { emit(out, ","); }
 
 void writeTail(Print& out) { emit(out, "]}"); }
 
-void writeDashboard(HalFile& in, const Summary& summary, const uint16_t today, Print& out) {
-  writeDashboardHead(out, summary, summary.bookCount, summary.finishedBookCount, today);
-  DashboardCopy copy(
-      out, ReadingStatsStore::pooledSecondsPerPercent(summary.totalSeconds, summary.paceSeconds, summary.pacePercents));
-  if (copy.run(in) != ScanResult::Ok) {
-    LOG_ERR("RSF", "Stats file changed or failed between passes; dashboard truncated");
-  }
-  writeTail(out);
-}
-
-void writeWithoutTarget(HalFile& in, const Summary& summary, Print& out) {
-  Rewrite rewrite;
-  rewrite.totals = summary;  // the ReadingTotals part
-  ReadingStatsStore::takeOut(summary.target, rewrite.totals);
-  rewrite.dropAt = summary.targetFirst;
-  if (writeRewrite(&in, rewrite, out) != ScanResult::Ok) {
-    LOG_ERR("RSF", "Stats file changed or failed between passes; copy truncated");
-  }
-}
-
 void writeBook(Print& out, const BookReadingStats& book, const long long etaSeconds) {
   emit(out, "{\"docId\":");
   emitString(out, book.docId);
@@ -655,13 +507,4 @@ void writeBook(Print& out, const BookReadingStats& book, const long long etaSeco
   emit(out, "}");
 }
 
-ScanResult writeRewrite(HalFile* in, const Rewrite& rewrite, Print& out) {
-  writeFileHead(out, rewrite.totals);
-  RewriteCopy copy(out, rewrite);
-  const ScanResult result = in == nullptr ? ScanResult::Ok : copy.run(*in);
-  if (rewrite.append != nullptr) copy.appendAfterLast(*rewrite.append);
-  writeTail(out);
-  return result;
-}
-
-}  // namespace ReadingStatsFile
+}  // namespace ReadingStatsJson
