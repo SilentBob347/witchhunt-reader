@@ -226,6 +226,10 @@ class ActivityManager {
   // only when the current activity is a reader; others are no-ops in other contexts.
   void dispatchButtonAction(CrossPointSettings::BUTTON_ACTION action);
 
+  // Offer a manual force refresh to the activity on top. False when it leaves the refresh to the
+  // caller -- see Activity::handleForcedRefresh().
+  bool handleForcedRefresh(HalDisplay::RefreshMode mode);
+
 #if CP_TOUCH_UI
   // Pull the reading-light submenu down from the top edge, from whatever screen is up.
   // Global rather than reader-only on purpose: reaching the light from the home screen in

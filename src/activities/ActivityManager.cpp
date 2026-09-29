@@ -697,6 +697,10 @@ void ActivityManager::dispatchButtonAction(const CrossPointSettings::BUTTON_ACTI
   }
 }
 
+bool ActivityManager::handleForcedRefresh(const HalDisplay::RefreshMode mode) {
+  return currentActivity && currentActivity->handleForcedRefresh(mode);
+}
+
 #if CP_TOUCH_UI
 
 void ActivityManager::dispatchLightPanelGesture() {

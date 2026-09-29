@@ -1903,24 +1903,21 @@ void loop() {
           // enterDeepSleep() never returns; report it anyway rather than relying
           // on that, so the caller stops processing.
           return false;
-        case BA::BTN_FORCE_REFRESH: {
-          // In the reader, route through the activity so it re-displays the CURRENT page in
-          // the requested mode (a raw displayBuffer() here can flush a Background-A pre-render
-          // of the next page, which looks like a page turn). Elsewhere, raw-flush is correct.
-          if (activityManager.isReaderActivity()) {
-            activityManager.dispatchButtonAction(BA::BTN_FORCE_REFRESH);
-          } else {
-            RenderLock lock;
-            renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-          }
-          break;
-        }
+        case BA::BTN_FORCE_REFRESH:
         case BA::BTN_FORCE_FAST_REFRESH: {
-          if (activityManager.isReaderActivity()) {
-            activityManager.dispatchButtonAction(BA::BTN_FORCE_FAST_REFRESH);
-          } else {
+          const auto mode = action == BA::BTN_FORCE_FAST_REFRESH ? HalDisplay::FAST_REFRESH : HalDisplay::HALF_REFRESH;
+          // The activity ON TOP gets the first say: the readers re-render their current page,
+          // which keeps its gray planes and never flushes the EPUB reader's pre-rendered next
+          // page. This used to ask isReaderActivity(), which is also true under the reader's menu
+          // and TOC -- the refresh went to the reader, which was not drawing, and did nothing.
+          //
+          // Everything else re-flushes the frame on the panel. Synced first: displayBuffer() ends
+          // in a buffer swap, so the write buffer holds the frame from TWO refreshes ago, and
+          // flushing it as it stood briefly showed the previous screen.
+          if (!activityManager.handleForcedRefresh(mode)) {
             RenderLock lock;
-            renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+            renderer.syncWriteBufferFromDisplayed();
+            renderer.displayBuffer(mode);
           }
           break;
         }
