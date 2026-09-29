@@ -269,16 +269,23 @@ BookReadingStats bookFromEntry(const Entry& entry) {
   return book;
 }
 
-// The book an entry names: from its slot, or from the directory when the slot is damaged.
-void readBook(FsFile& file, const Entry& entry, uint8_t* image, BookReadingStats& book) {
-  DocKey key{};
-  if (ReadingStatsSlotFile::readSlot(file, entry.slot, image) && ReadingStatsSlotFile::decodeSlot(image, key, book) &&
-      key == entry.key) {
-    return;
+enum class BookRead : uint8_t { Ok, Damaged, IoError };
+
+// The book an entry names: from its slot, or from the directory's figures when the slot is damaged
+// (Damaged) or the card did not give it back (IoError). Queries show either; an update must not
+// build on an IoError, which says nothing about the slot.
+BookRead readBook(FsFile& file, const Entry& entry, uint8_t* image, BookReadingStats& book) {
+  if (!ReadingStatsSlotFile::readSlot(file, entry.slot, image)) {
+    LOG_ERR("RST", "Slot %u could not be read", static_cast<unsigned>(entry.slot));
+    book = bookFromEntry(entry);
+    return BookRead::IoError;
   }
+  DocKey key{};
+  if (ReadingStatsSlotFile::decodeSlot(image, key, book) && key == entry.key) return BookRead::Ok;
   LOG_ERR("RST", "Slot %u fails its check; %s keeps only its directory figures", static_cast<unsigned>(entry.slot),
           ReadingStatsSlotFile::formatDocId(entry.key).c_str());
   book = bookFromEntry(entry);
+  return BookRead::Damaged;
 }
 
 // The global pace from the directory alone.
@@ -432,7 +439,11 @@ ReadingStatsStore::WriteResult ReadingStatsStore::write(
       case Load::Ok:
         fresh = false;
         index = meta->find(key);
-        if (index != kEntryCount) readBook(file, meta->entry(index), image.get(), book);
+        // A slot the card would not give back is no reason to rewrite the book from the directory
+        // alone: that would drop its days, counts and dates for good. A damaged one is.
+        if (index != kEntryCount && readBook(file, meta->entry(index), image.get(), book) == BookRead::IoError) {
+          return WriteResult::Failed;
+        }
         break;
     }
   }
@@ -756,15 +767,17 @@ const ReadingStatsStore::RecentSnapshot* ReadingStatsStore::recent(const std::st
 
 // ---- The web ----------------------------------------------------------------------------------
 
-ReadingStatsStore::ReadResult ReadingStatsStore::writeDashboard(Print& out, const uint16_t today) {
-  return writeJson(out, today, /*dashboard=*/true);
+ReadingStatsStore::ReadResult ReadingStatsStore::writeDashboard(Print& out, const uint16_t today,
+                                                                const std::function<void()>& ready) {
+  return writeJson(out, today, /*dashboard=*/true, ready);
 }
 
-ReadingStatsStore::ReadResult ReadingStatsStore::writeExport(Print& out) {
-  return writeJson(out, 0, /*dashboard=*/false);
+ReadingStatsStore::ReadResult ReadingStatsStore::writeExport(Print& out, const std::function<void()>& ready) {
+  return writeJson(out, 0, /*dashboard=*/false, ready);
 }
 
-ReadingStatsStore::ReadResult ReadingStatsStore::writeJson(Print& out, const uint16_t today, const bool dashboard) {
+ReadingStatsStore::ReadResult ReadingStatsStore::writeJson(Print& out, const uint16_t today, const bool dashboard,
+                                                           const std::function<void()>& ready) {
   const ReadResult prepared = prepare();
   if (prepared != ReadResult::Ok) return prepared;
   auto meta = Meta::create();
@@ -776,6 +789,8 @@ ReadingStatsStore::ReadResult ReadingStatsStore::writeJson(Print& out, const uin
   if (result != ReadResult::Ok) return result;
   Summary summary;
   if (exists) summarize(*meta, summary, /*withIndex=*/false);
+  // Nothing below can fail: a damaged slot degrades to its directory figures.
+  if (ready) ready();
   if (dashboard) {
     ReadingStatsJson::writeDashboardHead(out, summary, summary.bookCount, summary.finishedBookCount, today);
   } else {

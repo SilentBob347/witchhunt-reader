@@ -668,3 +668,67 @@ TEST_F(StoreTest, LongLegacyTitleIsCut) {
 
   EXPECT_EQ(bookOf(store, id(1)).book.title, std::string(ReadingStatsSlotFile::kTitleMax, 'x'));
 }
+
+TEST_F(StoreTest, SlotReadErrorFailsTheWriteAndKeepsTheBook) {
+  ReadingStatsStore store(path_, legacy_);
+  ASSERT_EQ(store.recordSession(id(1), "Book A", "X", 600, 10, 20, kNoon), WriteResult::Done);
+
+  // A card read that fails at the slot -- not a damaged slot: the update must not go ahead on the
+  // directory's figures alone, which would drop the book's days, counts and dates for good.
+  HalFile::failReadsFrom = static_cast<long>(ReadingStatsSlotFile::kSlotsOffset);
+  const WriteResult session = store.recordSession(id(1), "Book A", "X", 60, 1, 21, kNoon + kDay);
+  const WriteResult removal = store.removeBook(id(1));
+  HalFile::failReadsFrom = -1;
+
+  EXPECT_EQ(session, WriteResult::Failed);
+  EXPECT_EQ(removal, WriteResult::Failed);
+  const auto query = bookOf(store, id(1));
+  ASSERT_TRUE(query.found);
+  EXPECT_EQ(query.book.title, "Book A");
+  EXPECT_EQ(query.book.totalSeconds, 600u);
+  EXPECT_EQ(query.book.sessions, 1u);
+  EXPECT_EQ(query.book.days.size(), 1u);
+}
+
+TEST_F(StoreTest, DamagedSlotKeepsItsDirectoryFiguresUntilTheNextSession) {
+  ReadingStatsStore store(path_, legacy_);
+  ASSERT_EQ(store.recordSession(id(1), "Book A", "X", 600, 10, 20, kNoon), WriteResult::Done);
+  // The first book of a new history goes into slot 0.
+  std::string bytes = readBytes(path_);
+  bytes[ReadingStatsSlotFile::kSlotsOffset + 100] ^= 0x01;
+  writeBytes(path_, bytes);
+
+  auto query = bookOf(store, id(1));
+  ASSERT_TRUE(query.found);
+  EXPECT_EQ(query.book.totalSeconds, 600u);  // the directory's figures
+  EXPECT_EQ(query.book.title, "");           // lost with the slot
+
+  ASSERT_EQ(store.recordSession(id(1), "Book A", "X", 60, 1, 21, kNoon + kDay), WriteResult::Done);
+  query = bookOf(store, id(1));
+  EXPECT_EQ(query.book.title, "Book A");  // the session wrote a whole slot again
+  EXPECT_EQ(query.book.totalSeconds, 660u);
+}
+
+TEST_F(StoreTest, WebPayloadsStartOnlyOnceTheHistoryIsOpen) {
+  {
+    ReadingStatsStore store(path_, legacy_);
+    ASSERT_NO_FATAL_FAILURE(twoBooks(store));
+    StringPrint out;
+    size_t bytesWhenStarted = 1;
+
+    ASSERT_EQ(store.writeDashboard(out, 0, [&] { bytesWhenStarted = out.text.size(); }), ReadResult::Ok);
+
+    EXPECT_EQ(bytesWhenStarted, 0u);  // before the first byte: the handler's 200 goes out here
+    EXPECT_FALSE(out.text.empty());
+  }
+  // A history that cannot be read never starts a response: the handler can still answer 500.
+  writeBytes(path_, "junk");
+  ReadingStatsStore store(path_, legacy_);
+  StringPrint out;
+  bool started = false;
+
+  EXPECT_EQ(store.writeExport(out, [&] { started = true; }), ReadResult::Corrupt);
+
+  EXPECT_FALSE(started);
+  EXPECT_TRUE(out.text.empty());
+}

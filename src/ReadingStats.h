@@ -115,11 +115,13 @@ class ReadingStatsStore {
   // ---- The web ----------------------------------------------------------------------------------
   //
   // Generated one book at a time: the meta and one slot, whatever the history holds.
+  // `ready` runs once the history is open and every buffer is allocated, before the first byte:
+  // the web handler sends its 200 there, so every failure comes before the response starts.
   // The /api/stats payload: the figures, streaks when `today` is known, every book with its
   // time-to-finish estimate (etaSeconds).
-  ReadResult writeDashboard(Print& out, uint16_t today);
+  ReadResult writeDashboard(Print& out, uint16_t today, const std::function<void()>& ready = nullptr);
   // The history in the reading-stats.json format, which older firmware reads.
-  ReadResult writeExport(Print& out);
+  ReadResult writeExport(Print& out, const std::function<void()>& ready = nullptr);
 
   // ---- Reading speed / time-to-finish -----------------------------------------------------------
   //
@@ -192,7 +194,7 @@ class ReadingStatsStore {
   // meta into copy A, and reads the meta back.
   ReadResult writeImport(FsFile& in, ReadingStatsJson::Summary& legacy, const std::string& tmpPath, size_t& imported);
   // Both web payloads: the head from the meta, then every book from its slot.
-  ReadResult writeJson(Print& out, uint16_t today, bool dashboard);
+  ReadResult writeJson(Print& out, uint16_t today, bool dashboard, const std::function<void()>& ready);
 
   std::string path_;
   std::string legacyPath_;

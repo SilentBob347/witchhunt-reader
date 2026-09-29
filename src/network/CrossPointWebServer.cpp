@@ -646,21 +646,30 @@ void CrossPointWebServer::handleStatsApi() const {
   //
   // Generated from the history file one book at a time, never loaded whole: the meta and one slot,
   // whatever the history holds.
-  ReadingStatsStore::Summary summary;
-  if (READING_STATS.querySummary(summary) != ReadingStatsStore::ReadResult::Ok) {
-    server->send(500, "application/json", "{\"error\":\"Reading stats could not be read\"}");
-    return;
-  }
-  if (summary.bookCount == 0 && summary.totalSeconds == 0) {
+  bool empty = false;
+  {
+    ReadingStatsStore::Summary summary;
+    if (READING_STATS.querySummary(summary) != ReadingStatsStore::ReadResult::Ok) {
+      server->send(500, "application/json", "{\"error\":\"Reading stats could not be read\"}");
+      return;
+    }
+    empty = summary.bookCount == 0 && summary.totalSeconds == 0;
+  }  // its day buckets go before the payload's own are read
+  if (empty) {
     server->send(200, "application/json", "{\"totalSeconds\":0,\"books\":[]}");  // no history yet
     return;
   }
-  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server->send(200, "application/json", "");
   ChunkedResponse response(server.get());
   ChunkedPrint out(response);
-  if (READING_STATS.writeDashboard(out, currentLocalDayIndex()) != ReadingStatsStore::ReadResult::Ok) {
-    LOG_ERR("WEB", "Reading stats failed mid-response; dashboard truncated");
+  // The 200 goes out only once the history is open and its buffers are allocated, so a failure
+  // still reaches the browser as one.
+  const auto result = READING_STATS.writeDashboard(out, currentLocalDayIndex(), [this] {
+    server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server->send(200, "application/json", "");
+  });
+  if (result != ReadingStatsStore::ReadResult::Ok) {
+    server->send(500, "application/json", "{\"error\":\"Reading stats could not be read\"}");
+    return;
   }
   response.finish();
   LOG_WEB_MEM("stats_api_exit");
@@ -696,22 +705,31 @@ void CrossPointWebServer::handleStatsExport() const {
   if (rejectIfLowMemory(server.get())) return;
   // The reading-stats.json format older firmware reads, generated from the history file: the
   // backup, and the way back after a downgrade.
-  ReadingStatsStore::Summary summary;
-  if (READING_STATS.querySummary(summary) != ReadingStatsStore::ReadResult::Ok) {
-    server->send(500, "application/json", "{}");
-    return;
+  bool empty = false;
+  {
+    ReadingStatsStore::Summary summary;
+    if (READING_STATS.querySummary(summary) != ReadingStatsStore::ReadResult::Ok) {
+      server->send(500, "application/json", "{}");
+      return;
+    }
+    empty = summary.bookCount == 0 && summary.totalSeconds == 0;
   }
-  if (summary.bookCount == 0 && summary.totalSeconds == 0) {
+  if (empty) {
     server->send(404, "application/json", "{}");
     return;
   }
-  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server->sendHeader("Content-Disposition", "attachment; filename=\"reading-stats.json\"");
-  server->send(200, "application/json", "");
   ChunkedResponse response(server.get());
   ChunkedPrint out(response);
-  if (READING_STATS.writeExport(out) != ReadingStatsStore::ReadResult::Ok) {
-    LOG_ERR("WEB", "Reading stats failed mid-export; file truncated");
+  // As for the dashboard: the headers only once nothing can fail, or the browser would save a
+  // truncated backup as if it were whole.
+  const auto result = READING_STATS.writeExport(out, [this] {
+    server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server->sendHeader("Content-Disposition", "attachment; filename=\"reading-stats.json\"");
+    server->send(200, "application/json", "");
+  });
+  if (result != ReadingStatsStore::ReadResult::Ok) {
+    server->send(500, "application/json", "{}");
+    return;
   }
   response.finish();
 }
