@@ -23,7 +23,6 @@
 #include "HttpFileStreamer.h"
 #include "OpdsServerStore.h"
 #include "ReadingStats.h"
-#include "ReadingStatsFile.h"
 #include "SdCardFontGlobals.h"
 #include "SdCardFontRegistry.h"
 #include "SettingsList.h"
@@ -645,32 +644,40 @@ void CrossPointWebServer::handleStatsApi() const {
   // browser doesn't have to recreate the day-index math; the day arrays go across untouched so it
   // can render the sparkline.
   //
-  // Streamed from the file, never loaded: the store's full load plus a JSON document of the whole
-  // payload does not fit next to Wi-Fi once the history grows. ReadingStatsFile holds a parser and
-  // the global day buckets, and the books go through to the chunked response as stored.
-  FsFile file;
-  if (!Storage.exists(ReadingStatsFile::kPath) || !Storage.openFileForRead("WEB", ReadingStatsFile::kPath, file) ||
-      file.size() == 0) {
-    // No history yet (an absent or empty file, as for the loader).
-    server->send(200, "application/json", "{\"totalSeconds\":0,\"books\":[]}");
+  // Generated from the history file one book at a time, never loaded whole: the meta and one slot,
+  // whatever the history holds.
+  bool empty = false;
+  {
+    ReadingStatsStore::Summary summary;
+    if (READING_STATS.querySummary(summary) != ReadingStatsStore::ReadResult::Ok) {
+      server->send(500, "application/json", "{\"error\":\"Reading stats could not be read\"}");
+      return;
+    }
+    empty = summary.bookCount == 0 && summary.totalSeconds == 0;
+  }  // its day buckets go before the payload's own are read
+  if (empty) {
+    server->send(200, "application/json", "{\"totalSeconds\":0,\"books\":[]}");  // no history yet
     return;
   }
-  ReadingStatsFile::Summary summary;
-  if (!ReadingStatsFile::summarize(file, summary)) {
+  ChunkedResponse response(server.get());
+  ChunkedPrint out(response);
+  // The 200 goes out only once the history is open and its buffers are allocated, so a failure
+  // still reaches the browser as one.
+  const auto result = READING_STATS.writeDashboard(out, currentLocalDayIndex(), [this] {
+    server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server->send(200, "application/json", "");
+  });
+  if (result != ReadingStatsStore::ReadResult::Ok) {
     server->send(500, "application/json", "{\"error\":\"Reading stats could not be read\"}");
     return;
   }
-  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server->send(200, "application/json", "");
-  ChunkedResponse response(server.get());
-  ChunkedPrint out(response);
-  ReadingStatsFile::writeDashboard(file, summary, currentLocalDayIndex(), out);
   response.finish();
   LOG_WEB_MEM("stats_api_exit");
 }
 
 // Body: {"docId": "..."}. Same removal as the device's per-book stats screen: the book's entry goes
-// and its time comes back out of the totals. Streamed through the file like the dashboard.
+// and its time comes back out of the totals: the store frees its directory entry and rewrites the
+// global figures, copy-on-write.
 void CrossPointWebServer::handleStatsRemove() const {
   if (rejectIfLowMemory(server.get())) return;
   JsonDocument req;
@@ -680,40 +687,52 @@ void CrossPointWebServer::handleStatsRemove() const {
   }
   const std::string docId = req["docId"].as<const char*>();
 
-  switch (READING_STATS.removeBookFromFile(docId)) {
-    case ReadingStatsStore::FileRemoval::Removed:
+  switch (READING_STATS.removeBook(docId)) {
+    case ReadingStatsStore::WriteResult::Done:
       LOG_DBG("WEB", "Removed from reading stats: %s", docId.c_str());
       server->send(200, "application/json", "{\"ok\":true}");
       return;
-    case ReadingStatsStore::FileRemoval::NotFound:
+    case ReadingStatsStore::WriteResult::NotFound:
       server->send(404, "application/json", "{\"error\":\"Book not found\"}");
       return;
-    case ReadingStatsStore::FileRemoval::Failed:
+    case ReadingStatsStore::WriteResult::NoMemory:
+    case ReadingStatsStore::WriteResult::Failed:
       server->send(500, "application/json", "{\"error\":\"Could not update the reading stats\"}");
       return;
   }
 }
 
 void CrossPointWebServer::handleStatsExport() const {
-  // The raw stats file, streamed from SD -- the same shape the device writes and reads, so it
-  // round-trips cleanly through external tooling without a second schema.
-  FsFile file;
-  if (!Storage.exists(ReadingStatsFile::kPath)) {
+  if (rejectIfLowMemory(server.get())) return;
+  // The reading-stats.json format older firmware reads, generated from the history file: the
+  // backup, and the way back after a downgrade.
+  bool empty = false;
+  {
+    ReadingStatsStore::Summary summary;
+    if (READING_STATS.querySummary(summary) != ReadingStatsStore::ReadResult::Ok) {
+      server->send(500, "application/json", "{}");
+      return;
+    }
+    empty = summary.bookCount == 0 && summary.totalSeconds == 0;
+  }
+  if (empty) {
     server->send(404, "application/json", "{}");
     return;
   }
-  if (!Storage.openFileForRead("WEB", ReadingStatsFile::kPath, file)) {
+  ChunkedResponse response(server.get());
+  ChunkedPrint out(response);
+  // As for the dashboard: the headers only once nothing can fail, or the browser would save a
+  // truncated backup as if it were whole.
+  const auto result = READING_STATS.writeExport(out, [this] {
+    server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server->sendHeader("Content-Disposition", "attachment; filename=\"reading-stats.json\"");
+    server->send(200, "application/json", "");
+  });
+  if (result != ReadingStatsStore::ReadResult::Ok) {
     server->send(500, "application/json", "{}");
     return;
   }
-  server->setContentLength(file.size());
-  server->sendHeader("Content-Disposition", "attachment; filename=\"reading-stats.json\"");
-  server->send(200, "application/json", "");
-  NetworkClient client = server->client();
-  if (!HttpFileStreamer::streamFileToClient(file, client)) {
-    LOG_DBG("WEB", "Stats export interrupted while streaming");
-  }
-  client.clear();
+  response.finish();
 }
 
 void CrossPointWebServer::handleJszip() const {

@@ -77,7 +77,7 @@ class ChunkedResponse {
   size_t used = 0;
 };
 
-// Print on top of ChunkedResponse, for writers that speak Print (ReadingStatsFile's dashboard).
+// Print on top of ChunkedResponse, for writers that speak Print (the reading-stats dashboard and export).
 class ChunkedPrint final : public Print {
  public:
   explicit ChunkedPrint(ChunkedResponse& out) : out(out) {}

@@ -21,8 +21,8 @@ class ReadingStatsBookDetailActivity final : public Activity {
   void render(RenderLock&&) override;
 
  private:
-  // Resolved against the store on every render, so the store has to stay loaded for the screen.
-  ReadingStatsStore::ScopedLoad statsLoad_;
+  // The book, read once on entry. render() draws from it.
+  ReadingStatsStore::BookQuery query_;
 
   std::string docId;
 

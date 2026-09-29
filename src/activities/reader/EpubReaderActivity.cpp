@@ -882,12 +882,11 @@ void EpubReaderActivity::onExit() {
   currentPageFootnotes.clear();
   currentPageFootnotes.shrink_to_fit();
 
-  // Flush the reading-stats session LAST: end() loads the whole history to merge one entry and
-  // rewrite the file, and it needs nothing of the reader (the tracker copied the id, title and
-  // author at begin()). Before the teardown it ran with the section, the page and the epub still
-  // resident -- run 17 loaded an 18-book store at 25 KB free / 9.7 KB contiguous, the tightest
-  // point of the whole exit path; here it has the ~18 KB the teardown just freed. Sleep paths
-  // that bypass onExit() still end up here on resume because the activity is recreated.
+  // Flush the reading-stats session LAST: end() writes the book and the global figures in place
+  // (~10 KB of heap whatever the history holds), and it needs nothing of the reader (the tracker
+  // copied the id, title and author at begin()). Here it has the heap the teardown just freed.
+  // Sleep paths that bypass onExit() still end up here on resume because the activity is
+  // recreated.
   globalReadingSessionTracker().end();
 }
 

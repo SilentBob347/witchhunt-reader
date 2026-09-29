@@ -1435,11 +1435,9 @@ void setup() {
   logStartupMemory("after_recent_books");
   GLOBAL_BOOKMARKS.load();
   logStartupMemory("after_bookmarks");
-  // READING_STATS is deliberately NOT loaded here. Nothing on the reading path needs the history
-  // — the session tracker accumulates in its own members and only touches the store at book exit
-  // — while keeping it resident cost, measured on X4 with 36 books, ~15 KB of heap and dropped
-  // largest8 from 65524 to 26612 before the first book was even opened. Consumers load it for
-  // the duration they need it (ReadingStatsStore::ScopedLoad) and release it after.
+  // READING_STATS holds no history: every consumer streams the file (ReadingStatsStore), so there
+  // is nothing to load here. Keeping it resident used to cost, measured on X4 with 36 books,
+  // ~15 KB of heap and largest8 65524 -> 26612 before the first book was even opened.
   BootDiag::markPhase(BootPhase::StoreLoad);
 
   if (recoveryFirmwareMode) {
