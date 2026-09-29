@@ -55,6 +55,15 @@ ReadingStatsJson::Summary scanOf(const std::string& file, const ReadingStatsJson
   return summary;
 }
 
+// Every book a scan hands over, in the order it does.
+std::vector<BookReadingStats> booksOf(const std::string& file) {
+  std::vector<BookReadingStats> books;
+  ReadingStatsJson::ScanRequest request;
+  request.onBook = [&books](const BookReadingStats& book) { books.push_back(book); };
+  scanOf(file, request);
+  return books;
+}
+
 const std::string kBookD =
     R"({"docId":"d","title":"D","author":"","totalSeconds":120,"pagesTurned":3,"sessions":1,"firstReadEpoch":0,)"
     R"("lastReadEpoch":0,"progress":5,"finishedCount":0,"lastFinishedEpoch":0,"finished":false,)"
@@ -112,10 +121,10 @@ TEST(ReadingStatsJsonScan, DecodesTheWholeTarget) {
       R"(","author":"X","totalSeconds":900,"pagesTurned":9,"sessions":3,)"
       R"("firstReadEpoch":1767225600,"lastReadEpoch":1768046400,"progress":100,"finishedCount":2,)"
       R"("lastFinishedEpoch":1768046400,"finished":true,"days":[[20463,900]]})";
-  HalFile in = HalFile::fromString(head + dated + "]}");
-  BookReadingStats b;
+  const auto books = booksOf(head + dated + "]}");
 
-  ASSERT_EQ(ReadingStatsJson::readBookAt(in, head.size(), b), ScanResult::Ok);
+  ASSERT_EQ(books.size(), 1u);
+  const BookReadingStats& b = books[0];
   // The parser passes \u escapes through undecoded; titles are for display only.
   EXPECT_EQ(b.title, "Say \"hi\" \\u00e9");
   EXPECT_EQ(b.author, "X");
@@ -134,51 +143,28 @@ TEST(ReadingStatsJsonScan, LegacyFinishedFlagCountsAsOneFinish) {
   const std::string legacy = R"({"docId":"l","totalSeconds":60,"progress":100,"finished":true,"days":[]})";
   const std::string head = R"({"totalSeconds":60,"books":[)";
   const std::string file = head + legacy + "]}";
-  HalFile in = HalFile::fromString(file);
-  BookReadingStats book;
+  const auto books = booksOf(file);
 
-  ASSERT_EQ(ReadingStatsJson::readBookAt(in, head.size(), book), ScanResult::Ok);
-
-  EXPECT_EQ(book.finishedCount, 1);
+  ASSERT_EQ(books.size(), 1u);
+  EXPECT_EQ(books[0].finishedCount, 1);
   EXPECT_EQ(scanOf(file, {}).finishedBookCount, 1u);
 }
 
-TEST(ReadingStatsJsonScan, IndexOrdersBooksByTime) {
-  ReadingStatsJson::ScanRequest request;
-  request.wantIndex = true;
+TEST(ReadingStatsJsonScan, BooksArriveInFileOrderAsTheyAreRead) {
+  const auto books = booksOf(kFile);
 
-  const auto summary = scanOf(kFile, request);
-
-  std::vector<std::pair<uint32_t, uint32_t>> index;
-  for (const auto& e : summary.byTime) index.emplace_back(e.totalSeconds, e.offset);
-  EXPECT_EQ(index, (std::vector<std::pair<uint32_t, uint32_t>>{{1000, static_cast<uint32_t>(kFile.find(kBookA))},
-                                                               {300, static_cast<uint32_t>(kFile.find(kBookB))},
-                                                               {50, static_cast<uint32_t>(kFile.find(kBookC))}}));
+  ASSERT_EQ(books.size(), 3u);
+  EXPECT_EQ(books[0].docId, "a");
+  EXPECT_EQ(books[1].docId, "b");
+  EXPECT_EQ(books[2].docId, "c");
+  EXPECT_EQ(books[1].title, "B");
+  EXPECT_EQ(books[1].totalSeconds, 300u);
+  EXPECT_EQ(books[1].finishedCount, 1);
+  EXPECT_EQ(pairsOf(books[1].days), (std::vector<std::pair<uint16_t, uint32_t>>{{20463, 300}}));
 }
 
 TEST(ReadingStatsJsonScan, TruncatedFileIsMalformed) {
   scanOf(kFile.substr(0, kFile.size() / 2), {}, ScanResult::Malformed);
-}
-
-TEST(ReadingStatsJsonBookAt, DecodesTheEntryAtAnOffset) {
-  HalFile in = HalFile::fromString(kFile);
-  BookReadingStats book;
-
-  ASSERT_EQ(ReadingStatsJson::readBookAt(in, kFile.find(kBookB), book), ScanResult::Ok);
-
-  EXPECT_EQ(book.docId, "b");
-  EXPECT_EQ(book.title, "B");
-  EXPECT_EQ(book.totalSeconds, 300u);
-  EXPECT_EQ(book.finishedCount, 1);
-  EXPECT_EQ(pairsOf(book.days), (std::vector<std::pair<uint16_t, uint32_t>>{{20463, 300}}));
-}
-
-TEST(ReadingStatsJsonBookAt, CutOffEntryIsMalformed) {
-  const std::string cut = kFile.substr(0, kFile.find(kBookA) + kBookA.size() / 2);
-  HalFile in = HalFile::fromString(cut);
-  BookReadingStats book;
-
-  EXPECT_EQ(ReadingStatsJson::readBookAt(in, kFile.find(kBookA), book), ScanResult::Malformed);
 }
 
 TEST(ReadingStatsJsonWriteBook, EscapesTheTitleAndKeepsTheFieldOrder) {

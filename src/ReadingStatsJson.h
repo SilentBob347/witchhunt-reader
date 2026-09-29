@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -21,15 +22,11 @@ constexpr char kPath[] = "/.crosspoint/reading-stats.json";
 // later pass may succeed; Malformed is the file's own fault.
 enum class ScanResult : uint8_t { Ok, NoMemory, IoError, Malformed };
 
-// One book's place in the file, for the list ordered by time.
-struct IndexEntry {
-  uint32_t totalSeconds = 0;
-  uint32_t offset = 0;  // byte offset of the entry's opening brace
-};
-
 // What a pass collects beyond the global figures.
 struct ScanRequest {
-  bool wantIndex = false;  // Summary::byTime
+  // Each book with a docId, as the pass finishes it: in file order, every field decoded, days
+  // trimmed the way a load would.
+  std::function<void(const BookReadingStats&)> onBook;
 };
 
 // One pass over the file: the global figures and whatever the request asked for. Days are
@@ -40,14 +37,9 @@ struct Summary : ReadingTotals {
   // Over the books far enough in to count toward the global pace (see ReadingStatsStore).
   uint32_t paceSeconds = 0;
   uint32_t pacePercents = 0;
-
-  std::vector<IndexEntry> byTime;  // descending by time; equal times in file order
 };
 
 ScanResult scan(HalFile& in, Summary& summary, const ScanRequest& request);
-
-// Decodes the single entry whose opening brace is at `offset` (an IndexEntry::offset).
-ScanResult readBookAt(HalFile& in, size_t offset, BookReadingStats& book);
 
 // One book as a JSON object, in the field order the device has always written. Strings are
 // escaped the way ArduinoJson does: quote, backslash and control characters; UTF-8 passes through.

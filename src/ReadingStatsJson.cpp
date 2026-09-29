@@ -103,15 +103,11 @@ time_t toEpoch(const char* text) {
 }
 
 // Walks the file with the SAX parser, keeping track of where it is in the stats layout, and hands
-// the subclasses what they need: the top-level counters, the global day buckets, and each book
-// with the offsets of its braces. Fed a byte at a time so that every event knows the offset of the
-// byte that caused it.
+// the subclasses what they need: the top-level counters, the global day buckets, and each book.
+// Fed a block at a time; nothing needs the offset of a byte.
 //
 //   { "totalSeconds": n, ..., "globalDays": [[d, s], ...], "books": [ { ..., "days": [[d, s]] } ] }
 //   depth 1                   2            3              2          3            4  5
-//
-// In single-book mode (readBookAt) the input starts at one entry's opening brace: the book is at
-// depth 1, its days at 2 and 3, and the pass ends when that object closes.
 class Scanner {
  public:
   struct Book {
@@ -129,8 +125,6 @@ class Scanner {
     bool finishedFlag = false;  // the legacy bool, read only when finishedCount is absent
     time_t lastFinishedEpoch = 0;
     std::vector<DayBucket> days;
-    size_t first = 0;  // offset of '{'
-    bool hasFields = false;
 
     bool finished() const { return hasFinishedCount ? finishedCount > 0 : finishedFlag; }
 
@@ -154,29 +148,24 @@ class Scanner {
     }
   };
 
-  explicit Scanner(const bool singleBook = false) : singleBook_(singleBook) {}
+  Scanner() = default;
   virtual ~Scanner() = default;
 
-  ScanResult run(HalFile& in, const size_t start = 0) {
+  ScanResult run(HalFile& in) {
     auto parser = makeUniqueNoThrow<StreamingJsonParser>(callbacks());
     auto block = makeUniqueNoThrow<char[]>(kReadBlock);
     if (!parser || !block) {
       LOG_ERR("RSF", "OOM: stats file parser");
       return ScanResult::NoMemory;
     }
-    if (!in.seekSet(start)) return ScanResult::IoError;
-    char* const bytes = block.get();
-    size_t offset = start;
-    while (!done_) {
-      const int n = in.read(bytes, kReadBlock);
+    if (!in.seekSet(0)) return ScanResult::IoError;
+    for (;;) {
+      const int n = in.read(block.get(), kReadBlock);
       if (n < 0) return ScanResult::IoError;
       if (n == 0) break;
-      for (int i = 0; i < n && !done_; ++i, ++offset) {
-        offset_ = offset;
-        parser->feed(&bytes[i], 1);
-      }
+      parser->feed(block.get(), static_cast<size_t>(n));
     }
-    const bool complete = singleBook_ ? done_ : (rootClosed_ && depth_ == 0);
+    const bool complete = rootClosed_ && depth_ == 0;
     return !parser->hasError() && complete ? ScanResult::Ok : ScanResult::Malformed;
   }
 
@@ -186,7 +175,7 @@ class Scanner {
   virtual void onCounter(Top, uint32_t) {}
   virtual void onGlobalDay(uint16_t, uint32_t) {}
   // While the parser takes in the book's closing brace.
-  virtual void onBookEnd(const Book&, size_t) {}
+  virtual void onBookEnd(const Book&) {}
 
  private:
   enum class Field : uint8_t {
@@ -233,28 +222,23 @@ class Scanner {
     return Field::Other;
   }
 
-  int bookDepth() const { return singleBook_ ? 1 : 3; }
-  bool inBookScope() const { return singleBook_ || top_ == Top::Books; }
-  bool atBook() const { return inBookScope() && depth_ == bookDepth(); }
-  bool atBookDayPair() const { return inBookScope() && field_ == Field::Days && depth_ == bookDepth() + 2; }
-  bool atGlobalDayPair() const { return !singleBook_ && top_ == Top::GlobalDays && depth_ == 3; }
+  static constexpr int kBookDepth = 3;
+  bool atBook() const { return top_ == Top::Books && depth_ == kBookDepth; }
+  bool atBookDayPair() const { return top_ == Top::Books && field_ == Field::Days && depth_ == kBookDepth + 2; }
+  bool atGlobalDayPair() const { return top_ == Top::GlobalDays && depth_ == 3; }
 
   void objectStart() {
     ++depth_;
-    if (!singleBook_ && depth_ == 1) rootSeen_ = true;
+    if (depth_ == 1) rootSeen_ = true;
     if (atBook()) {
       book_ = Book{};
-      book_.first = offset_;
       field_ = Field::Other;
     }
   }
 
   void objectEnd() {
-    if (atBook()) onBookEnd(book_, offset_);
-    if (depth_ == 1) {
-      if (singleBook_) done_ = true;
-      if (!singleBook_ && rootSeen_) rootClosed_ = true;
-    }
+    if (atBook()) onBookEnd(book_);
+    if (depth_ == 1 && rootSeen_) rootClosed_ = true;
     if (depth_ > 0) --depth_;
   }
 
@@ -280,16 +264,15 @@ class Scanner {
   }
 
   void key(const char* text) {
-    if (!singleBook_ && depth_ == 1) {
+    if (depth_ == 1) {
       top_ = topFor(text);
     } else if (atBook()) {
       field_ = fieldFor(text);
-      book_.hasFields = true;
     }
   }
 
   void number(const char* text) {
-    if (!singleBook_ && depth_ == 1) {
+    if (depth_ == 1) {
       onCounter(top_, toCount(text));
     } else if (atGlobalDayPair() || atBookDayPair()) {
       if (pairIndex_ == 0) pairDay_ = static_cast<uint16_t>(std::min<uint32_t>(toCount(text), 0xFFFF));
@@ -353,12 +336,9 @@ class Scanner {
     return cb;
   }
 
-  const bool singleBook_;
-  size_t offset_ = 0;
   int depth_ = 0;
   bool rootSeen_ = false;
   bool rootClosed_ = false;
-  bool done_ = false;
   Top top_ = Top::Other;
   Field field_ = Field::Other;
   uint8_t pairIndex_ = 0;
@@ -370,12 +350,6 @@ class Scanner {
 class SummaryScan final : public Scanner {
  public:
   SummaryScan(Summary& summary, const ScanRequest& request) : summary_(summary), request_(request) {}
-
-  // After the pass: the index in time order.
-  void settle() {
-    std::stable_sort(summary_.byTime.begin(), summary_.byTime.end(),
-                     [](const IndexEntry& a, const IndexEntry& b) { return a.totalSeconds > b.totalSeconds; });
-  }
 
  private:
   void onCounter(const Top top, const uint32_t value) override {
@@ -401,7 +375,7 @@ class SummaryScan final : public Scanner {
     summary_.globalDays.push_back({day, seconds});
   }
 
-  void onBookEnd(const Book& book, size_t) override {
+  void onBookEnd(const Book& book) override {
     // The loader skips an entry without a docId; so does everything counted here.
     if (book.docId.empty()) return;
     ++summary_.bookCount;
@@ -410,21 +384,11 @@ class SummaryScan final : public Scanner {
       summary_.paceSeconds += book.totalSeconds;
       summary_.pacePercents += book.progress;
     }
-    if (request_.wantIndex) summary_.byTime.push_back({book.totalSeconds, static_cast<uint32_t>(book.first)});
+    if (request_.onBook) request_.onBook(book.toStats());
   }
 
   Summary& summary_;
   const ScanRequest& request_;
-};
-
-class BookAt final : public Scanner {
- public:
-  explicit BookAt(BookReadingStats& out) : Scanner(/*singleBook=*/true), out_(out) {}
-
- private:
-  void onBookEnd(const Book& book, size_t) override { out_ = book.toStats(); }
-
-  BookReadingStats& out_;
 };
 
 }  // namespace
@@ -436,14 +400,7 @@ ScanResult scan(HalFile& in, Summary& summary, const ScanRequest& request) {
   if (result != ScanResult::Ok) return result;
   // What a load would hold: the newest kMaxGlobalDays buckets, the record folded in first.
   ReadingStatsStore::trimGlobalDays(summary.globalDays, summary.longestStreak);
-  pass.settle();
   return ScanResult::Ok;
-}
-
-ScanResult readBookAt(HalFile& in, const size_t offset, BookReadingStats& book) {
-  book = BookReadingStats{};
-  BookAt pass(book);
-  return pass.run(in, offset);
 }
 
 void writeDashboardHead(Print& out, const ReadingTotals& totals, const uint32_t bookCount,
